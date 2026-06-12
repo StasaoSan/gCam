@@ -3,7 +3,6 @@ package com.stasao.gcam
 import android.app.*
 import android.content.Context
 import android.content.Intent
-import android.hardware.camera2.CameraManager
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
@@ -13,6 +12,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 
+@android.annotation.SuppressLint("NotificationPermission")
 class MonitorService : Service() {
 
     companion object {
@@ -44,7 +44,6 @@ class MonitorService : Service() {
 
         scope.launch {
             var prevSocket = ""
-            var prevCam = ""
             var prevUnix = ""
 
             while (isActive) {
@@ -77,16 +76,7 @@ class MonitorService : Service() {
                     else -> "unknown"
                 }
 
-                // 2. CameraManager.cameraIdList
-                val camStatus = try {
-                    val mgr = getSystemService(CAMERA_SERVICE) as CameraManager
-                    val ids = mgr.cameraIdList
-                    if (ids.isEmpty()) "пусто" else "КАМЕРЫ: ${ids.joinToString()}"
-                } catch (e: Exception) {
-                    "err:${e.message?.take(40)}"
-                }
-
-                // 3. /proc/net/unix for camera socket
+                // 2. /proc/net/unix for camera socket
                 val unixStatus = try {
                     val lines = File("/proc/net/unix").readLines()
                         .filter { it.contains("camera", true) }
@@ -94,13 +84,12 @@ class MonitorService : Service() {
                 } catch (_: Exception) { "?" }
 
                 // Log only on change
-                val changed = socketStatus != prevSocket || camStatus != prevCam || unixStatus != prevUnix
+                val changed = socketStatus != prevSocket || unixStatus != prevUnix
                 if (changed) {
-                    val msg = "socket=$socketStatus | cam=$camStatus | unix=$unixStatus"
+                    val msg = "socket=$socketStatus | unix=$unixStatus"
                     log("$ts ИЗМЕНЕНИЕ: $msg")
                     updateNotif(msg.take(60))
                     prevSocket = socketStatus
-                    prevCam = camStatus
                     prevUnix = unixStatus
                 }
 

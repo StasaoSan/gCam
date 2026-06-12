@@ -24,6 +24,8 @@ class DiagnosticsEngine(internal val context: Context) {
         report(checkHwServiceManager())
         report(checkQCarCamProcess())
         report(checkQCarCamHidl())
+        report(checkQCarCamDeeper())
+        report(checkEvsHidl())
         report(checkVendorSockets())
         report(checkVendorInitFiles())
         report(checkVendorCameraProps())

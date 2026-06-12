@@ -495,13 +495,264 @@ fun ToolsTab() {
         }
     }
 
+    var avmLog by remember { mutableStateOf("") }
+
+    // ── Camera preview (MediaProjection + AVM) ──
+    var camTextureST by remember { mutableStateOf<SurfaceTexture?>(null) }
+    var camProjection by remember { mutableStateOf<android.media.projection.MediaProjection?>(null) }
+    var camVirtualDisplay by remember { mutableStateOf<android.hardware.display.VirtualDisplay?>(null) }
+    var camSurf by remember { mutableStateOf<android.view.Surface?>(null) }
+    var isCamCapturing by remember { mutableStateOf(false) }
+    var camStatus by remember { mutableStateOf("") }
+    var camMpCode by remember { mutableStateOf(0) }
+    var camMpData by remember { mutableStateOf<Intent?>(null) }
+
+    val camMpLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK && result.data != null) {
+            camMpCode = result.resultCode
+            camMpData = result.data
+        } else {
+            camStatus = "Разрешение MediaProjection не выдано"
+        }
+    }
+
+    fun stopCamCapture() {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val cr = Class.forName("ecarx.fw.api.PasFunc.PasFunc\$\$Creator").newInstance()
+                val pf = cr.javaClass.getMethod("create", Context::class.java).invoke(cr, context)!!
+                pf.javaClass.getMethod("startOrStopAvm", Int::class.javaPrimitiveType).invoke(pf, 0)
+            } catch (_: Exception) {}
+        }
+        camVirtualDisplay?.release(); camVirtualDisplay = null
+        camProjection?.stop();        camProjection = null
+        camSurf?.release();           camSurf = null
+        isCamCapturing = false
+        camMpCode = 0; camMpData = null
+        camStatus = "Захват остановлен"
+    }
+
+    fun callPasFunc(action: Int) {
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            avmLog = try {
+                val creator = Class.forName("ecarx.fw.api.PasFunc.PasFunc\$\$Creator").newInstance()
+                val pasFunc = creator.javaClass.getMethod("create", Context::class.java)
+                    .invoke(creator, context)!!
+                when (action) {
+                    1, 0 -> {
+                        pasFunc.javaClass
+                            .getMethod("startOrStopAvm", Int::class.javaPrimitiveType)
+                            .invoke(pasFunc, action)
+                        "PasFunc.startOrStopAvm($action) → OK"
+                    }
+                    -1 -> {
+                        val state = pasFunc.javaClass.getMethod("getAVMState").invoke(pasFunc)
+                        val pdcState = pasFunc.javaClass.getMethod("getPDCState").invoke(pasFunc)
+                        val apaState = pasFunc.javaClass.getMethod("getAPAState").invoke(pasFunc)
+                        "AVM=$state  PDC=$pdcState  APA=$apaState"
+                    }
+                    else -> "?"
+                }
+            } catch (e: Exception) {
+                "${e.javaClass.simpleName}: ${e.message?.take(120)}"
+            }
+        }
+    }
+
+    // When both MP permission AND TextureView SurfaceTexture are ready → create VirtualDisplay
+    LaunchedEffect(camMpCode, camTextureST) {
+        if (camMpCode != 0 && camMpData != null && camTextureST != null && !isCamCapturing) {
+            val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE)
+                as android.media.projection.MediaProjectionManager
+            val mp = mgr.getMediaProjection(camMpCode, camMpData!!)
+                ?: run { camStatus = "MediaProjection: null — попробуйте снова"; return@LaunchedEffect }
+            camProjection = mp
+            val dm = context.resources.displayMetrics
+            val st = camTextureST ?: return@LaunchedEffect
+            st.setDefaultBufferSize(dm.widthPixels, dm.heightPixels)
+            val surf = android.view.Surface(st)
+            camSurf = surf
+            val vd = mp.createVirtualDisplay(
+                "gcam_preview", dm.widthPixels, dm.heightPixels, dm.densityDpi,
+                4 /* VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR */, surf, null, null
+            )
+            camVirtualDisplay = vd
+            isCamCapturing = true
+            camStatus = "VirtualDisplay активен — запускаю AVM..."
+            withContext(Dispatchers.IO) {
+                try {
+                    val cr = Class.forName("ecarx.fw.api.PasFunc.PasFunc\$\$Creator").newInstance()
+                    val pf = cr.javaClass.getMethod("create", Context::class.java).invoke(cr, context)!!
+                    pf.javaClass.getMethod("startOrStopAvm", Int::class.javaPrimitiveType).invoke(pf, 1)
+                    withContext(Dispatchers.Main) { camStatus = "AVM запущен — изображение в TextureView ниже" }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) { camStatus = "AVM error: ${e.message?.take(80)}" }
+                }
+            }
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { camVirtualDisplay?.release(); camProjection?.stop(); camSurf?.release() }
+    }
+
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         item {
-            Text("Инструменты", style = MaterialTheme.typography.titleMedium,
+            Text("AVM Управление", style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(bottom = 4.dp))
+        }
+
+        item {
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFE8EAF6))
+            ) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("PasFunc (прямой вызов через системный ClassLoader)",
+                        style = MaterialTheme.typography.labelMedium, color = Color(0xFF1A237E))
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = { callPasFunc(1) },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B5E20)),
+                            modifier = Modifier.weight(1f)
+                        ) { Text("▶ AVM Старт") }
+                        Button(
+                            onClick = { callPasFunc(0) },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB71C1C)),
+                            modifier = Modifier.weight(1f)
+                        ) { Text("■ AVM Стоп") }
+                        OutlinedButton(
+                            onClick = { callPasFunc(-1) },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("Статус") }
+                    }
+
+                    Button(
+                        onClick = {
+                            try {
+                                val intent = android.content.Intent().apply {
+                                    component = android.content.ComponentName(
+                                        "com.ecarx.parking",
+                                        "com.ecarx.parking.MainAvmActivity"
+                                    )
+                                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                }
+                                context.startActivity(intent)
+                                avmLog = "Intent → com.ecarx.parking запущен"
+                            } catch (e: Exception) {
+                                avmLog = "Intent failed: ${e.message}"
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0277BD)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Запустить com.ecarx.parking (Intent)") }
+
+                    if (avmLog.isNotEmpty()) {
+                        Surface(
+                            Modifier.fillMaxWidth(),
+                            color = if (avmLog.contains("OK") || avmLog.contains("запущен"))
+                                Color(0xFFE8F5E9) else Color(0xFFFFF8E1),
+                            shape = MaterialTheme.shapes.small
+                        ) {
+                            Text(avmLog, Modifier.padding(8.dp),
+                                fontSize = 11.sp, fontFamily = FontFamily.Monospace,
+                                color = if (avmLog.contains("OK") || avmLog.contains("запущен"))
+                                    Color(0xFF1B5E20) else Color(0xFFE65100),
+                                lineHeight = 15.sp)
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Camera Preview card ──
+        item {
+            HorizontalDivider(Modifier.padding(vertical = 4.dp))
+            Text("Камера (MediaProjection + AVM)",
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(vertical = 4.dp))
+        }
+        item {
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFE1F5FE))
+            ) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "1. Нажмите «Запустить» — появится диалог «Разрешить захват экрана?»\n" +
+                        "2. Разрешите → AVM запустится автоматически (камера в оверлее)\n" +
+                        "3. TextureView ниже захватывает то же изображение через VirtualDisplay\n" +
+                        "4. Нажмите «Стоп» (или AVM Стоп выше) чтобы закончить",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF01579B), lineHeight = 16.sp, fontSize = 11.sp
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE)
+                                    as android.media.projection.MediaProjectionManager
+                                camStatus = "Ожидание разрешения MediaProjection..."
+                                camMpLauncher.launch(mgr.createScreenCaptureIntent())
+                            },
+                            enabled = !isCamCapturing,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0277BD)),
+                            modifier = Modifier.weight(1f)
+                        ) { Text("▶ Запустить", fontSize = 12.sp) }
+                        Button(
+                            onClick = { stopCamCapture() },
+                            enabled = isCamCapturing,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB71C1C)),
+                            modifier = Modifier.weight(1f)
+                        ) { Text("■ Стоп", fontSize = 12.sp) }
+                    }
+                    if (camStatus.isNotEmpty()) {
+                        Text(camStatus, fontSize = 11.sp, fontFamily = FontFamily.Monospace,
+                            color = if (isCamCapturing) Color(0xFF01579B) else Color(0xFFE65100))
+                    }
+                    // TextureView — receives VirtualDisplay output (mirrored main display)
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .aspectRatio(16f / 9f)
+                            .background(Color.Black),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        AndroidView(
+                            factory = { ctx ->
+                                TextureView(ctx).apply {
+                                    surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                                        override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                                            camTextureST = st
+                                        }
+                                        override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+                                        override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                                            camTextureST = null
+                                            return true
+                                        }
+                                        override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        if (!isCamCapturing) {
+                            Text("Нет сигнала", color = Color.White, fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
+        }
+
+        item {
+            HorizontalDivider(Modifier.padding(vertical = 4.dp))
+            Text("Извлечение APK", style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.padding(bottom = 4.dp))
             Text(
                 "Извлекает APK системных камера-приложений в папку приложения.\nПотом: adb pull или USB-файлменеджер.",
