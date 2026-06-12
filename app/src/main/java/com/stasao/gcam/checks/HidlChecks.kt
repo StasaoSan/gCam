@@ -453,7 +453,7 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
         sb.appendLine("  lastCode@300ms (post-openStream): ${try { getLastCode?.invoke(qcarStubInstance) } catch (_: Throwable) { null }}")
 
         val sb2 = streamBinder
-        if (sb2 != null) {
+        if (sb2 != null) try {
             sb.appendLine("\n  *** IQcarCameraStream ПОЛУЧЕН — начинаем поток ***")
 
             // Вывести все методы HwParcel (для понимания доступного API)
@@ -538,24 +538,17 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
                 }
             }
 
-            // ── configureStream через HwBlob ──
-            // HAL ожидает структуру QcarcamStreamConfig через HIDL buffer, не raw int32.
-            // Пробуем разные размеры (нет .hal файла, угадываем layout).
+            // ── configureStream через HwBlob (3 попытки с паузами) ──
             sb.appendLine("\n  --- configureStream HwBlob probe ---")
             if (hwBlobCtor != null && writeBuffer != null && putInt32B != null) {
-                // Типичные поля: inputId, width, height, format, frameRate, flags = 6×4=24 bytes
-                // Пробуем size=24 с разными шириной/высотой (типичные авто-камеры)
                 data class CfgAttempt(val sz: Int, val fields: List<Int>, val label: String)
                 val attempts = listOf(
-                    CfgAttempt(24, listOf(0, 0, 0, 0, 0, 0), "all-zero sz=24"),
-                    CfgAttempt(24, listOf(0, 1280, 720, 0, 0, 0), "1280x720 sz=24"),
-                    CfgAttempt(24, listOf(0, 640, 480, 0, 0, 0),  "640x480 sz=24"),
-                    CfgAttempt(16, listOf(0, 0, 0, 0), "all-zero sz=16"),
-                    CfgAttempt(32, listOf(0, 1280, 720, 0, 0, 0, 0, 0), "1280x720 sz=32"),
-                    CfgAttempt(8,  listOf(0, 0), "all-zero sz=8"),
-                    CfgAttempt(48, List(12) { 0 }, "all-zero sz=48")
+                    CfgAttempt(24, listOf(0, 0, 0, 0, 0, 0),    "zeros sz=24"),
+                    CfgAttempt(24, listOf(0, 1280, 720, 0, 0, 0),"1280x720 sz=24"),
+                    CfgAttempt(32, listOf(0, 1280, 720, 0, 0, 0, 0, 0), "1280x720 sz=32")
                 )
                 for (att in attempts) {
+                    Thread.sleep(100)
                     val rq = newParcel(); val rp = newParcel()
                     try {
                         writeToken.invoke(rq, streamIfaceToken)
@@ -567,46 +560,61 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
                         streamTransact.invoke(sb2, 2, rq, rp, 0)
                         try { verifySuc.invoke(rp) } catch (_: Throwable) {}
                         val v = try { readInt32.invoke(rp) as? Int } catch (_: Throwable) { null }
-                        sb.appendLine("  configureStream(${att.label}) status=$v${if (v == 0) " ✓ OK!" else if (v != null && v == -61) " (ENODATA)" else ""}")
+                        sb.appendLine("  configureStream(${att.label}) status=$v${if (v == 0) " ✓ OK!" else if (v == -61) " (ENODATA)" else ""}")
                     } catch (e: Throwable) {
-                        val inner = e.cause ?: e
-                        sb.appendLine("  configureStream(${att.label}): ${inner.javaClass.simpleName}")
+                        sb.appendLine("  configureStream(${att.label}): ${(e.cause ?: e).javaClass.simpleName}")
                     } finally {
                         try { release.invoke(rq) } catch (_: Throwable) {}
                         try { release.invoke(rp) } catch (_: Throwable) {}
                     }
                 }
             } else {
-                sb.appendLine("  HwBlob недоступен — пробуем без blob:")
                 streamCall(2, "configureStream(no args)")
             }
 
-            // method=1: getStreamConfig (после попытки configure)
+            // getStreamConfig после configure
             streamCall(1, "getStreamConfig")
 
-            // method=3: setStreamBuffers (ONEWAY) — пока без реальных буферов
+            // setStreamBuffers (пока пустой)
             streamOW(3, "setStreamBuffers(empty)")
 
-            // method=4: startStream (ONEWAY)
+            // startStream
             streamOW(4, "startStream")
 
-            // Ждём callback — 5 секунд
-            Thread.sleep(5000)
-            sb.appendLine("  lastCode after startStream+5s: ${try { getLastCode?.invoke(qcarStubInstance) } catch (_: Throwable) { null }}")
+            // Ждём callback — 3 секунды
+            Thread.sleep(3000)
+            sb.appendLine("  lastCode after startStream+3s: ${try { getLastCode?.invoke(qcarStubInstance) } catch (_: Throwable) { null }}")
 
-            // method=7: getFrame
+            // getFrame / releaseFrame
             streamCall(7, "getFrame")
-
-            // method=8: releaseFrame
             streamCall(8, "releaseFrame(no args)")
 
-            // method=5: stopStream (ONEWAY)
+            // stopStream
             streamOW(5, "stopStream")
 
+            // Закрываем стрим на IQcarCamera (метод 3 = closeStream, принимает IQcarCameraStream)
+            Thread.sleep(200)
+            val rqClose = newParcel(); val rpClose = newParcel()
+            try {
+                writeToken.invoke(rqClose, iface)
+                writeStrongBinder.invoke(rqClose, sb2)   // передаём stream binder как аргумент
+                transact.invoke(binder, 3, rqClose, rpClose, 0)  // m=3 closeStream на IQcarCamera
+                try { verifySuc.invoke(rpClose) } catch (_: Throwable) {}
+                sb.appendLine("  closeStream: OK")
+            } catch (e: Throwable) {
+                sb.appendLine("  closeStream: ${(e.cause ?: e).javaClass.simpleName}")
+            } finally {
+                try { release.invoke(rqClose) } catch (_: Throwable) {}
+                try { release.invoke(rpClose) } catch (_: Throwable) {}
+            }
+
             // Финальная проверка callback
-            Thread.sleep(500)
+            Thread.sleep(300)
             val lastFinal = try { getLastCode?.invoke(qcarStubInstance) } catch (_: Throwable) { null }
             sb.appendLine("  lastCode FINAL: $lastFinal${if ((lastFinal as? Int) != null && lastFinal != -1) " *** CALLBACK RECEIVED code=$lastFinal ***" else ""}")
+
+        } catch (e: Throwable) {
+            sb.appendLine("  *** STREAM BLOCK CRASHED: ${e.javaClass.name}: ${e.message?.take(100)} ***")
 
         } else {
             sb.appendLine("  IQcarCameraStream binder = null")
@@ -620,31 +628,98 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
             sb.appendLine("  lastCode after 3s = $lastFinal")
         }
 
+        // ── AHardwareBuffer + NativeHandle ──
+        // AHardwareBuffer (API 29) → getNativeHandle() → передать в setStreamBuffers
+        sb.appendLine("\n  --- AHardwareBuffer / NativeHandle probe ---")
+        try {
+            val hbClass = Class.forName("android.hardware.HardwareBuffer")
+            // create(width, height, format=RGBA_8888=1, layers=1, usage=CPU_WRITE_OFTEN=0x40)
+            val hbCreate = hbClass.getMethod("create",
+                Int::class.java, Int::class.java, Int::class.java, Int::class.java, Long::class.java)
+            val hb = hbCreate.invoke(null, 64, 64, 1, 1, 0x40L)
+            sb.appendLine("  HardwareBuffer.create(64x64 RGBA): ${hb?.javaClass?.simpleName ?: "null"}")
+            if (hb != null) {
+                // Перечислим методы HardwareBuffer c "Handle"/"Native"
+                val hbMethods = hbClass.methods.map { it.name }.filter { it.contains("handle", true) || it.contains("native", true) }
+                sb.appendLine("  HardwareBuffer handle-methods: $hbMethods")
+                val getNH = hbClass.methods.firstOrNull {
+                    it.name.lowercase().contains("native") && it.name.lowercase().contains("handle") }
+                if (getNH != null) {
+                    getNH.isAccessible = true
+                    val nh = try { getNH.invoke(hb) } catch (e: Throwable) { "ERR:${(e.cause?:e).javaClass.simpleName}" }
+                    sb.appendLine("  ${getNH.name}() = ${nh?.javaClass?.simpleName ?: "null"}")
+                }
+                try { hbClass.getMethod("close").invoke(hb) } catch (_: Throwable) {}
+            }
+        } catch (e: Throwable) {
+            sb.appendLine("  HardwareBuffer: ${(e.cause ?: e).javaClass.simpleName}: ${(e.cause ?: e).message?.take(60)}")
+        }
+
+        // android.os.NativeHandle — API 30, есть на Android 11
+        try {
+            val nhClass = Class.forName("android.os.NativeHandle")
+            sb.appendLine("  NativeHandle class: found")
+            val nhMethods = nhClass.methods.map { "${it.name}(${it.parameterTypes.joinToString { p -> p.simpleName }})" }
+            sb.appendLine("  NativeHandle methods: $nhMethods")
+            val writeNHM = try { hwParcelClass.getMethod("writeNativeHandle", nhClass) } catch (_: Throwable) { null }
+            sb.appendLine("  HwParcel.writeNativeHandle: ${if (writeNHM != null) "found" else "NOT found"}")
+        } catch (e: Throwable) {
+            sb.appendLine("  NativeHandle class: not found (${(e.cause?:e).javaClass.simpleName})")
+        }
+
+        // ── Попытка readBuffer для getInputStreamList ──
+        // getInputStreamList (m=1) возвращает hidl_vec<QcarcamInputInfo> через BINDER_TYPE_PTR буферы.
+        // Попробуем прочитать их через HwParcel.readBuffer если метод доступен.
+        sb.appendLine("\n  --- getInputStreamList readBuffer attempt ---")
+        try {
+            val readBufM = hwParcelClass.methods.firstOrNull { m ->
+                m.name == "readBuffer" && m.parameterCount >= 1 }
+            sb.appendLine("  HwParcel.readBuffer signature: ${readBufM?.let { "${it.name}(${it.parameterTypes.joinToString { p -> p.simpleName }})" } ?: "not found"}")
+
+            if (readBufM != null) {
+                val rq2 = newParcel(); val rp2 = newParcel()
+                try {
+                    writeToken.invoke(rq2, iface)
+                    transact.invoke(binder, 1, rq2, rp2, 0)
+                    try { verifySuc.invoke(rp2) } catch (_: Throwable) {}
+                    // Попробуем вызвать readBuffer с разными аргументами
+                    val params = readBufM.parameterTypes
+                    val buf = when {
+                        params.size == 1 && params[0] == Long::class.java ->
+                            try { readBufM.invoke(rp2, 16L) } catch (e: Throwable) { "ERR:${(e.cause?:e).message?.take(40)}" }
+                        params.size == 2 ->
+                            try { readBufM.invoke(rp2, 16L, LongArray(1)) } catch (e: Throwable) { "ERR:${(e.cause?:e).message?.take(40)}" }
+                        params.size == 3 ->
+                            try { readBufM.invoke(rp2, 16L, LongArray(1), false) } catch (e: Throwable) { "ERR:${(e.cause?:e).message?.take(40)}" }
+                        else -> "unknown params: ${params.map { it.simpleName }}"
+                    }
+                    if (buf is java.nio.ByteBuffer) {
+                        val bytes = ByteArray(minOf(buf.remaining(), 64))
+                        buf.get(bytes)
+                        sb.appendLine("  readBuffer(16) → ${bytes.size} bytes: ${bytes.take(16).map { "0x${(it.toInt() and 0xFF).toString(16)}" }}")
+                    } else {
+                        sb.appendLine("  readBuffer(16) → $buf")
+                    }
+                } finally {
+                    try { release.invoke(rq2) } catch (_: Throwable) {}
+                    try { release.invoke(rp2) } catch (_: Throwable) {}
+                }
+            }
+        } catch (e: Throwable) {
+            sb.appendLine("  readBuffer probe: ${(e.cause ?: e).javaClass.simpleName}: ${(e.cause ?: e).message?.take(60)}")
+        }
+
         // Logcat for any HAL messages
-        val lcR = shell("logcat", "-d", "-t", "400", "-v", "brief", timeoutMs = 5000)
+        val lcR = shell("logcat", "-d", "-t", "300", "-v", "brief", timeoutMs = 5000)
         val qcarLines = lcR.stdout.lines().filter { line ->
-            listOf("qcar", "QCar", "QCAR", "qcarcam", "QCarCam", "QCarCamera",
-                   "hwbinder", "HwBinder", "vendor.qti.automotive")
+            listOf("qcar", "QCar", "qcarcam", "hwbinder", "HwBinder", "vendor.qti.automotive",
+                   "HardwareBuffer", "NativeHandle")
                 .any { line.contains(it) }
-        }.takeLast(50)
+        }.takeLast(40)
         if (qcarLines.isNotEmpty()) {
-            sb.appendLine("\n  --- logcat (qcarcam/hwbinder) ---")
+            sb.appendLine("\n  --- logcat ---")
             qcarLines.forEach { sb.appendLine("  ${it.take(200)}") }
         }
-    }
-
-    // Methods 3..7 — no args, probe the rest of the API surface
-    for (m in 3..7) {
-        val (sm, dm) = safeTransact(m)
-        sb.appendLine("  method=$m(no args) status=$sm" +
-            if (!dm.isNullOrEmpty()) " hex=${dm.take(4).map { "0x${it.toUInt().toString(16)}" }}" else "")
-    }
-
-    // Methods 3..4 — inputId=0 as uint32
-    for (m in 3..4) {
-        val (smh, dmh) = safeTransact(m) { req -> writeInt32.invoke(req, 0) }
-        sb.appendLine("  method=$m(inputId=0) status=$smh" +
-            if (!dmh.isNullOrEmpty()) " hex=${dmh.take(4).map { "0x${it.toUInt().toString(16)}" }}" else "")
     }
 
     // strings on vendor lib — look for ALL method/interface names

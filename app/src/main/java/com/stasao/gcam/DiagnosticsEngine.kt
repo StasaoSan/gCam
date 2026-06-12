@@ -7,33 +7,38 @@ import kotlinx.coroutines.withContext
 class DiagnosticsEngine(internal val context: Context) {
 
     suspend fun runAll(onProgress: (CheckResult) -> Unit) = withContext(Dispatchers.IO) {
-        suspend fun report(r: CheckResult) = withContext(Dispatchers.Main) { onProgress(r) }
+        // Crash recovery: пишем каждую проверку сразу в файл.
+        // Если приложение упадёт в HIDL-проверке — все предыдущие результаты уже на диске.
+        val crashFile = try {
+            java.io.File(context.getExternalFilesDir(null), "gcam_last_run.txt").also { f ->
+                f.writeText("=== gCam Diagnostics (crash recovery) ===\n" +
+                    "Started: ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())}\n\n")
+            }
+        } catch (_: Exception) { null }
 
+        suspend fun report(r: CheckResult) {
+            withContext(Dispatchers.Main) { onProgress(r) }
+            try { crashFile?.appendText("[${r.status.name}] ${r.title}\n${r.detail.trimEnd()}\n\n") }
+            catch (_: Exception) {}
+        }
+
+        // Лёгкие проверки — идут первыми, чтобы данные точно сохранились
         report(checkDeviceInfo())
         report(checkSystemProps())
-        report(checkProcessesViaProcfs())
         report(checkSeLinux())
         report(checkOwnGids())
-        report(checkVideoDevices())
-        report(checkV4L2NodeNames())
-        report(checkCameraHal())
         report(checkShellServiceList())
-        report(checkShellLsZSocket())
-        report(checkCameraSocketDir())
-        report(checkHidlCameraProvider())
-        report(checkHwServiceManager())
         report(checkQCarCamProcess())
-        report(checkQCarCamHidl())
-        report(checkQCarCamDeeper())
-        report(checkEvsHidl())
         report(checkVendorSockets())
         report(checkVendorInitFiles())
         report(checkVendorCameraProps())
-        report(checkCarPropertyCamera())
-        report(checkCarVendorExtension())
-        report(checkCarAndEvsDetail())
         report(checkInstalledPackages())
         report(checkECarXCarService())
+        report(checkQCarCamDeeper())
+        // QCarCam HIDL — самая долгая и потенциально крашащая — идёт последней
+        report(checkQCarCamHidl())
+
+        try { crashFile?.appendText("=== RUN COMPLETED ===\n") } catch (_: Exception) {}
     }
 
     internal data class ShellResult(val stdout: String, val stderr: String, val exitCode: Int)

@@ -84,15 +84,43 @@ fun GCamApp() {
     var diagRunning by remember { mutableStateOf(false) }
     var diagDone by remember { mutableStateOf(false) }
     var selectedTab by remember { mutableIntStateOf(0) }
+    var exportPath by remember { mutableStateOf("") }
 
     fun runDiag() {
         scope.launch {
             diagRunning = true
             diagResults.clear()
             diagDone = false
+            exportPath = ""
             DiagnosticsEngine(context).runAll { diagResults.add(it) }
             diagRunning = false
             diagDone = true
+        }
+    }
+
+    fun exportDiagLog() {
+        scope.launch(Dispatchers.IO) {
+            val ts = java.text.SimpleDateFormat("yyyy-MM-dd_HH-mm", java.util.Locale.US)
+                .format(java.util.Date())
+            val file = java.io.File(context.getExternalFilesDir(null), "gcam_diag_$ts.txt")
+            file.writeText(buildString {
+                appendLine("=== gCam Diagnostics ===")
+                appendLine("Device : ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
+                appendLine("Android: ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
+                appendLine("Date   : $ts")
+                appendLine("=".repeat(50))
+                appendLine()
+                diagResults.forEach { r ->
+                    appendLine("[${r.status.name}] ${r.title}")
+                    appendLine(r.detail.trimEnd())
+                    appendLine()
+                }
+            })
+            withContext(Dispatchers.Main) {
+                exportPath = file.absolutePath
+                Toast.makeText(context,
+                    "Сохранено: ${file.name}", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
@@ -114,14 +142,9 @@ fun GCamApp() {
                 ),
                 actions = {
                     if (diagDone) {
-                        TextButton(onClick = {
-                            val text = diagResults.joinToString("\n\n") {
-                                "[${it.status.name}] ${it.title}\n${it.detail}"
-                            }
-                            val cb = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            cb.setPrimaryClip(ClipData.newPlainText("gCam Diag", text))
-                            Toast.makeText(context, "Скопировано в буфер", Toast.LENGTH_SHORT).show()
-                        }) { Text("Копировать") }
+                        TextButton(onClick = { exportDiagLog() }) {
+                            Text("Экспорт .txt")
+                        }
                     }
                 }
             )
@@ -143,6 +166,7 @@ fun GCamApp() {
                     results = diagResults,
                     isRunning = diagRunning,
                     hasPerm = hasPerm,
+                    exportPath = exportPath,
                     onRerun = { runDiag() },
                     onRequestPerm = { permLauncher.launch(Manifest.permission.CAMERA) }
                 )
@@ -219,9 +243,11 @@ fun DiagnosticsTab(
     results: List<CheckResult>,
     isRunning: Boolean,
     hasPerm: Boolean,
+    exportPath: String,
     onRerun: () -> Unit,
     onRequestPerm: () -> Unit
 ) {
+    val context = LocalContext.current
     if (!hasPerm && results.isEmpty()) {
         PermissionScreen(onRequest = onRequestPerm)
         return
@@ -242,6 +268,30 @@ fun DiagnosticsTab(
             LinearProgressIndicator(Modifier.fillMaxWidth())
             Text("Выполняется диагностика...", Modifier.padding(12.dp),
                 style = MaterialTheme.typography.bodyMedium)
+        }
+        // Показ пути экспортированного файла + adb pull
+        if (exportPath.isNotEmpty()) {
+            Card(
+                Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))
+            ) {
+                Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("Файл сохранён:", fontSize = 11.sp, color = Color(0xFF1B5E20),
+                        fontWeight = FontWeight.Bold)
+                    Text(exportPath, fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+                        color = Color(0xFF2E7D32))
+                    Text("adb pull \"$exportPath\"",
+                        fontSize = 10.sp, fontFamily = FontFamily.Monospace, color = Color(0xFF1565C0))
+                    TextButton(
+                        onClick = {
+                            val cb = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            cb.setPrimaryClip(ClipData.newPlainText("adb", "adb pull \"$exportPath\""))
+                            Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
+                        },
+                        contentPadding = PaddingValues(0.dp)
+                    ) { Text("Скопировать adb pull", fontSize = 11.sp) }
+                }
+            }
         }
         if (results.isNotEmpty()) {
             Row(
