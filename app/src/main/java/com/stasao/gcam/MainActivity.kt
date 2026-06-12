@@ -10,6 +10,8 @@ import android.graphics.SurfaceTexture
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.TextureView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -102,8 +104,8 @@ fun GCamApp() {
         scope.launch(Dispatchers.IO) {
             val ts = java.text.SimpleDateFormat("yyyy-MM-dd_HH-mm", java.util.Locale.US)
                 .format(java.util.Date())
-            val file = java.io.File(context.getExternalFilesDir(null), "gcam_diag_$ts.txt")
-            file.writeText(buildString {
+            val fileName = "gcam_diag_$ts.txt"
+            val text = buildString {
                 appendLine("=== gCam Diagnostics ===")
                 appendLine("Device : ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
                 appendLine("Android: ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
@@ -115,11 +117,34 @@ fun GCamApp() {
                     appendLine(r.detail.trimEnd())
                     appendLine()
                 }
-            })
+            }
+
+            // Сохраняем через MediaStore.Downloads → /sdcard/Download/ (Android 10+, без доп. разрешений)
+            var savedPath = ""
+            try {
+                val cv = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    put(android.provider.MediaStore.Downloads.MIME_TYPE, "text/plain")
+                }
+                val uri = context.contentResolver.insert(
+                    android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
+                if (uri != null) {
+                    context.contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray()) }
+                    savedPath = "/sdcard/Download/$fileName"
+                }
+            } catch (_: Exception) {}
+
+            // Fallback: приватная папка приложения (всегда работает)
+            if (savedPath.isEmpty()) {
+                val file = java.io.File(context.getExternalFilesDir(null), fileName)
+                file.writeText(text)
+                savedPath = file.absolutePath
+            }
+
+            val finalPath = savedPath
             withContext(Dispatchers.Main) {
-                exportPath = file.absolutePath
-                Toast.makeText(context,
-                    "Сохранено: ${file.name}", Toast.LENGTH_SHORT).show()
+                exportPath = finalPath
+                Toast.makeText(context, "Сохранено: $fileName", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -276,20 +301,30 @@ fun DiagnosticsTab(
                 colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))
             ) {
                 Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("Файл сохранён:", fontSize = 11.sp, color = Color(0xFF1B5E20),
-                        fontWeight = FontWeight.Bold)
+                    val inDownload = exportPath.startsWith("/sdcard/Download")
+                    Text(if (inDownload) "Сохранено в /sdcard/Download/" else "Сохранено (fallback):",
+                        fontSize = 11.sp, color = Color(0xFF1B5E20), fontWeight = FontWeight.Bold)
                     Text(exportPath, fontSize = 10.sp, fontFamily = FontFamily.Monospace,
                         color = Color(0xFF2E7D32))
-                    Text("adb pull \"$exportPath\"",
-                        fontSize = 10.sp, fontFamily = FontFamily.Monospace, color = Color(0xFF1565C0))
+                    if (!inDownload) {
+                        Text("adb pull \"$exportPath\"",
+                            fontSize = 10.sp, fontFamily = FontFamily.Monospace, color = Color(0xFF1565C0))
+                    }
+                    Text(
+                        if (inDownload) "Доступен в файловом менеджере → Download"
+                        else "Crash recovery: adb pull /sdcard/Android/data/com.stasao.gcam/files/gcam_last_run.txt",
+                        fontSize = 9.sp, color = Color(0xFF388E3C)
+                    )
                     TextButton(
                         onClick = {
+                            val cmd = if (inDownload) "adb pull \"$exportPath\""
+                                      else "adb pull \"$exportPath\""
                             val cb = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            cb.setPrimaryClip(ClipData.newPlainText("adb", "adb pull \"$exportPath\""))
+                            cb.setPrimaryClip(ClipData.newPlainText("adb", cmd))
                             Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
                         },
                         contentPadding = PaddingValues(0.dp)
-                    ) { Text("Скопировать adb pull", fontSize = 11.sp) }
+                    ) { Text("Скопировать путь", fontSize = 11.sp) }
                 }
             }
         }
@@ -348,13 +383,6 @@ fun DiagCard(result: CheckResult) {
 
 @Composable
 fun CameraTab(hasPerm: Boolean) {
-    if (!hasPerm) {
-        Box(Modifier.fillMaxSize(), Alignment.Center) {
-            Text("Нет разрешения CAMERA", color = Color(0xFFB71C1C))
-        }
-        return
-    }
-
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val controller = remember { CameraController(context) }
@@ -364,50 +392,55 @@ fun CameraTab(hasPerm: Boolean) {
     var isSuccess by remember { mutableStateOf(false) }
     var retryKey by remember { mutableIntStateOf(0) }
 
-    val surfaceTextureState = remember { mutableStateOf<SurfaceTexture?>(null) }
-    val surfaceSize = remember { mutableStateOf(Pair(1280, 720)) }
+    val surfaceHolderState = remember { mutableStateOf<SurfaceHolder?>(null) }
+    val surfaceSize = remember { mutableStateOf(Pair(0, 0)) }
 
     DisposableEffect(Unit) {
         onDispose { controller.release() }
     }
 
-    LaunchedEffect(surfaceTextureState.value, retryKey) {
-        val st = surfaceTextureState.value ?: return@LaunchedEffect
+    LaunchedEffect(surfaceHolderState.value, surfaceSize.value, retryKey) {
+        val holder = surfaceHolderState.value ?: return@LaunchedEffect
         val (w, h) = surfaceSize.value
+        if (w == 0 || h == 0) return@LaunchedEffect
 
         controller.release()
         isSuccess = false
         methodText = ""
 
-        // Attempt Camera2
+        // Попытка 1: Camera2
         statusText = "Пробуем Camera2..."
-        val r2 = withContext(Dispatchers.IO) { controller.tryCamera2(st, w, h) }
+        val r2 = withContext(Dispatchers.IO) { controller.tryCamera2(holder, w, h) }
         if (r2 is CameraOpenResult.Success) {
-            statusText = "Работает!"
-            methodText = r2.method
-            isSuccess = true
+            statusText = "Работает!"; methodText = r2.method; isSuccess = true
             return@LaunchedEffect
         }
 
-        // Attempt Camera1
-        statusText = "Camera2 не удалась (${(r2 as CameraOpenResult.Failure).reason})\nПробуем Camera1..."
-        val r1 = withContext(Dispatchers.IO) { controller.tryCamera1(st, w, h) }
+        // Попытка 2: Camera1
+        statusText = "Camera2: ${(r2 as CameraOpenResult.Failure).reason}\nПробуем Camera1..."
+        val r1 = withContext(Dispatchers.IO) { controller.tryCamera1(holder, w, h) }
         if (r1 is CameraOpenResult.Success) {
-            statusText = "Работает!"
-            methodText = r1.method
-            isSuccess = true
+            statusText = "Работает!"; methodText = r1.method; isSuccess = true
             return@LaunchedEffect
         }
 
-        statusText = "Обе попытки не удались:\n" +
+        // Попытка 3: ECarX EVSImp
+        statusText = "Camera1: ${(r1 as CameraOpenResult.Failure).reason}\nПробуем ECarX EVS..."
+        val rE = withContext(Dispatchers.IO) { controller.tryEvsCamera(holder) }
+        if (rE is CameraOpenResult.Success) {
+            statusText = "Работает!"; methodText = rE.method; isSuccess = true
+            return@LaunchedEffect
+        }
+
+        statusText = "Все методы не удались:\n" +
             "Camera2: ${r2.reason}\n" +
-            "Camera1: ${(r1 as CameraOpenResult.Failure).reason}"
-        methodText = ""
+            "Camera1: ${r1.reason}\n" +
+            "EVSImp:  ${(rE as CameraOpenResult.Failure).reason}"
         isSuccess = false
     }
 
     Column(Modifier.fillMaxSize()) {
-        // Status bar
+        // Статус-бар
         Surface(
             Modifier.fillMaxWidth(),
             color = when {
@@ -427,43 +460,34 @@ fun CameraTab(hasPerm: Boolean) {
             }
         }
 
-        // TextureView for camera preview
+        // SurfaceView — поддерживает и Camera1 и EVSImp (оба ждут SurfaceHolder)
         AndroidView(
             factory = { ctx ->
-                TextureView(ctx).apply {
-                    surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                        override fun onSurfaceTextureAvailable(
-                            surface: SurfaceTexture, width: Int, height: Int
-                        ) {
-                            surfaceSize.value = Pair(width, height)
-                            surfaceTextureState.value = surface
+                SurfaceView(ctx).apply {
+                    holder.addCallback(object : SurfaceHolder.Callback {
+                        override fun surfaceCreated(h: SurfaceHolder) {
+                            surfaceHolderState.value = h
                         }
-                        override fun onSurfaceTextureSizeChanged(
-                            surface: SurfaceTexture, width: Int, height: Int
-                        ) {
+                        override fun surfaceChanged(h: SurfaceHolder, format: Int, width: Int, height: Int) {
                             surfaceSize.value = Pair(width, height)
+                            surfaceHolderState.value = h
                         }
-                        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
-                            surfaceTextureState.value = null
+                        override fun surfaceDestroyed(h: SurfaceHolder) {
+                            surfaceHolderState.value = null
                             controller.release()
-                            return true
                         }
-                        override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
-                    }
+                    })
                 }
             },
             modifier = Modifier.fillMaxWidth().weight(1f)
         )
 
-        // Retry button, shown only on failure
         if (!isSuccess && !statusText.startsWith("Ожидание") && !statusText.startsWith("Пробуем")) {
             Button(
                 onClick = { retryKey++ },
                 modifier = Modifier.fillMaxWidth().padding(12.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-            ) {
-                Text("Попробовать ещё раз")
-            }
+            ) { Text("Попробовать ещё раз") }
         }
     }
 }

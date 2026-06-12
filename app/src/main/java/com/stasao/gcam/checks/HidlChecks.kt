@@ -203,8 +203,8 @@ internal fun DiagnosticsEngine.checkQCarCamHidl(): CheckResult {
         } else {
             sb.appendLine("\nHwBinder.getService: null")
         }
-    } catch (e: Exception) {
-        sb.appendLine("\nHwBinder: ${e.message?.take(80)}")
+    } catch (t: Throwable) {
+        sb.appendLine("\nHwBinder crashed: ${t.javaClass.simpleName}: ${t.message?.take(80)}")
     }
 
     val vendorLibs = (File("/vendor/lib64").listFiles { f ->
@@ -354,20 +354,7 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
 
     // G) real IHwBinder stub + joinRpcThreadpool (for callbacks) + session probe
 
-    // joinRpcThreadpool() blocks the calling thread in the HwBinder event loop.
-    // Without it, the HAL cannot deliver callbacks to our process.
-    val hwBinderCls2 = try { Class.forName("android.os.HwBinder") } catch (_: Throwable) { null }
-    val hwBrThread = if (hwBinderCls2 != null) {
-        Thread {
-            try {
-                hwBinderCls2.getMethod("configureRpcThreadpool", Long::class.java, Boolean::class.java)
-                    .invoke(null, 1L, true)  // 1 thread, callerWillJoin=true
-                hwBinderCls2.getMethod("joinRpcThreadpool").invoke(null)  // blocks
-            } catch (_: Throwable) {}
-        }.also { it.isDaemon = true; it.name = "qcarcam-hwbr"; it.start() }
-    } else null
-    Thread.sleep(300)  // wait for event loop to initialise
-    sb.appendLine("  HwBinder callback thread: ${when { hwBrThread == null -> "HwBinder class not found"; hwBrThread.isAlive -> "alive (callbacks ready)"; else -> "DIED — callbacks won't work" }}")
+    // joinRpcThreadpool убран: нативный вызов модифицирует глобальный ProcessState → SIGABRT
 
     val qcarStubInstance = if (writeStrongBinder != null) {
         try {
@@ -471,30 +458,7 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
             val putInt64B   = try { hwBlobClass?.getMethod("putInt64", Long::class.java, Long::class.java) } catch (_: Throwable) { null }
             sb.appendLine("  HwBlob: ${if (hwBlobCtor != null) "OK" else "unavailable"}, writeBuffer: ${if (writeBuffer != null) "OK" else "unavailable"}")
 
-            // Самотест: вызвать наш собственный callback через transact
-            // Если lastCode обновится → thread pool работает, HAL просто не вызывает нас
-            sb.appendLine("\n  --- Самотест callback ---")
-            val selfTransact = try {
-                qcarStubInstance!!.javaClass.getMethod("transact",
-                    Int::class.java, hwParcelClass, hwParcelClass, Int::class.java)
-            } catch (_: Throwable) { null }
-            if (selfTransact != null && getLastCode != null) {
-                val tq = newParcel(); val tr = newParcel()
-                try {
-                    writeToken.invoke(tq, "vendor.qti.automotive.qcarcam@1.0::IQcarCameraStreamCB")
-                    selfTransact.invoke(qcarStubInstance, 1, tq, tr, 0)
-                    val lc = try { getLastCode.invoke(qcarStubInstance) } catch (_: Throwable) { -99 }
-                    sb.appendLine("  selfTransact(code=1) → lastCode=$lc${if ((lc as? Int) == 1) " ✓ THREAD POOL WORKS" else " ✗ thread pool broken"}")
-                } catch (e: Throwable) {
-                    val inner = e.cause ?: e
-                    sb.appendLine("  selfTransact ERROR: ${inner.javaClass.simpleName}: ${inner.message?.take(80)}")
-                } finally {
-                    try { release.invoke(tq) } catch (_: Throwable) {}
-                    try { release.invoke(tr) } catch (_: Throwable) {}
-                }
-            } else {
-                sb.appendLine("  selfTransact: not available (selfTransact=$selfTransact)")
-            }
+            // selfTransact убран: HwBinder.transact() без нативного контекста → SIGSEGV
 
             // Get transact method from stream binder's class
             val streamTransact = try {
@@ -538,17 +502,44 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
                 }
             }
 
-            // ── configureStream через HwBlob (3 попытки с паузами) ──
-            sb.appendLine("\n  --- configureStream HwBlob probe ---")
+            // ── configureStream probe ──
+            sb.appendLine("\n  --- configureStream probe ---")
             if (hwBlobCtor != null && writeBuffer != null && putInt32B != null) {
+                // Тест 0: проверяем работоспособность HwBlob (hidden API restriction?)
+                try {
+                    val testBlob = hwBlobCtor.newInstance(4)
+                    val putOk = try { putInt32B.invoke(testBlob, 0L, 0x12345678); "OK" }
+                        catch (t: Throwable) { "FAIL(${(t.cause?:t).javaClass.simpleName})" }
+                    val tq = newParcel()
+                    try {
+                        writeToken.invoke(tq, streamIfaceToken)
+                        val wbOk = try { writeBuffer.invoke(tq, testBlob); "OK" }
+                            catch (t: Throwable) { "FAIL(${(t.cause?:t).javaClass.simpleName}:${(t.cause?:t).message?.take(40)})" }
+                        sb.appendLine("  HwBlob(sz=4): putInt32=$putOk writeBuffer=$wbOk")
+                    } finally { try { release.invoke(tq) } catch (_: Throwable) {} }
+                } catch (t: Throwable) {
+                    sb.appendLine("  HwBlob create FAIL: ${t.javaClass.simpleName}")
+                }
+
+                // Тесты: разные размеры/форматы QcarcamStreamConfig
+                // Форматы: 0=UYVY_8, 1=UYVY_10, 3=RGB888, 5=NV12 (QTI automotive)
                 data class CfgAttempt(val sz: Int, val fields: List<Int>, val label: String)
                 val attempts = listOf(
-                    CfgAttempt(24, listOf(0, 0, 0, 0, 0, 0),    "zeros sz=24"),
-                    CfgAttempt(24, listOf(0, 1280, 720, 0, 0, 0),"1280x720 sz=24"),
-                    CfgAttempt(32, listOf(0, 1280, 720, 0, 0, 0, 0, 0), "1280x720 sz=32")
+                    CfgAttempt(16, listOf(0, 1280, 720, 3),           "sz=16 fmt=0"),
+                    CfgAttempt(16, listOf(1, 1280, 720, 3),           "sz=16 fmt=1"),
+                    CfgAttempt(16, listOf(3, 1280, 720, 3),           "sz=16 fmt=3"),
+                    CfgAttempt(20, listOf(0, 1280, 720, 3, 0),        "sz=20"),
+                    CfgAttempt(24, listOf(0, 1280, 720, 3, 0, 0),     "sz=24 fmt=0"),
+                    CfgAttempt(24, listOf(1, 1280, 720, 3, 0, 0),     "sz=24 fmt=1"),
+                    CfgAttempt(24, listOf(3, 1280, 720, 3, 0, 0),     "sz=24 fmt=3"),
+                    CfgAttempt(24, listOf(5, 1280, 720, 3, 0, 0),     "sz=24 fmt=5"),
+                    CfgAttempt(28, listOf(0, 1280, 720, 3, 0, 0, 0),  "sz=28"),
+                    CfgAttempt(32, listOf(0, 1280, 720, 3, 0, 0, 0, 0), "sz=32"),
+                    CfgAttempt(40, listOf(0, 1280, 720, 3, 0, 0, 0, 0, 0, 0), "sz=40"),
+                    CfgAttempt(48, listOf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), "sz=48 zeros"),
                 )
                 for (att in attempts) {
-                    Thread.sleep(100)
+                    Thread.sleep(30)
                     val rq = newParcel(); val rp = newParcel()
                     try {
                         writeToken.invoke(rq, streamIfaceToken)
@@ -556,16 +547,33 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
                         att.fields.forEachIndexed { i, v ->
                             try { putInt32B.invoke(blob, (i * 4).toLong(), v) } catch (_: Throwable) {}
                         }
-                        writeBuffer.invoke(rq, blob)
-                        streamTransact.invoke(sb2, 2, rq, rp, 0)
-                        try { verifySuc.invoke(rp) } catch (_: Throwable) {}
-                        val v = try { readInt32.invoke(rp) as? Int } catch (_: Throwable) { null }
-                        sb.appendLine("  configureStream(${att.label}) status=$v${if (v == 0) " ✓ OK!" else if (v == -61) " (ENODATA)" else ""}")
+                        // Разделяем writeBuffer и transact чтобы точно знать где падает
+                        try { writeBuffer.invoke(rq, blob) }
+                        catch (wbEx: Throwable) {
+                            sb.appendLine("  cfg(${att.label}) wbFAIL: ${(wbEx.cause?:wbEx).javaClass.simpleName}: ${(wbEx.cause?:wbEx).message?.take(40)}")
+                            continue
+                        }
+                        try {
+                            streamTransact.invoke(sb2, 2, rq, rp, 0)
+                            try { verifySuc.invoke(rp) } catch (_: Throwable) {}
+                            val v = try { readInt32.invoke(rp) as? Int } catch (_: Throwable) { null }
+                            sb.appendLine("  cfg(${att.label}) → $v${if (v == 0) " ✓ OK!" else if (v == -61) " ENODATA" else ""}")
+                        } catch (txEx: Throwable) {
+                            sb.appendLine("  cfg(${att.label}) txFAIL: ${(txEx.cause?:txEx).javaClass.simpleName}: ${(txEx.cause?:txEx).message?.take(40)}")
+                        }
                     } catch (e: Throwable) {
-                        sb.appendLine("  configureStream(${att.label}): ${(e.cause ?: e).javaClass.simpleName}")
+                        sb.appendLine("  cfg(${att.label}) EX: ${(e.cause ?: e).javaClass.simpleName}")
                     } finally {
                         try { release.invoke(rq) } catch (_: Throwable) {}
                         try { release.invoke(rp) } catch (_: Throwable) {}
+                    }
+                }
+                // Запасной вариант: без HwBlob, плоские int32 (нестандартно, но покажет реакцию HAL)
+                for (fmt in listOf(0, 1, 3)) {
+                    streamCall(2, "flat_int32 fmt=$fmt") { rq ->
+                        writeInt32.invoke(rq, fmt); writeInt32.invoke(rq, 1280)
+                        writeInt32.invoke(rq, 720); writeInt32.invoke(rq, 3)
+                        writeInt32.invoke(rq, 0);   writeInt32.invoke(rq, 0)
                     }
                 }
             } else {
@@ -581,9 +589,9 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
             // startStream
             streamOW(4, "startStream")
 
-            // Ждём callback — 3 секунды
-            Thread.sleep(3000)
-            sb.appendLine("  lastCode after startStream+3s: ${try { getLastCode?.invoke(qcarStubInstance) } catch (_: Throwable) { null }}")
+            // Ждём callback
+            Thread.sleep(800)
+            sb.appendLine("  lastCode after startStream+800ms: ${try { getLastCode?.invoke(qcarStubInstance) } catch (_: Throwable) { null }}")
 
             // getFrame / releaseFrame
             streamCall(7, "getFrame")
@@ -628,77 +636,58 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
             sb.appendLine("  lastCode after 3s = $lastFinal")
         }
 
-        // ── AHardwareBuffer + NativeHandle ──
-        // AHardwareBuffer (API 29) → getNativeHandle() → передать в setStreamBuffers
-        sb.appendLine("\n  --- AHardwareBuffer / NativeHandle probe ---")
+        // ── getInputStreamList: читаем через readBuffer ──
+        // ВАЖНО: не читаем int32 до readBuffer — иначе позиция смещается
+        sb.appendLine("\n  --- getInputStreamList readBuffer ---")
         try {
-            val hbClass = Class.forName("android.hardware.HardwareBuffer")
-            // create(width, height, format=RGBA_8888=1, layers=1, usage=CPU_WRITE_OFTEN=0x40)
-            val hbCreate = hbClass.getMethod("create",
-                Int::class.java, Int::class.java, Int::class.java, Int::class.java, Long::class.java)
-            val hb = hbCreate.invoke(null, 64, 64, 1, 1, 0x40L)
-            sb.appendLine("  HardwareBuffer.create(64x64 RGBA): ${hb?.javaClass?.simpleName ?: "null"}")
-            if (hb != null) {
-                // Перечислим методы HardwareBuffer c "Handle"/"Native"
-                val hbMethods = hbClass.methods.map { it.name }.filter { it.contains("handle", true) || it.contains("native", true) }
-                sb.appendLine("  HardwareBuffer handle-methods: $hbMethods")
-                val getNH = hbClass.methods.firstOrNull {
-                    it.name.lowercase().contains("native") && it.name.lowercase().contains("handle") }
-                if (getNH != null) {
-                    getNH.isAccessible = true
-                    val nh = try { getNH.invoke(hb) } catch (e: Throwable) { "ERR:${(e.cause?:e).javaClass.simpleName}" }
-                    sb.appendLine("  ${getNH.name}() = ${nh?.javaClass?.simpleName ?: "null"}")
-                }
-                try { hbClass.getMethod("close").invoke(hb) } catch (_: Throwable) {}
-            }
-        } catch (e: Throwable) {
-            sb.appendLine("  HardwareBuffer: ${(e.cause ?: e).javaClass.simpleName}: ${(e.cause ?: e).message?.take(60)}")
-        }
-
-        // android.os.NativeHandle — API 30, есть на Android 11
-        try {
-            val nhClass = Class.forName("android.os.NativeHandle")
-            sb.appendLine("  NativeHandle class: found")
-            val nhMethods = nhClass.methods.map { "${it.name}(${it.parameterTypes.joinToString { p -> p.simpleName }})" }
-            sb.appendLine("  NativeHandle methods: $nhMethods")
-            val writeNHM = try { hwParcelClass.getMethod("writeNativeHandle", nhClass) } catch (_: Throwable) { null }
-            sb.appendLine("  HwParcel.writeNativeHandle: ${if (writeNHM != null) "found" else "NOT found"}")
-        } catch (e: Throwable) {
-            sb.appendLine("  NativeHandle class: not found (${(e.cause?:e).javaClass.simpleName})")
-        }
-
-        // ── Попытка readBuffer для getInputStreamList ──
-        // getInputStreamList (m=1) возвращает hidl_vec<QcarcamInputInfo> через BINDER_TYPE_PTR буферы.
-        // Попробуем прочитать их через HwParcel.readBuffer если метод доступен.
-        sb.appendLine("\n  --- getInputStreamList readBuffer attempt ---")
-        try {
-            val readBufM = hwParcelClass.methods.firstOrNull { m ->
-                m.name == "readBuffer" && m.parameterCount >= 1 }
-            sb.appendLine("  HwParcel.readBuffer signature: ${readBufM?.let { "${it.name}(${it.parameterTypes.joinToString { p -> p.simpleName }})" } ?: "not found"}")
+            val readBufM = hwParcelClass.methods.firstOrNull { it.name == "readBuffer" && it.parameterCount >= 1 }
+            val readEmbM = hwParcelClass.methods.firstOrNull { it.name == "readEmbeddedBuffer" && it.parameterCount >= 1 }
+            sb.appendLine("  readBuffer:         ${readBufM?.let { "${it.name}(${it.parameterTypes.map{p->p.simpleName}})" } ?: "not found"}")
+            sb.appendLine("  readEmbeddedBuffer: ${readEmbM?.let { "${it.name}(${it.parameterTypes.map{p->p.simpleName}})" } ?: "not found"}")
 
             if (readBufM != null) {
+                // Создаём BlobHelper для чтения полей из HwBlob через reflection
+                val hwBlobCls2  = try { Class.forName("android.os.HwBlob") } catch (_: Throwable) { null }
+                val blobGetI32  = try { hwBlobCls2?.getMethod("getInt32", Long::class.javaObjectType) } catch (_: Throwable) { null }
+                fun blobI32(blob: Any, off: Long): Int? = try { blobGetI32?.let { m -> m.invoke(blob, off) as? Int } } catch (_: Throwable) { null }
+
                 val rq2 = newParcel(); val rp2 = newParcel()
                 try {
                     writeToken.invoke(rq2, iface)
                     transact.invoke(binder, 1, rq2, rp2, 0)
                     try { verifySuc.invoke(rp2) } catch (_: Throwable) {}
-                    // Попробуем вызвать readBuffer с разными аргументами
+                    // Читаем hidl_vec header (16 байт: ptr64 + count64)
                     val params = readBufM.parameterTypes
-                    val buf = when {
-                        params.size == 1 && params[0] == Long::class.java ->
-                            try { readBufM.invoke(rp2, 16L) } catch (e: Throwable) { "ERR:${(e.cause?:e).message?.take(40)}" }
-                        params.size == 2 ->
-                            try { readBufM.invoke(rp2, 16L, LongArray(1)) } catch (e: Throwable) { "ERR:${(e.cause?:e).message?.take(40)}" }
-                        params.size == 3 ->
-                            try { readBufM.invoke(rp2, 16L, LongArray(1), false) } catch (e: Throwable) { "ERR:${(e.cause?:e).message?.take(40)}" }
-                        else -> "unknown params: ${params.map { it.simpleName }}"
+                    val blob16 = when (params.size) {
+                        1    -> try { readBufM.invoke(rp2, 16L) } catch (t: Throwable) { "ERR:${(t.cause?:t).javaClass.simpleName}:${(t.cause?:t).message?.take(30)}" }
+                        2    -> try { readBufM.invoke(rp2, 16L, LongArray(1)) } catch (t: Throwable) { "ERR:${(t.cause?:t).javaClass.simpleName}:${(t.cause?:t).message?.take(30)}" }
+                        else -> "params=${params.map{it.simpleName}}"
                     }
-                    if (buf is java.nio.ByteBuffer) {
-                        val bytes = ByteArray(minOf(buf.remaining(), 64))
-                        buf.get(bytes)
-                        sb.appendLine("  readBuffer(16) → ${bytes.size} bytes: ${bytes.take(16).map { "0x${(it.toInt() and 0xFF).toString(16)}" }}")
-                    } else {
-                        sb.appendLine("  readBuffer(16) → $buf")
+                    sb.appendLine("  readBuffer(16) → type=${blob16?.javaClass?.simpleName}")
+                    if (blob16 != null && hwBlobCls2?.isInstance(blob16) == true) {
+                        val ptrLo = blobI32(blob16, 0L)?.toUInt()?.toString(16)
+                        val ptrHi = blobI32(blob16, 4L)?.toUInt()?.toString(16)
+                        val count = blobI32(blob16, 8L)
+                        sb.appendLine("  hidl_vec: ptr=0x${ptrHi}_${ptrLo}  count=$count")
+                        // Пробуем читать embedded элементы QcarcamInputInfo (размер неизвестен)
+                        if (count != null && count > 0 && readEmbM != null) {
+                            val embParams = readEmbM.parameterTypes
+                            for (elemSz in listOf(72L, 48L, 32L, 24L)) {
+                                val eblob = try {
+                                    when (embParams.size) {
+                                        4    -> readEmbM.invoke(rp2, count * elemSz, 0L, 0L, false)
+                                        3    -> readEmbM.invoke(rp2, count * elemSz, 0L, 0L)
+                                        else -> null
+                                    }
+                                } catch (_: Throwable) { null }
+                                if (eblob != null && hwBlobCls2.isInstance(eblob)) {
+                                    sb.appendLine("  readEmbedded(count*$elemSz) → OK  ← QcarcamInputInfo size=$elemSz")
+                                    val f = (0..3).map { i -> blobI32(eblob, i * 4L)?.toUInt()?.toString(16) ?: "?" }
+                                    sb.appendLine("  elem[0] fields: 0x${f[0]} 0x${f[1]} 0x${f[2]} 0x${f[3]}")
+                                    break
+                                }
+                            }
+                        }
                     }
                 } finally {
                     try { release.invoke(rq2) } catch (_: Throwable) {}
@@ -707,6 +696,34 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
             }
         } catch (e: Throwable) {
             sb.appendLine("  readBuffer probe: ${(e.cause ?: e).javaClass.simpleName}: ${(e.cause ?: e).message?.take(60)}")
+        }
+
+        // ── EVSImp — альтернативный путь к камере через ECarX ──
+        sb.appendLine("\n  --- ECarX EVSImp probe ---")
+        try {
+            val evsCls = Class.forName("com.ecarx.xui.adaptapi.evs.EVSImp")
+            val evsMethods = evsCls.methods
+                .map { "${it.name}(${it.parameterTypes.joinToString { p -> p.simpleName }}):${it.returnType.simpleName}" }
+                .sorted()
+            sb.appendLine("  EVSImp class found, methods (${evsMethods.size}):")
+            evsMethods.take(30).forEach { sb.appendLine("    $it") }
+            // Попробуем создать экземпляр
+            val inst = try {
+                val ctor = evsCls.constructors.firstOrNull()
+                ctor?.let {
+                    val args = it.parameterTypes.map { p ->
+                        when {
+                            p == android.content.Context::class.java -> context
+                            p.isPrimitive -> 0
+                            else -> null
+                        }
+                    }.toTypedArray()
+                    it.newInstance(*args)
+                }
+            } catch (t: Throwable) { "ERR:${(t.cause?:t).javaClass.simpleName}" }
+            sb.appendLine("  EVSImp instance: $inst")
+        } catch (t: Throwable) {
+            sb.appendLine("  EVSImp: ${t.javaClass.simpleName}: ${t.message?.take(60)}")
         }
 
         // Logcat for any HAL messages
@@ -722,71 +739,6 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
         }
     }
 
-    // strings on vendor lib — look for ALL method/interface names
-    val libPath = "/vendor/lib64/vendor.qti.automotive.qcarcam@1.0.so"
-    val strR = shell("strings", libPath, timeoutMs = 5000)
-    if (strR.stdout.isNotEmpty()) {
-        val allLines = strR.stdout.lines().filter { it.length in 4..120 }
-        // Group 1: mangled C++ symbols with method names
-        val mangledMethods = allLines.filter { it.startsWith("_Z") &&
-            (it.contains("Session") || it.contains("Buffer") || it.contains("Stream") ||
-             it.contains("Input") || it.contains("Start") || it.contains("Stop") ||
-             it.contains("Frame") || it.contains("Surface") || it.contains("Alloc") ||
-             it.contains("Queue") || it.contains("Config") || it.contains("Param") ||
-             it.contains("Qcar") || it.contains("Camera")) }
-        // Group 2: readable strings (method names, HIDL descriptors, error messages)
-        val readable = allLines.filter { !it.startsWith("_Z") }.filter { line ->
-            listOf("QcarCam", "IQcar", "session", "Session", "input", "frame", "stream",
-                "Stream", "open", "start", "stop", "init", "buffer", "Buffer", "surface",
-                "Surface", "alloc", "Alloc", "vendor.qti", "format", "width", "height",
-                "queue", "param", "config", "method", "transact", "Camera", "camera")
-                .any { line.contains(it) }
-        }
-        sb.appendLine("\nstrings $libPath (${allLines.size} строк всего):")
-        if (mangledMethods.isNotEmpty()) {
-            sb.appendLine("  Mangled symbols с интересными именами (${mangledMethods.size}):")
-            mangledMethods.distinct().take(40).forEach { sb.appendLine("    $it") }
-        }
-        if (readable.isNotEmpty()) {
-            sb.appendLine("  Читаемые строки (${readable.size}):")
-            readable.distinct().take(40).forEach { sb.appendLine("    $it") }
-        }
-        if (mangledMethods.isEmpty() && readable.isEmpty()) {
-            sb.appendLine("  Нет совпадений. Первые 20 строк:")
-            allLines.take(20).forEach { sb.appendLine("    $it") }
-        }
-    } else {
-        val f = File(libPath)
-        sb.appendLine("\n$libPath: exists=${f.exists()} size=${f.length()}")
-        sb.appendLine("strings: ${strR.stderr.take(80)}")
-    }
-
-    // Search for .hal files — would reveal the exact method signatures
-    for (searchDir in listOf("/vendor", "/system", "/odm")) {
-        val r = shell("find", searchDir, "-name", "*.hal", "-path", "*qcarcam*", timeoutMs = 2000)
-        if (r.stdout.isNotEmpty()) {
-            sb.appendLine("\n.hal файлы ($searchDir): ${r.stdout.take(200)}")
-            r.stdout.lines().firstOrNull()?.let { halPath ->
-                try {
-                    val content = File(halPath).readText().take(800)
-                    sb.appendLine("HAL содержимое:\n$content")
-                } catch (_: Exception) {}
-            }
-        }
-    }
-
-    // Find the surround-view / 360° system APK that uses QCarCam
-    val surroundPkg = try {
-        context.packageManager.getInstalledPackages(0)
-            .filter { it.applicationInfo?.flags?.and(android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0 }
-            .filter { pkg ->
-                listOf("surround", "360", "parking", "avm", "qcar", "evs", "view")
-                    .any { pkg.packageName.contains(it, true) }
-            }.map { it.packageName }
-    } catch (_: Exception) { emptyList() }
-    if (surroundPkg.isNotEmpty()) {
-        sb.appendLine("\nSystem APK (surround/360/avm): ${surroundPkg.joinToString()}")
-    }
 }
 
 internal fun DiagnosticsEngine.checkEvsHidl(): CheckResult {
@@ -1036,4 +988,244 @@ internal fun DiagnosticsEngine.checkQCarCamDeeper(): CheckResult {
     }
 
     return CheckResult("QCarCam Deeper", CheckStatus.INFO, sb.toString().trim())
+}
+
+internal fun DiagnosticsEngine.checkECarXEvs(): CheckResult {
+    val sb = StringBuilder()
+    val pkg = "com.ecarx.xui.adaptapi.evs"
+
+    // Probe all known ECarX EVS classes in this package
+    for (n in listOf("EVSImp", "EVS", "IEvsCamera", "IEvsCameraStatusObserver",
+                     "EvsCameraInfo", "EvsFrame", "EvsCamera", "EvsManagerClient")) {
+        try {
+            val cls = Class.forName("$pkg.$n")
+            val ifaces = cls.interfaces.map { it.simpleName }.joinToString()
+            val sup = cls.superclass?.simpleName ?: "Object"
+            sb.appendLine("[$n] super=$sup ifaces=${ifaces.ifEmpty { "none" }}")
+        } catch (_: Throwable) {}
+    }
+
+    // Create EVSImp instance (confirmed working from prior run)
+    val evsCls = try { Class.forName("$pkg.EVSImp") }
+        catch (t: Throwable) {
+            return CheckResult("ECarX EVS", CheckStatus.FAIL,
+                "EVSImp not found: ${t.message?.take(60)}\n$sb")
+        }
+
+    val evsimp: Any? = try {
+        val ctor = evsCls.constructors.firstOrNull()
+        val args = ctor?.parameterTypes?.map { p ->
+            when {
+                p == android.content.Context::class.java -> context
+                p.isPrimitive -> 0
+                else -> null
+            }
+        }?.toTypedArray()
+        if (args != null) ctor!!.newInstance(*args) else null
+    } catch (t: Throwable) {
+        sb.appendLine("EVSImp() FAIL: ${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(80)}")
+        null
+    }
+    sb.appendLine("EVSImp instance: $evsimp")
+    if (evsimp == null) return CheckResult("ECarX EVS", CheckStatus.FAIL, sb.toString())
+
+    // create(Context) — determine if static
+    val createM = evsCls.methods.firstOrNull { it.name == "create" }
+    val createIsStatic = createM?.let { java.lang.reflect.Modifier.isStatic(it.modifiers) } ?: false
+    sb.appendLine("create() static=$createIsStatic returnType=${createM?.returnType?.simpleName}")
+
+    val evs: Any? = if (createM != null) try {
+        if (createIsStatic) createM.invoke(null, context)
+        else createM.invoke(evsimp, context)
+    } catch (t: Throwable) {
+        sb.appendLine("create(context) FAIL: ${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(100)}")
+        null
+    } else null
+    sb.appendLine("EVS from create(): ${evs?.javaClass?.name ?: "null"}")
+
+    // Show EVS methods if it's a different type from EVSImp
+    if (evs != null && evs.javaClass != evsCls) {
+        val ms = evs.javaClass.methods
+            .map { "${it.name}(${it.parameterTypes.joinToString { p -> p.simpleName }}):${it.returnType.simpleName}" }
+            .sorted()
+        sb.appendLine("EVS (${evs.javaClass.simpleName}) methods (${ms.size}):")
+        ms.forEach { sb.appendLine("  $it") }
+    }
+
+    // getEvsCamera() — try on EVSImp, then on EVS object
+    var evsCamera: Any? = null
+    for ((label, target) in listOf("EVSImp" to evsimp, "EVS" to evs)) {
+        if (target == null || evsCamera != null) continue
+        val m = try { target.javaClass.getMethod("getEvsCamera") } catch (_: Throwable) { null } ?: continue
+        evsCamera = try {
+            m.invoke(target).also { cam ->
+                sb.appendLine("IEvsCamera from $label: ${cam?.javaClass?.name ?: "null"}")
+            }
+        } catch (t: Throwable) {
+            sb.appendLine("getEvsCamera() on $label FAIL: ${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(80)}")
+            null
+        }
+    }
+
+    // isCameraOpened — только на EVSImp, не на EvsCamera
+    val isOpenOnEvsimp = try { evsimp.javaClass.getMethod("isCameraOpened", Int::class.java) } catch (_: Throwable) { null }
+    if (isOpenOnEvsimp != null) {
+        sb.appendLine("\nEVSImp.isCameraOpened(0..5):")
+        (0..5).forEach { id ->
+            val v = try { isOpenOnEvsimp.invoke(evsimp, id) }
+                catch (t: Throwable) { (t.cause ?: t).javaClass.simpleName }
+            sb.appendLine("  isCameraOpened($id)=$v")
+        }
+    }
+
+    if (evsCamera != null) {
+        val camCls = evsCamera.javaClass
+        sb.appendLine("\n[IEvsCamera] class=${camCls.name}")
+        sb.appendLine("  interfaces=${camCls.interfaces.map { it.simpleName }}")
+        val camMethods = camCls.methods.map { m ->
+            val mod = if (java.lang.reflect.Modifier.isStatic(m.modifiers)) "static " else ""
+            "$mod${m.name}(${m.parameterTypes.joinToString { p -> p.simpleName }}):${m.returnType.simpleName}"
+        }.sorted()
+        sb.appendLine("  methods (${camMethods.size}):")
+        camMethods.forEach { sb.appendLine("    $it") }
+
+        // open(0..10) — пробуем ВСЕ ID, не останавливаемся на false
+        val openM = try { camCls.getMethod("open", Int::class.java) } catch (_: Throwable) { null }
+        if (openM != null) {
+            sb.appendLine("  open(0..10):")
+            for (id in 0..10) {
+                val v = try { openM.invoke(evsCamera, id) }
+                    catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(60)}" }
+                sb.appendLine("    open($id)=$v")
+                if (v == true) {
+                    // Нашли рабочий ID — пробуем startPreview без surface
+                    val startV = try { camCls.getMethod("startPreview").invoke(evsCamera) }
+                        catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(50)}" }
+                    sb.appendLine("    startPreview() (без surface) = $startV")
+                    try { camCls.getMethod("stopPreview").invoke(evsCamera) } catch (_: Throwable) {}
+                    break
+                }
+            }
+        }
+
+        // startPreview() / release() без open — смотрим поведение
+        for (name in listOf("startPreview", "stopPreview", "release")) {
+            val m = try { camCls.getMethod(name) } catch (_: Throwable) { null } ?: continue
+            val v = try { m.invoke(evsCamera) }
+                catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(60)}" }
+            sb.appendLine("  $name() (прямой вызов) = $v")
+        }
+    } else {
+        sb.appendLine("IEvsCamera = null — getEvsCamera() не вернул объект")
+    }
+
+    // ── ЭКСПЕРИМЕНТ 1: fake context (com.ecarx.parking) ─────────────────────
+    sb.appendLine("\n=== Fake context (com.ecarx.parking) ===")
+    try {
+        val fakeCtx = object : android.content.ContextWrapper(context) {
+            override fun getPackageName() = "com.ecarx.parking"
+        }
+        val evsFake: Any? = if (createM != null) try {
+            if (createIsStatic) createM.invoke(null, fakeCtx) else createM.invoke(evsimp, fakeCtx)
+        } catch (t: Throwable) {
+            sb.appendLine("create(parkingCtx) FAIL: ${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(100)}")
+            null
+        } else null
+        sb.appendLine("create(parkingCtx) = ${evsFake?.javaClass?.name ?: "null"}")
+
+        if (evsFake != null) {
+            val fakeCam = try { evsFake.javaClass.getMethod("getEvsCamera").invoke(evsFake) } catch (_: Throwable) { null }
+            sb.appendLine("  getEvsCamera = ${fakeCam?.javaClass?.simpleName ?: "null"}")
+            if (fakeCam != null) {
+                val fOpenM = try { fakeCam.javaClass.getMethod("open", Int::class.java) } catch (_: Throwable) { null }
+                for (id in 0..5) {
+                    val v = try { fOpenM?.invoke(fakeCam, id) }
+                        catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(50)}" }
+                    sb.appendLine("  [parking] open($id)=$v")
+                    if (v == true) {
+                        val sv = try { fakeCam.javaClass.getMethod("startPreview").invoke(fakeCam) } catch (t: Throwable) { "ERR:${(t.cause ?: t).javaClass.simpleName}" }
+                        sb.appendLine("  [parking] startPreview()=$sv")
+                        try { fakeCam.javaClass.getMethod("stopPreview").invoke(fakeCam) } catch (_: Throwable) {}
+                        break
+                    }
+                }
+            }
+        }
+    } catch (t: Throwable) {
+        sb.appendLine("fake context FAIL: ${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(80)}")
+    }
+
+    // ── ЭКСПЕРИМЕНТ 2: AVM trigger + open ────────────────────────────────────
+    sb.appendLine("\n=== AVM trigger + open ===")
+    try {
+        val pasCls = Class.forName("ecarx.fw.api.PasFunc.PasFunc\$\$Creator")
+        val pasCreator = pasCls.newInstance()
+        val pasFunc = pasCreator.javaClass
+            .getMethod("create", android.content.Context::class.java)
+            .invoke(pasCreator, context)
+        val avmM = pasFunc?.javaClass?.getMethod("startOrStopAvm", Int::class.javaPrimitiveType)
+        if (avmM != null && evsCamera != null) {
+            val startRes = try { avmM.invoke(pasFunc, 1) } catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}" }
+            sb.appendLine("startOrStopAvm(1) = $startRes")
+            Thread.sleep(1000)
+
+            // isCameraOpened после AVM
+            val isoM = try { evsimp.javaClass.getMethod("isCameraOpened", Int::class.java) } catch (_: Throwable) { null }
+            if (isoM != null) {
+                sb.appendLine("isCameraOpened(0..5) после AVM:")
+                (0..5).forEach { id ->
+                    val v = try { isoM.invoke(evsimp, id) }
+                        catch (t: Throwable) { (t.cause ?: t).javaClass.simpleName }
+                    sb.appendLine("  isCameraOpened($id)=$v")
+                }
+            }
+
+            // open(0..5) после AVM
+            val openM = try { evsCamera.javaClass.getMethod("open", Int::class.java) } catch (_: Throwable) { null }
+            if (openM != null) {
+                sb.appendLine("open(0..5) после AVM:")
+                for (id in 0..5) {
+                    val v = try { openM.invoke(evsCamera, id) }
+                        catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(50)}" }
+                    sb.appendLine("  open($id)=$v")
+                    if (v == true) {
+                        sb.appendLine("  → УСПЕХ!")
+                        val sv = try { evsCamera.javaClass.getMethod("startPreview").invoke(evsCamera) } catch (t: Throwable) { "ERR" }
+                        sb.appendLine("  startPreview()=$sv")
+                        try { evsCamera.javaClass.getMethod("stopPreview").invoke(evsCamera) } catch (_: Throwable) {}
+                        break
+                    }
+                }
+            }
+
+            // Останавливаем AVM
+            try { avmM.invoke(pasFunc, 0) } catch (_: Throwable) {}
+        } else {
+            sb.appendLine("PasFunc или evsCamera = null, пропускаем")
+        }
+    } catch (t: Throwable) {
+        sb.appendLine("AVM experiment FAIL: ${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(80)}")
+    }
+
+    // attachEvsCameraStatusObserver(null) — check for SecurityException vs NPE
+    try {
+        val obsCls = Class.forName("$pkg.IEvsCameraStatusObserver")
+        val m = evsimp.javaClass.getMethod("attachEvsCameraStatusObserver", obsCls)
+        val v = try { m.invoke(evsimp, null) }
+            catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(80)}" }
+        sb.appendLine("attachEvsCameraStatusObserver(null)=$v")
+    } catch (_: Throwable) {}
+
+    // Logcat for any EVS activity
+    val lcR = shell("logcat", "-d", "-t", "200", "-v", "brief", timeoutMs = 4000)
+    val evsLines = lcR.stdout.lines().filter { line ->
+        listOf("EVS", "evs", "EvsCamera", "evsCamera", "EVSImp", "ecarx").any { line.contains(it) }
+    }.takeLast(20)
+    if (evsLines.isNotEmpty()) {
+        sb.appendLine("\n--- logcat EVS ---")
+        evsLines.forEach { sb.appendLine("  ${it.take(200)}") }
+    }
+
+    val status = if (evsCamera != null) CheckStatus.OK else CheckStatus.WARN
+    return CheckResult("ECarX EVS Camera", status, sb.toString().trim())
 }

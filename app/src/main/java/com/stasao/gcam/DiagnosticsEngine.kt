@@ -7,22 +7,41 @@ import kotlinx.coroutines.withContext
 class DiagnosticsEngine(internal val context: Context) {
 
     suspend fun runAll(onProgress: (CheckResult) -> Unit) = withContext(Dispatchers.IO) {
-        // Crash recovery: пишем каждую проверку сразу в файл.
-        // Если приложение упадёт в HIDL-проверке — все предыдущие результаты уже на диске.
-        val crashFile = try {
-            java.io.File(context.getExternalFilesDir(null), "gcam_last_run.txt").also { f ->
-                f.writeText("=== gCam Diagnostics (crash recovery) ===\n" +
-                    "Started: ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())}\n\n")
+        val ts = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+        val header = "=== gCam Diagnostics ===\nStarted: $ts\n\n"
+
+        // MediaStore: создаём запись ОДИН РАЗ, держим OutputStream открытым весь прогон.
+        // flush() после каждой проверки — данные немедленно на диске даже при краше.
+        val crashUri = try {
+            context.contentResolver.delete(
+                android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                "${android.provider.MediaStore.Downloads.DISPLAY_NAME}=?",
+                arrayOf("gcam_last_run.txt"))
+            val cv = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.Downloads.DISPLAY_NAME, "gcam_last_run.txt")
+                put(android.provider.MediaStore.Downloads.MIME_TYPE, "text/plain")
             }
+            context.contentResolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
+        } catch (_: Exception) { null }
+
+        val crashStream: java.io.OutputStream? = try {
+            crashUri?.let { context.contentResolver.openOutputStream(it) }
+                ?.also { os -> os.write(header.toByteArray()); os.flush() }
+        } catch (_: Exception) { null }
+
+        // Резервный файл в приватной папке (страховка)
+        val crashFile: java.io.File? = try {
+            java.io.File(context.getExternalFilesDir(null), "gcam_last_run.txt")
+                .also { it.writeText(header) }
         } catch (_: Exception) { null }
 
         suspend fun report(r: CheckResult) {
             withContext(Dispatchers.Main) { onProgress(r) }
-            try { crashFile?.appendText("[${r.status.name}] ${r.title}\n${r.detail.trimEnd()}\n\n") }
-            catch (_: Exception) {}
+            val line = "[${r.status.name}] ${r.title}\n${r.detail.trimEnd()}\n\n"
+            try { crashStream?.write(line.toByteArray()); crashStream?.flush() } catch (_: Exception) {}
+            try { crashFile?.appendText(line) } catch (_: Exception) {}
         }
 
-        // Лёгкие проверки — идут первыми, чтобы данные точно сохранились
         report(checkDeviceInfo())
         report(checkSystemProps())
         report(checkSeLinux())
@@ -35,10 +54,17 @@ class DiagnosticsEngine(internal val context: Context) {
         report(checkInstalledPackages())
         report(checkECarXCarService())
         report(checkQCarCamDeeper())
+        report(checkECarXEvs())
         // QCarCam HIDL — самая долгая и потенциально крашащая — идёт последней
-        report(checkQCarCamHidl())
+        val hidlResult = try { checkQCarCamHidl() } catch (t: Throwable) {
+            CheckResult("QCarCam HIDL", CheckStatus.FAIL,
+                "NATIVE CRASH: ${t.javaClass.simpleName}: ${t.message?.take(200)}")
+        }
+        report(hidlResult)
 
-        try { crashFile?.appendText("=== RUN COMPLETED ===\n") } catch (_: Exception) {}
+        val done = "=== RUN COMPLETED ===\n"
+        try { crashStream?.write(done.toByteArray()); crashStream?.flush(); crashStream?.close() } catch (_: Exception) {}
+        try { crashFile?.appendText(done) } catch (_: Exception) {}
     }
 
     internal data class ShellResult(val stdout: String, val stderr: String, val exitCode: Int)

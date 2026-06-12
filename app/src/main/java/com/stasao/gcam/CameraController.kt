@@ -2,13 +2,12 @@ package com.stasao.gcam
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.os.Handler
 import android.os.HandlerThread
-import android.view.Surface
+import android.view.SurfaceHolder
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 
@@ -25,9 +24,10 @@ class CameraController(private val context: Context) {
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var camera1: android.hardware.Camera? = null
+    private var evsCamera: Any? = null
 
     @SuppressLint("MissingPermission")
-    suspend fun tryCamera2(surfaceTexture: SurfaceTexture, width: Int, height: Int): CameraOpenResult {
+    suspend fun tryCamera2(holder: SurfaceHolder, width: Int, height: Int): CameraOpenResult {
         return try {
             val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
                 ?: return CameraOpenResult.Failure("Camera2", "CAMERA_SERVICE = null")
@@ -53,12 +53,10 @@ class CameraController(private val context: Context) {
                             if (cont.isActive) cont.resume(cam)
                         }
                         override fun onDisconnected(cam: CameraDevice) {
-                            cam.close()
-                            if (cont.isActive) cont.resume(null)
+                            cam.close(); if (cont.isActive) cont.resume(null)
                         }
                         override fun onError(cam: CameraDevice, error: Int) {
-                            cam.close()
-                            if (cont.isActive) cont.resume(null)
+                            cam.close(); if (cont.isActive) cont.resume(null)
                         }
                     }, h)
                 } catch (e: Exception) {
@@ -67,8 +65,7 @@ class CameraController(private val context: Context) {
             } ?: return CameraOpenResult.Failure("Camera2", "openCamera вернул null/error")
 
             cameraDevice = device
-            surfaceTexture.setDefaultBufferSize(width, height)
-            val surface = Surface(surfaceTexture)
+            val surface = holder.surface
 
             val ok = suspendCancellableCoroutine<Boolean> { cont ->
                 try {
@@ -91,9 +88,7 @@ class CameraController(private val context: Context) {
                             override fun onConfigureFailed(session: CameraCaptureSession) {
                                 if (cont.isActive) cont.resume(false)
                             }
-                        },
-                        h
-                    )
+                        }, h)
                 } catch (e: Exception) {
                     if (cont.isActive) cont.resume(false)
                 }
@@ -101,17 +96,15 @@ class CameraController(private val context: Context) {
 
             if (ok) CameraOpenResult.Success("Camera2 API")
             else CameraOpenResult.Failure("Camera2", "createCaptureSession onConfigureFailed")
-
         } catch (e: Exception) {
             CameraOpenResult.Failure("Camera2", e.message ?: "unknown error")
         }
     }
 
-    fun tryCamera1(surfaceTexture: SurfaceTexture, width: Int, height: Int): CameraOpenResult {
+    fun tryCamera1(holder: SurfaceHolder, width: Int, height: Int): CameraOpenResult {
         return try {
             val count = android.hardware.Camera.getNumberOfCameras()
             if (count == 0) return CameraOpenResult.Failure("Camera1", "getNumberOfCameras() = 0")
-
             val cam = android.hardware.Camera.open(0)
             val params = cam.parameters
             val best = params.supportedPreviewSizes
@@ -119,14 +112,43 @@ class CameraController(private val context: Context) {
             if (best != null) {
                 params.setPreviewSize(best.width, best.height)
                 cam.parameters = params
-                surfaceTexture.setDefaultBufferSize(best.width, best.height)
             }
-            cam.setPreviewTexture(surfaceTexture)
+            cam.setPreviewDisplay(holder)
             cam.startPreview()
             camera1 = cam
             CameraOpenResult.Success("Camera1 API (legacy)")
         } catch (e: Exception) {
             CameraOpenResult.Failure("Camera1", e.message ?: "unknown error")
+        }
+    }
+
+    fun tryEvsCamera(holder: SurfaceHolder): CameraOpenResult {
+        return try {
+            val evsCls = Class.forName("com.ecarx.xui.adaptapi.evs.EVSImp")
+            val createM = evsCls.methods.first { it.name == "create" }
+            // create() is static, returns EVSImp itself
+            val evsimp = createM.invoke(null, context)
+                ?: return CameraOpenResult.Failure("EVSImp", "create(context) вернул null")
+
+            val cam = evsimp.javaClass.getMethod("getEvsCamera").invoke(evsimp)
+                ?: return CameraOpenResult.Failure("EVSImp", "getEvsCamera() вернул null")
+
+            val openM = cam.javaClass.getMethod("open", Int::class.java)
+            var openedId = -1
+            for (id in 0..4) {
+                if (openM.invoke(cam, id) as? Boolean == true) { openedId = id; break }
+            }
+            if (openedId < 0) return CameraOpenResult.Failure("EVSImp", "open(0..4) все вернули false")
+
+            cam.javaClass.getMethod("setPreviewDisplay", SurfaceHolder::class.java).invoke(cam, holder)
+
+            val started = cam.javaClass.getMethod("startPreview").invoke(cam) as? Boolean ?: false
+            if (!started) return CameraOpenResult.Failure("EVSImp", "startPreview() false (cam#$openedId)")
+
+            evsCamera = cam
+            CameraOpenResult.Success("ECarX EVSImp cam#$openedId")
+        } catch (t: Throwable) {
+            CameraOpenResult.Failure("EVSImp", "${t.javaClass.simpleName}: ${t.message?.take(80)}")
         }
     }
 
@@ -140,5 +162,8 @@ class CameraController(private val context: Context) {
         handler = null
         try { camera1?.stopPreview(); camera1?.release() } catch (_: Exception) {}
         camera1 = null
+        try { evsCamera?.javaClass?.getMethod("stopPreview")?.invoke(evsCamera) } catch (_: Exception) {}
+        try { evsCamera?.javaClass?.getMethod("release")?.invoke(evsCamera) } catch (_: Exception) {}
+        evsCamera = null
     }
 }
