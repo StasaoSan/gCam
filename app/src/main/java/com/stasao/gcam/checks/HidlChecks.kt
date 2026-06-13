@@ -698,8 +698,9 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
 
             if (readBufM != null) {
                 val hwBlobCls2 = try { Class.forName("android.os.HwBlob") } catch (_: Throwable) { null }
-                val blobGetI32 = try { hwBlobCls2?.getMethod("getInt32",  Long::class.javaObjectType) } catch (_: Throwable) { null }
-                val blobGetI64 = try { hwBlobCls2?.getMethod("getInt64",  Long::class.javaObjectType) } catch (_: Throwable) { null }
+                // MUST use javaPrimitiveType — HwBlob.getInt32/64 take primitive long, not boxed Long
+                val blobGetI32 = try { hwBlobCls2?.getMethod("getInt32",  Long::class.javaPrimitiveType) } catch (_: Throwable) { null }
+                val blobGetI64 = try { hwBlobCls2?.getMethod("getInt64",  Long::class.javaPrimitiveType) } catch (_: Throwable) { null }
                 fun blobI32(blob: Any, off: Long): Int?  = try { blobGetI32?.invoke(blob, off) as? Int  } catch (_: Throwable) { null }
                 fun blobI64(blob: Any, off: Long): Long? = try { blobGetI64?.invoke(blob, off) as? Long } catch (_: Throwable) { null }
 
@@ -727,45 +728,59 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
                         else -> null.also { sb.appendLine("  readBuffer params=${rbParams.map{it.simpleName}}") }
                     }
                     sb.appendLine("  readBuffer(16) → ${if (vecBlob == null) "null" else vecBlob.javaClass.simpleName}")
+                    sb.appendLine("  blobGetI32=${blobGetI32 != null} blobGetI64=${blobGetI64 != null}")
 
                     if (vecBlob != null && hwBlobCls2?.isInstance(vecBlob) == true) {
-                        // hidl_vec в памяти: [ptr:int64, count:int64]
+                        // Dump all 4 int32 fields to reveal actual struct layout
+                        val b0 = blobI32(vecBlob, 0L); val b4 = blobI32(vecBlob, 4L)
+                        val b8 = blobI32(vecBlob, 8L); val b12 = blobI32(vecBlob, 12L)
+                        sb.appendLine("  vec[0]=${b0?.toUInt()} [4]=${b4?.toUInt()} [8]=${b8?.toUInt()} [12]=${b12?.toUInt()}")
+
+                        // hidl_vec: ptr(uint64 at 0) + count(uint64 at 8)
                         val count64 = blobI64(vecBlob, 8L) ?: blobI32(vecBlob, 8L)?.toLong()
                         val count = count64?.toInt() ?: 0
                         sb.appendLine("  hidl_vec count=$count")
 
-                        if (count > 0 && readEmbM != null) {
+                        // Try readEmbeddedBuffer UNCONDITIONALLY — raw hex shows 0x480=1152 bytes always
+                        if (readEmbM != null) {
                             val embParams = readEmbM.parameterTypes
-                            // Из raw hex знаем: embedded buffer = 0x480 = 1152 байт
-                            // Пробуем размеры элемента: 1152/count, и стандартные
                             val knownEmbSz = 1152L
-                            val candidates = listOf(knownEmbSz / count, 288L, 192L, 96L, 72L, 48L, 32L)
-                                .distinct().filter { it > 0 }
-                            for (elemSz in candidates) {
-                                val totalSz = count * elemSz
-                                val eblob = try {
-                                    when (embParams.size) {
-                                        4    -> readEmbM.invoke(rp2, totalSz, 0L, 0L, false)
-                                        3    -> readEmbM.invoke(rp2, totalSz, 0L, 0L)
-                                        else -> null
-                                    }
-                                } catch (_: Throwable) { null }
-                                if (eblob != null && hwBlobCls2.isInstance(eblob)) {
-                                    sb.appendLine("  readEmbedded(totalSz=$totalSz, elemSz=$elemSz) → OK")
-                                    // Дамп первых 16 полей по 4 байта каждого элемента
-                                    for (elem in 0 until minOf(count, 3)) {
+                            val eblob = try {
+                                when (embParams.size) {
+                                    4 -> readEmbM.invoke(rp2, knownEmbSz, 0L, 0L, false)
+                                    3 -> readEmbM.invoke(rp2, knownEmbSz, 0L, 0L)
+                                    else -> null
+                                }
+                            } catch (t: Throwable) {
+                                sb.appendLine("  readEmbedded(1152) FAIL: ${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(60)}")
+                                null
+                            }
+                            if (eblob != null && hwBlobCls2.isInstance(eblob)) {
+                                sb.appendLine("  readEmbedded(1152) → OK")
+                                // Dump first 288 bytes (72 uint32s, 9 rows × 8 values)
+                                val hexVals = (0 until 72).map { i ->
+                                    blobI32(eblob, i * 4L)?.toUInt()?.toString(16)?.padStart(8, '0') ?: "????????"
+                                }
+                                for (row in 0 until 9) {
+                                    val vals = hexVals.subList(row * 8, row * 8 + 8).joinToString(" ")
+                                    sb.appendLine("  emb[${row * 32}+]: $vals")
+                                }
+                                // Structured dump if count known
+                                if (count > 0) {
+                                    val elemSz = knownEmbSz / count
+                                    sb.appendLine("  ($count elems × $elemSz bytes)")
+                                    for (elem in 0 until minOf(count, 4)) {
                                         val base = elem * elemSz
-                                        val fields = (0 until minOf(16, (elemSz / 4).toInt())).map { i ->
+                                        val nFields = minOf(16L, elemSz / 4).toInt()
+                                        val fields = (0 until nFields).map { i ->
                                             blobI32(eblob, base + i * 4L)?.toUInt()?.toString(16) ?: "?"
                                         }
-                                        sb.appendLine("  elem[$elem](base=$base): ${fields.joinToString(" ")}")
+                                        sb.appendLine("  elem[$elem]: ${fields.joinToString(" ")}")
                                     }
-                                    break
                                 }
                             }
                         }
                     } else if (vecBlob == null && errCode == 0) {
-                        // readBuffer вернул null но Error=OK — попробуем через raw readInt32
                         sb.appendLine("  fallback: raw int32 reads after Error:")
                         val raws = (0 until 20).mapNotNull {
                             try { readInt32.invoke(rp2) as? Int } catch (_: Throwable) { null }
@@ -779,34 +794,6 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
             }
         } catch (e: Throwable) {
             sb.appendLine("  readBuffer probe: ${(e.cause ?: e).javaClass.simpleName}: ${(e.cause ?: e).message?.take(60)}")
-        }
-
-        // ── EVSImp — альтернативный путь к камере через ECarX ──
-        sb.appendLine("\n  --- ECarX EVSImp probe ---")
-        try {
-            val evsCls = Class.forName("com.ecarx.xui.adaptapi.evs.EVSImp")
-            val evsMethods = evsCls.methods
-                .map { "${it.name}(${it.parameterTypes.joinToString { p -> p.simpleName }}):${it.returnType.simpleName}" }
-                .sorted()
-            sb.appendLine("  EVSImp class found, methods (${evsMethods.size}):")
-            evsMethods.take(30).forEach { sb.appendLine("    $it") }
-            // Попробуем создать экземпляр
-            val inst = try {
-                val ctor = evsCls.constructors.firstOrNull()
-                ctor?.let {
-                    val args = it.parameterTypes.map { p ->
-                        when {
-                            p == android.content.Context::class.java -> context
-                            p.isPrimitive -> 0
-                            else -> null
-                        }
-                    }.toTypedArray()
-                    it.newInstance(*args)
-                }
-            } catch (t: Throwable) { "ERR:${(t.cause?:t).javaClass.simpleName}" }
-            sb.appendLine("  EVSImp instance: $inst")
-        } catch (t: Throwable) {
-            sb.appendLine("  EVSImp: ${t.javaClass.simpleName}: ${t.message?.take(60)}")
         }
 
         // Logcat for any HAL messages
@@ -824,107 +811,6 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
 
 }
 
-internal fun DiagnosticsEngine.checkEvsHidl(): CheckResult {
-    val sb = StringBuilder()
-
-    val hwBinderCls = try {
-        Class.forName("android.os.HwBinder")
-    } catch (e: Exception) {
-        return CheckResult("EVS HIDL", CheckStatus.FAIL, "HwBinder недоступен: ${e.message}")
-    }
-    val getServiceM = hwBinderCls.getMethod("getService", String::class.java, String::class.java)
-    val hwParcelCls = try { Class.forName("android.os.HwParcel") } catch (e: Exception) {
-        return CheckResult("EVS HIDL", CheckStatus.FAIL, "HwParcel недоступен: ${e.message}")
-    }
-    val newParcel   = { hwParcelCls.getDeclaredConstructor().newInstance() }
-    val writeToken  = hwParcelCls.getMethod("writeInterfaceToken", String::class.java)
-    val releaseP    = hwParcelCls.getMethod("release")
-    val verifySuc  = hwParcelCls.getMethod("verifySuccess")
-    val readInt32P  = hwParcelCls.getMethod("readInt32")
-
-    // EVS Manager HIDL interfaces (running as android.automotive.evs.manager@1.1)
-    val evsIfaces = listOf(
-        "android.automotive.evs@1.1::IEvsEnumerator" to "default",
-        "android.hardware.automotive.evs@1.1::IEvsEnumerator" to "default",
-        "android.hardware.automotive.evs@1.0::IEvsEnumerator" to "default",
-    )
-
-    for ((iface, instance) in evsIfaces) {
-        val binder = try {
-            getServiceM.invoke(null, iface, instance)
-        } catch (e: Exception) {
-            sb.appendLine("$iface/$instance: err=${e.cause?.message?.take(60) ?: e.message?.take(60)}")
-            continue
-        }
-        if (binder == null) {
-            sb.appendLine("$iface/$instance: null")
-            continue
-        }
-        sb.appendLine("$iface/$instance: FOUND! $binder")
-
-        val transactM = try {
-            binder.javaClass.getMethod("transact", Int::class.java, hwParcelCls, hwParcelCls, Int::class.java)
-        } catch (e: Exception) {
-            sb.appendLine("  transact method not found: ${e.message?.take(60)}")
-            continue
-        }
-
-        fun evsTransact(code: Int, writeArgs: ((Any) -> Unit)? = null): Pair<Int?, List<Int>> {
-            val req = newParcel()
-            val rep = newParcel()
-            return try {
-                writeToken.invoke(req, iface)
-                writeArgs?.invoke(req)
-                transactM.invoke(binder, code, req, rep, 0)
-                verifySuc.invoke(rep)
-                val status = readInt32P.invoke(rep) as? Int
-                val extra = mutableListOf<Int>()
-                repeat(12) {
-                    val v = try { readInt32P.invoke(rep) as? Int } catch (_: Throwable) { null } ?: return@repeat
-                    extra.add(v)
-                }
-                Pair(status, extra)
-            } catch (t: Throwable) {
-                val inner = t.cause ?: t
-                sb.appendLine("  EVS method=$code [${inner.javaClass.simpleName}]: ${inner.message?.take(70)}")
-                Pair(null, emptyList())
-            } finally {
-                try { releaseP.invoke(req) } catch (_: Throwable) {}
-                try { releaseP.invoke(rep) } catch (_: Throwable) {}
-            }
-        }
-
-        // Probe methods 1–5 without args — EVS 1.0: method=1=getCameraList, method=3=openCamera
-        for (m in 1..5) {
-            val (s, d) = evsTransact(m)
-            if (s != null) {
-                val hex = d.map { "0x${it.toUInt().toString(16)}" }.joinToString(" ")
-                sb.appendLine("  EVS method=$m status=$s hex=[$hex]")
-            }
-        }
-    }
-
-    // Also check regular Binder for EvsCameraService (ECarX EVS implementation)
-    val smClass = try { Class.forName("android.os.ServiceManager") } catch (_: Exception) { null }
-    val smGet   = smClass?.getMethod("getService", String::class.java)
-    for (name in listOf("EvsCameraService", "evsCamera", "evs_manager", "automotive_evs")) {
-        val b = try { smGet?.invoke(null, name) } catch (_: Exception) { null }
-        sb.appendLine("ServiceManager(\"$name\"): ${if (b != null) "FOUND $b" else "null"}")
-    }
-
-    // lshal grep for evs
-    val lsR = shell("lshal")
-    val evsLines = lsR.stdout.lines().filter { it.contains("evs", true) }
-    if (evsLines.isNotEmpty()) {
-        sb.appendLine("\nlshal (evs):")
-        evsLines.forEach { sb.appendLine("  $it") }
-    } else {
-        sb.appendLine("lshal evs: не найдено")
-    }
-
-    val hasEvs = sb.contains("FOUND")
-    return CheckResult("EVS HIDL", if (hasEvs) CheckStatus.OK else CheckStatus.WARN, sb.toString().trim())
-}
 
 internal fun DiagnosticsEngine.checkQCarCamDeeper(): CheckResult {
     val sb = StringBuilder()
@@ -1070,245 +956,70 @@ internal fun DiagnosticsEngine.checkQCarCamDeeper(): CheckResult {
         sb.appendLine("  /proc/self/status: ${e.message}")
     }
 
+    // 6. strings on QcarCam .so — looking for struct field names and format strings
+    sb.appendLine("\n[6] strings $libPath (stream config keywords)")
+    val strR = shell("strings", libPath, timeoutMs = 10000)
+    if (strR.stdout.isNotEmpty()) {
+        val interesting = strR.stdout.lines().filter { line ->
+            line.length in 4..80 && listOf(
+                "InputId", "inputId", "input_id", "colorFmt", "color_fmt", "ColorFmt",
+                "width", "height", "stride", "numBufs", "num_bufs", "numBuffers",
+                "UYVY", "NV12", "YUV420", "YUYV", "format", "Format",
+                "qcarcam_config", "QcarcamStream", "stream_config",
+                "open_stream", "openStream", "configureStream",
+                "getInputStreamList", "getInputList"
+            ).any { line.contains(it) }
+        }.distinct().take(40)
+        if (interesting.isNotEmpty()) {
+            sb.appendLine("  ${interesting.size} совпадений:")
+            interesting.forEach { sb.appendLine("  | $it") }
+        } else {
+            sb.appendLine("  strings OK (${strR.stdout.lines().size} строк), keywords не найдены")
+        }
+    } else {
+        sb.appendLine("  strings failed: ${strR.stderr.take(80)}")
+    }
+
+    // 7. QcarCam XML config — usually has input stream IDs, formats, resolutions
+    sb.appendLine("\n[7] QcarCam config XML")
+    val xmlCandidates = listOf(
+        "/vendor/etc/qcarcam_config.xml",
+        "/vendor/etc/camera/qcarcam_config.xml",
+        "/vendor/etc/qcarcam/qcarcam_config.xml"
+    )
+    var foundXml = false
+    for (path in xmlCandidates) {
+        val f = java.io.File(path)
+        if (f.exists()) {
+            try {
+                val txt = f.readText()
+                sb.appendLine("  FOUND: $path (${txt.length} bytes)")
+                txt.lines().take(60).forEach { sb.appendLine("  $it") }
+                foundXml = true
+            } catch (e: Exception) {
+                sb.appendLine("  $path: exists but read failed: ${e.message?.take(60)}")
+            }
+            break
+        }
+    }
+    if (!foundXml) {
+        // Broader scan
+        val scanR = shell("find", "/vendor/etc", "-name", "*qcarcam*", "-o", "-name", "*qcar_cam*",
+            timeoutMs = 5000)
+        if (scanR.stdout.isNotEmpty()) {
+            sb.appendLine("  find /vendor/etc: ${scanR.stdout}")
+            scanR.stdout.lines().filter { it.endsWith(".xml") }.firstOrNull()?.let { xmlPath ->
+                val txt = try { java.io.File(xmlPath).readText() } catch (_: Exception) { "" }
+                if (txt.isNotEmpty()) {
+                    sb.appendLine("  Content of $xmlPath:")
+                    txt.lines().take(60).forEach { sb.appendLine("  $it") }
+                    foundXml = true
+                }
+            }
+        }
+        if (!foundXml) sb.appendLine("  qcarcam_config.xml не найден")
+    }
+
     return CheckResult("QCarCam Deeper", CheckStatus.INFO, sb.toString().trim())
 }
 
-internal fun DiagnosticsEngine.checkECarXEvs(): CheckResult {
-    val sb = StringBuilder()
-    val pkg = "com.ecarx.xui.adaptapi.evs"
-
-    // Probe all known ECarX EVS classes in this package
-    for (n in listOf("EVSImp", "EVS", "IEvsCamera", "IEvsCameraStatusObserver",
-                     "EvsCameraInfo", "EvsFrame", "EvsCamera", "EvsManagerClient")) {
-        try {
-            val cls = Class.forName("$pkg.$n")
-            val ifaces = cls.interfaces.map { it.simpleName }.joinToString()
-            val sup = cls.superclass?.simpleName ?: "Object"
-            sb.appendLine("[$n] super=$sup ifaces=${ifaces.ifEmpty { "none" }}")
-        } catch (_: Throwable) {}
-    }
-
-    // Create EVSImp instance (confirmed working from prior run)
-    val evsCls = try { Class.forName("$pkg.EVSImp") }
-        catch (t: Throwable) {
-            return CheckResult("ECarX EVS", CheckStatus.FAIL,
-                "EVSImp not found: ${t.message?.take(60)}\n$sb")
-        }
-
-    val evsimp: Any? = try {
-        val ctor = evsCls.constructors.firstOrNull()
-        val args = ctor?.parameterTypes?.map { p ->
-            when {
-                p == android.content.Context::class.java -> context
-                p.isPrimitive -> 0
-                else -> null
-            }
-        }?.toTypedArray()
-        if (args != null) ctor!!.newInstance(*args) else null
-    } catch (t: Throwable) {
-        sb.appendLine("EVSImp() FAIL: ${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(80)}")
-        null
-    }
-    sb.appendLine("EVSImp instance: $evsimp")
-    if (evsimp == null) return CheckResult("ECarX EVS", CheckStatus.FAIL, sb.toString())
-
-    // create(Context) — determine if static
-    val createM = evsCls.methods.firstOrNull { it.name == "create" }
-    val createIsStatic = createM?.let { java.lang.reflect.Modifier.isStatic(it.modifiers) } ?: false
-    sb.appendLine("create() static=$createIsStatic returnType=${createM?.returnType?.simpleName}")
-
-    val evs: Any? = if (createM != null) try {
-        if (createIsStatic) createM.invoke(null, context)
-        else createM.invoke(evsimp, context)
-    } catch (t: Throwable) {
-        sb.appendLine("create(context) FAIL: ${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(100)}")
-        null
-    } else null
-    sb.appendLine("EVS from create(): ${evs?.javaClass?.name ?: "null"}")
-
-    // Show EVS methods if it's a different type from EVSImp
-    if (evs != null && evs.javaClass != evsCls) {
-        val ms = evs.javaClass.methods
-            .map { "${it.name}(${it.parameterTypes.joinToString { p -> p.simpleName }}):${it.returnType.simpleName}" }
-            .sorted()
-        sb.appendLine("EVS (${evs.javaClass.simpleName}) methods (${ms.size}):")
-        ms.forEach { sb.appendLine("  $it") }
-    }
-
-    // getEvsCamera() — try on EVSImp, then on EVS object
-    var evsCamera: Any? = null
-    for ((label, target) in listOf("EVSImp" to evsimp, "EVS" to evs)) {
-        if (target == null || evsCamera != null) continue
-        val m = try { target.javaClass.getMethod("getEvsCamera") } catch (_: Throwable) { null } ?: continue
-        evsCamera = try {
-            m.invoke(target).also { cam ->
-                sb.appendLine("IEvsCamera from $label: ${cam?.javaClass?.name ?: "null"}")
-            }
-        } catch (t: Throwable) {
-            sb.appendLine("getEvsCamera() on $label FAIL: ${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(80)}")
-            null
-        }
-    }
-
-    // isCameraOpened — только на EVSImp, не на EvsCamera
-    val isOpenOnEvsimp = try { evsimp.javaClass.getMethod("isCameraOpened", Int::class.java) } catch (_: Throwable) { null }
-    if (isOpenOnEvsimp != null) {
-        sb.appendLine("\nEVSImp.isCameraOpened(0..5):")
-        (0..5).forEach { id ->
-            val v = try { isOpenOnEvsimp.invoke(evsimp, id) }
-                catch (t: Throwable) { (t.cause ?: t).javaClass.simpleName }
-            sb.appendLine("  isCameraOpened($id)=$v")
-        }
-    }
-
-    if (evsCamera != null) {
-        val camCls = evsCamera.javaClass
-        sb.appendLine("\n[IEvsCamera] class=${camCls.name}")
-        sb.appendLine("  interfaces=${camCls.interfaces.map { it.simpleName }}")
-        val camMethods = camCls.methods.map { m ->
-            val mod = if (java.lang.reflect.Modifier.isStatic(m.modifiers)) "static " else ""
-            "$mod${m.name}(${m.parameterTypes.joinToString { p -> p.simpleName }}):${m.returnType.simpleName}"
-        }.sorted()
-        sb.appendLine("  methods (${camMethods.size}):")
-        camMethods.forEach { sb.appendLine("    $it") }
-
-        // open(0..10) — пробуем ВСЕ ID, не останавливаемся на false
-        val openM = try { camCls.getMethod("open", Int::class.java) } catch (_: Throwable) { null }
-        if (openM != null) {
-            sb.appendLine("  open(0..10):")
-            for (id in 0..10) {
-                val v = try { openM.invoke(evsCamera, id) }
-                    catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(60)}" }
-                sb.appendLine("    open($id)=$v")
-                if (v == true) {
-                    // Нашли рабочий ID — пробуем startPreview без surface
-                    val startV = try { camCls.getMethod("startPreview").invoke(evsCamera) }
-                        catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(50)}" }
-                    sb.appendLine("    startPreview() (без surface) = $startV")
-                    try { camCls.getMethod("stopPreview").invoke(evsCamera) } catch (_: Throwable) {}
-                    break
-                }
-            }
-        }
-
-        // startPreview() / release() без open — смотрим поведение
-        for (name in listOf("startPreview", "stopPreview", "release")) {
-            val m = try { camCls.getMethod(name) } catch (_: Throwable) { null } ?: continue
-            val v = try { m.invoke(evsCamera) }
-                catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(60)}" }
-            sb.appendLine("  $name() (прямой вызов) = $v")
-        }
-    } else {
-        sb.appendLine("IEvsCamera = null — getEvsCamera() не вернул объект")
-    }
-
-    // ── ЭКСПЕРИМЕНТ 1: fake context (com.ecarx.parking) ─────────────────────
-    sb.appendLine("\n=== Fake context (com.ecarx.parking) ===")
-    try {
-        val fakeCtx = object : android.content.ContextWrapper(context) {
-            override fun getPackageName() = "com.ecarx.parking"
-        }
-        val evsFake: Any? = if (createM != null) try {
-            if (createIsStatic) createM.invoke(null, fakeCtx) else createM.invoke(evsimp, fakeCtx)
-        } catch (t: Throwable) {
-            sb.appendLine("create(parkingCtx) FAIL: ${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(100)}")
-            null
-        } else null
-        sb.appendLine("create(parkingCtx) = ${evsFake?.javaClass?.name ?: "null"}")
-
-        if (evsFake != null) {
-            val fakeCam = try { evsFake.javaClass.getMethod("getEvsCamera").invoke(evsFake) } catch (_: Throwable) { null }
-            sb.appendLine("  getEvsCamera = ${fakeCam?.javaClass?.simpleName ?: "null"}")
-            if (fakeCam != null) {
-                val fOpenM = try { fakeCam.javaClass.getMethod("open", Int::class.java) } catch (_: Throwable) { null }
-                for (id in 0..5) {
-                    val v = try { fOpenM?.invoke(fakeCam, id) }
-                        catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(50)}" }
-                    sb.appendLine("  [parking] open($id)=$v")
-                    if (v == true) {
-                        val sv = try { fakeCam.javaClass.getMethod("startPreview").invoke(fakeCam) } catch (t: Throwable) { "ERR:${(t.cause ?: t).javaClass.simpleName}" }
-                        sb.appendLine("  [parking] startPreview()=$sv")
-                        try { fakeCam.javaClass.getMethod("stopPreview").invoke(fakeCam) } catch (_: Throwable) {}
-                        break
-                    }
-                }
-            }
-        }
-    } catch (t: Throwable) {
-        sb.appendLine("fake context FAIL: ${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(80)}")
-    }
-
-    // ── ЭКСПЕРИМЕНТ 2: AVM trigger + open ────────────────────────────────────
-    sb.appendLine("\n=== AVM trigger + open ===")
-    try {
-        val pasCls = Class.forName("ecarx.fw.api.PasFunc.PasFunc\$\$Creator")
-        val pasCreator = pasCls.newInstance()
-        val pasFunc = pasCreator.javaClass
-            .getMethod("create", android.content.Context::class.java)
-            .invoke(pasCreator, context)
-        val avmM = pasFunc?.javaClass?.getMethod("startOrStopAvm", Int::class.javaPrimitiveType)
-        if (avmM != null && evsCamera != null) {
-            val startRes = try { avmM.invoke(pasFunc, 1) } catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}" }
-            sb.appendLine("startOrStopAvm(1) = $startRes")
-            Thread.sleep(1000)
-
-            // isCameraOpened после AVM
-            val isoM = try { evsimp.javaClass.getMethod("isCameraOpened", Int::class.java) } catch (_: Throwable) { null }
-            if (isoM != null) {
-                sb.appendLine("isCameraOpened(0..5) после AVM:")
-                (0..5).forEach { id ->
-                    val v = try { isoM.invoke(evsimp, id) }
-                        catch (t: Throwable) { (t.cause ?: t).javaClass.simpleName }
-                    sb.appendLine("  isCameraOpened($id)=$v")
-                }
-            }
-
-            // open(0..5) после AVM
-            val openM = try { evsCamera.javaClass.getMethod("open", Int::class.java) } catch (_: Throwable) { null }
-            if (openM != null) {
-                sb.appendLine("open(0..5) после AVM:")
-                for (id in 0..5) {
-                    val v = try { openM.invoke(evsCamera, id) }
-                        catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(50)}" }
-                    sb.appendLine("  open($id)=$v")
-                    if (v == true) {
-                        sb.appendLine("  → УСПЕХ!")
-                        val sv = try { evsCamera.javaClass.getMethod("startPreview").invoke(evsCamera) } catch (t: Throwable) { "ERR" }
-                        sb.appendLine("  startPreview()=$sv")
-                        try { evsCamera.javaClass.getMethod("stopPreview").invoke(evsCamera) } catch (_: Throwable) {}
-                        break
-                    }
-                }
-            }
-
-            // Останавливаем AVM
-            try { avmM.invoke(pasFunc, 0) } catch (_: Throwable) {}
-        } else {
-            sb.appendLine("PasFunc или evsCamera = null, пропускаем")
-        }
-    } catch (t: Throwable) {
-        sb.appendLine("AVM experiment FAIL: ${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(80)}")
-    }
-
-    // attachEvsCameraStatusObserver(null) — check for SecurityException vs NPE
-    try {
-        val obsCls = Class.forName("$pkg.IEvsCameraStatusObserver")
-        val m = evsimp.javaClass.getMethod("attachEvsCameraStatusObserver", obsCls)
-        val v = try { m.invoke(evsimp, null) }
-            catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(80)}" }
-        sb.appendLine("attachEvsCameraStatusObserver(null)=$v")
-    } catch (_: Throwable) {}
-
-    // Logcat for any EVS activity
-    val lcR = shell("logcat", "-d", "-t", "200", "-v", "brief", timeoutMs = 4000)
-    val evsLines = lcR.stdout.lines().filter { line ->
-        listOf("EVS", "evs", "EvsCamera", "evsCamera", "EVSImp", "ecarx").any { line.contains(it) }
-    }.takeLast(20)
-    if (evsLines.isNotEmpty()) {
-        sb.appendLine("\n--- logcat EVS ---")
-        evsLines.forEach { sb.appendLine("  ${it.take(200)}") }
-    }
-
-    val status = if (evsCamera != null) CheckStatus.OK else CheckStatus.WARN
-    return CheckResult("ECarX EVS Camera", status, sb.toString().trim())
-}

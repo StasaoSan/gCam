@@ -53,8 +53,8 @@ class DiagnosticsEngine(internal val context: Context) {
         report(checkVendorCameraProps())
         report(checkInstalledPackages())
         report(checkECarXCarService())
+        report(checkAvmCameraTrigger())
         report(checkQCarCamDeeper())
-        report(checkECarXEvs())
         // QCarCam HIDL — самая долгая и потенциально крашащая — идёт последней
         val hidlResult = try { checkQCarCamHidl() } catch (t: Throwable) {
             CheckResult("QCarCam HIDL", CheckStatus.FAIL,

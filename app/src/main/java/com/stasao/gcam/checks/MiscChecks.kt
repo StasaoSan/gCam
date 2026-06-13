@@ -127,3 +127,40 @@ internal fun DiagnosticsEngine.checkECarXCarService(): CheckResult {
         if (hasService || hasClasses) CheckStatus.OK else CheckStatus.WARN,
         sb.toString().trim())
 }
+
+// Triggers AVM (360 camera view) via PasFunc.startOrStopAvm to confirm camera pipeline works
+internal fun DiagnosticsEngine.checkAvmCameraTrigger(): CheckResult {
+    val sb = StringBuilder()
+    try {
+        val pasCls = Class.forName("ecarx.fw.api.PasFunc.PasFunc\$\$Creator")
+        val pasCreator = pasCls.newInstance()
+        val pasFunc = pasCreator.javaClass
+            .getMethod("create", android.content.Context::class.java)
+            .invoke(pasCreator, context)
+        val avmM = pasFunc?.javaClass?.getMethod("startOrStopAvm", Int::class.javaPrimitiveType)
+
+        if (avmM == null || pasFunc == null) {
+            return CheckResult("AVM Camera Trigger", CheckStatus.WARN,
+                "PasFunc не найден — startOrStopAvm недоступен")
+        }
+
+        sb.appendLine("PasFunc: OK")
+        val startRes = try { avmM.invoke(pasFunc, 1) }
+            catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(80)}" }
+        sb.appendLine("startOrStopAvm(1) = $startRes  ← камера должна появиться на экране")
+
+        Thread.sleep(5000)  // 5 seconds to observe
+
+        val stopRes = try { avmM.invoke(pasFunc, 0) }
+            catch (t: Throwable) { "${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(80)}" }
+        sb.appendLine("startOrStopAvm(0) = $stopRes  ← камера остановлена")
+
+        val ok = startRes == null  // null means void (success)
+        return CheckResult("AVM Camera Trigger",
+            if (ok) CheckStatus.OK else CheckStatus.WARN,
+            sb.toString().trim())
+    } catch (t: Throwable) {
+        return CheckResult("AVM Camera Trigger", CheckStatus.FAIL,
+            "FAIL: ${(t.cause ?: t).javaClass.simpleName}: ${(t.cause ?: t).message?.take(120)}")
+    }
+}
