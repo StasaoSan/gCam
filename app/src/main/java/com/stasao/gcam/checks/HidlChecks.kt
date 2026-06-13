@@ -524,22 +524,60 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
                 // Тесты: разные размеры/форматы QcarcamStreamConfig
                 // Форматы: 0=UYVY_8, 1=UYVY_10, 3=RGB888, 5=NV12 (QTI automotive)
                 data class CfgAttempt(val sz: Int, val fields: List<Int>, val label: String)
+                // QcarcamStreamConfig field order guesses (QTI documentation patterns):
+                // A: [opmode, numBufs, colorFmt, stride, width, height, flags]
+                // B: [width, height, colorFmt, numBufs, stride, opmode, flags]
+                // C: [colorFmt, width, height, numBufs, ...]
+                // opmode: 0=single, 1=continuous; numBufs: 3-4; colorFmt: 0=UYVY_8, 12=NV12
                 val attempts = listOf(
-                    CfgAttempt(16, listOf(0, 1280, 720, 3),           "sz=16 fmt=0"),
-                    CfgAttempt(16, listOf(1, 1280, 720, 3),           "sz=16 fmt=1"),
-                    CfgAttempt(16, listOf(3, 1280, 720, 3),           "sz=16 fmt=3"),
-                    CfgAttempt(20, listOf(0, 1280, 720, 3, 0),        "sz=20"),
-                    CfgAttempt(24, listOf(0, 1280, 720, 3, 0, 0),     "sz=24 fmt=0"),
-                    CfgAttempt(24, listOf(1, 1280, 720, 3, 0, 0),     "sz=24 fmt=1"),
-                    CfgAttempt(24, listOf(3, 1280, 720, 3, 0, 0),     "sz=24 fmt=3"),
-                    CfgAttempt(24, listOf(5, 1280, 720, 3, 0, 0),     "sz=24 fmt=5"),
-                    CfgAttempt(28, listOf(0, 1280, 720, 3, 0, 0, 0),  "sz=28"),
-                    CfgAttempt(32, listOf(0, 1280, 720, 3, 0, 0, 0, 0), "sz=32"),
-                    CfgAttempt(40, listOf(0, 1280, 720, 3, 0, 0, 0, 0, 0, 0), "sz=40"),
-                    CfgAttempt(48, listOf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), "sz=48 zeros"),
+                    // Layout A: opmode, numBufs, fmt, stride, width, height, flags
+                    CfgAttempt(28, listOf(1, 3, 0, 1280, 1280, 720, 0),   "A:cont,3,uyvy,1280,1280,720"),
+                    CfgAttempt(28, listOf(1, 3, 12, 1280, 1280, 720, 0),  "A:cont,3,nv12,1280,1280,720"),
+                    CfgAttempt(28, listOf(1, 4, 0, 1280, 1280, 720, 0),   "A:cont,4,uyvy,1280,1280,720"),
+                    CfgAttempt(28, listOf(0, 3, 0, 1280, 1280, 720, 0),   "A:single,3,uyvy"),
+                    // Layout B: width, height, fmt, numBufs, stride, opmode, flags
+                    CfgAttempt(28, listOf(1280, 720, 0, 3, 1280, 1, 0),   "B:1280,720,uyvy,3"),
+                    CfgAttempt(28, listOf(1280, 720, 12, 3, 1280, 1, 0),  "B:1280,720,nv12,3"),
+                    // Layout C: fmt, width, height, numBufs (minimal, 16 bytes)
+                    CfgAttempt(16, listOf(0, 1280, 720, 3),               "C:uyvy,1280,720,3"),
+                    CfgAttempt(16, listOf(12, 1280, 720, 3),              "C:nv12,1280,720,3"),
+                    // Layout D: numBufs first
+                    CfgAttempt(20, listOf(3, 0, 1280, 720, 0),            "D:3,uyvy,1280,720"),
+                    CfgAttempt(20, listOf(3, 12, 1280, 720, 0),           "D:3,nv12,1280,720"),
+                    // inputId-based: stream config starts with inputId=0
+                    CfgAttempt(32, listOf(0, 1, 3, 0, 1280, 720, 1280, 0),"E:id=0,cont,3,uyvy"),
+                    CfgAttempt(32, listOf(0, 1280, 720, 0, 3, 1, 1280, 0),"E:id=0,1280,720"),
+                    // All zeros to see if HAL responds to anything
+                    CfgAttempt(28, listOf(0, 0, 0, 0, 0, 0, 0),           "allzeros"),
                 )
+                // ── ИСПРАВЛЕНИЕ: configureStream — ONEWAY метод (flags=1) ──
+                // Ранее вызывали с flags=0 → ядро возвращало EINVAL до достижения сервера.
+                // ONEWAY = fire-and-forget, reply не нужен, ждём callback после вызова.
+
+                fun cfgOneway(label: String, writeArgs: (Any) -> Unit) {
+                    val rq = newParcel(); val rp = newParcel()
+                    try {
+                        writeToken.invoke(rq, streamIfaceToken)
+                        writeArgs(rq)
+                        streamTransact.invoke(sb2, 2, rq, rp, 1)  // flags=1 ONEWAY
+                        sb.appendLine("  cfg_OW($label): sent OK")
+                    } catch (e: Throwable) {
+                        sb.appendLine("  cfg_OW($label): ${(e.cause ?: e).javaClass.simpleName}: ${(e.cause ?: e).message?.take(50)}")
+                    } finally {
+                        try { release.invoke(rq) } catch (_: Throwable) {}
+                        try { release.invoke(rp) } catch (_: Throwable) {}
+                    }
+                }
+
+                // Тест A: совсем без аргументов — посмотрим упадёт ли сервер
+                cfgOneway("no_args") {}
+
+                Thread.sleep(300)
+                sb.appendLine("  lastCode after cfg_OW(no_args)+300ms: ${try { getLastCode?.invoke(qcarStubInstance) } catch (_: Throwable) { null }}")
+
+                // Тест B: с HwBlob разных размеров (ONEWAY)
                 for (att in attempts) {
-                    Thread.sleep(30)
+                    Thread.sleep(50)
                     val rq = newParcel(); val rp = newParcel()
                     try {
                         writeToken.invoke(rq, streamIfaceToken)
@@ -547,51 +585,64 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
                         att.fields.forEachIndexed { i, v ->
                             try { putInt32B.invoke(blob, (i * 4).toLong(), v) } catch (_: Throwable) {}
                         }
-                        // Разделяем writeBuffer и transact чтобы точно знать где падает
                         try { writeBuffer.invoke(rq, blob) }
                         catch (wbEx: Throwable) {
-                            sb.appendLine("  cfg(${att.label}) wbFAIL: ${(wbEx.cause?:wbEx).javaClass.simpleName}: ${(wbEx.cause?:wbEx).message?.take(40)}")
+                            sb.appendLine("  cfg_OW(${att.label}) wbFAIL: ${(wbEx.cause?:wbEx).javaClass.simpleName}")
                             continue
                         }
-                        try {
-                            streamTransact.invoke(sb2, 2, rq, rp, 0)
-                            try { verifySuc.invoke(rp) } catch (_: Throwable) {}
-                            val v = try { readInt32.invoke(rp) as? Int } catch (_: Throwable) { null }
-                            sb.appendLine("  cfg(${att.label}) → $v${if (v == 0) " ✓ OK!" else if (v == -61) " ENODATA" else ""}")
-                        } catch (txEx: Throwable) {
-                            sb.appendLine("  cfg(${att.label}) txFAIL: ${(txEx.cause?:txEx).javaClass.simpleName}: ${(txEx.cause?:txEx).message?.take(40)}")
-                        }
+                        streamTransact.invoke(sb2, 2, rq, rp, 1)  // ONEWAY
+                        sb.appendLine("  cfg_OW(${att.label}): sent OK")
                     } catch (e: Throwable) {
-                        sb.appendLine("  cfg(${att.label}) EX: ${(e.cause ?: e).javaClass.simpleName}")
+                        sb.appendLine("  cfg_OW(${att.label}): ${(e.cause ?: e).javaClass.simpleName}: ${(e.cause ?: e).message?.take(40)}")
                     } finally {
                         try { release.invoke(rq) } catch (_: Throwable) {}
                         try { release.invoke(rp) } catch (_: Throwable) {}
                     }
                 }
-                // Запасной вариант: без HwBlob, плоские int32 (нестандартно, но покажет реакцию HAL)
+
+                // Тест C: плоские int32 (ONEWAY)
                 for (fmt in listOf(0, 1, 3)) {
-                    streamCall(2, "flat_int32 fmt=$fmt") { rq ->
+                    val rq = newParcel(); val rp = newParcel()
+                    try {
+                        writeToken.invoke(rq, streamIfaceToken)
                         writeInt32.invoke(rq, fmt); writeInt32.invoke(rq, 1280)
                         writeInt32.invoke(rq, 720); writeInt32.invoke(rq, 3)
                         writeInt32.invoke(rq, 0);   writeInt32.invoke(rq, 0)
+                        streamTransact.invoke(sb2, 2, rq, rp, 1)  // ONEWAY
+                        sb.appendLine("  cfg_OW(flat fmt=$fmt): sent OK")
+                    } catch (e: Throwable) {
+                        sb.appendLine("  cfg_OW(flat fmt=$fmt): ${(e.cause ?: e).javaClass.simpleName}: ${(e.cause ?: e).message?.take(40)}")
+                    } finally {
+                        try { release.invoke(rq) } catch (_: Throwable) {}
+                        try { release.invoke(rp) } catch (_: Throwable) {}
                     }
                 }
+
             } else {
-                streamCall(2, "configureStream(no args)")
+                // Нет HwBlob — пробуем только ONEWAY без аргументов
+                val rq = newParcel(); val rp = newParcel()
+                try {
+                    writeToken.invoke(rq, streamIfaceToken)
+                    streamTransact.invoke(sb2, 2, rq, rp, 1)
+                    sb.appendLine("  cfg_OW(no args, no blob): sent OK")
+                } catch (e: Throwable) {
+                    sb.appendLine("  cfg_OW(no args, no blob): ${(e.cause ?: e).javaClass.simpleName}: ${(e.cause ?: e).message?.take(50)}")
+                } finally {
+                    try { release.invoke(rq) } catch (_: Throwable) {}
+                    try { release.invoke(rp) } catch (_: Throwable) {}
+                }
             }
 
-            // getStreamConfig после configure
-            streamCall(1, "getStreamConfig")
+            // getStreamConfig после ONEWAY configure — теперь должен вернуть данные
+            Thread.sleep(300)
+            streamCall(1, "getStreamConfig after cfg_OW")
 
-            // setStreamBuffers (пока пустой)
-            streamOW(3, "setStreamBuffers(empty)")
+            // startStream сразу после configure (без setStreamBuffers — посмотрим реакцию)
+            streamOW(4, "startStream (after cfg_OW)")
 
-            // startStream
-            streamOW(4, "startStream")
-
-            // Ждём callback
-            Thread.sleep(800)
-            sb.appendLine("  lastCode after startStream+800ms: ${try { getLastCode?.invoke(qcarStubInstance) } catch (_: Throwable) { null }}")
+            // Ждём callback — теперь configureStream дошёл до HAL
+            Thread.sleep(1200)
+            sb.appendLine("  lastCode after cfg_OW+startStream+1200ms: ${try { getLastCode?.invoke(qcarStubInstance) } catch (_: Throwable) { null }}")
 
             // getFrame / releaseFrame
             streamCall(7, "getFrame")
@@ -646,48 +697,80 @@ private fun DiagnosticsEngine.qcarCamTransact(binder: Any, sb: StringBuilder) {
             sb.appendLine("  readEmbeddedBuffer: ${readEmbM?.let { "${it.name}(${it.parameterTypes.map{p->p.simpleName}})" } ?: "not found"}")
 
             if (readBufM != null) {
-                // Создаём BlobHelper для чтения полей из HwBlob через reflection
-                val hwBlobCls2  = try { Class.forName("android.os.HwBlob") } catch (_: Throwable) { null }
-                val blobGetI32  = try { hwBlobCls2?.getMethod("getInt32", Long::class.javaObjectType) } catch (_: Throwable) { null }
-                fun blobI32(blob: Any, off: Long): Int? = try { blobGetI32?.let { m -> m.invoke(blob, off) as? Int } } catch (_: Throwable) { null }
+                val hwBlobCls2 = try { Class.forName("android.os.HwBlob") } catch (_: Throwable) { null }
+                val blobGetI32 = try { hwBlobCls2?.getMethod("getInt32",  Long::class.javaObjectType) } catch (_: Throwable) { null }
+                val blobGetI64 = try { hwBlobCls2?.getMethod("getInt64",  Long::class.javaObjectType) } catch (_: Throwable) { null }
+                fun blobI32(blob: Any, off: Long): Int?  = try { blobGetI32?.invoke(blob, off) as? Int  } catch (_: Throwable) { null }
+                fun blobI64(blob: Any, off: Long): Long? = try { blobGetI64?.invoke(blob, off) as? Long } catch (_: Throwable) { null }
 
                 val rq2 = newParcel(); val rp2 = newParcel()
                 try {
                     writeToken.invoke(rq2, iface)
                     transact.invoke(binder, 1, rq2, rp2, 0)
                     try { verifySuc.invoke(rp2) } catch (_: Throwable) {}
-                    // Читаем hidl_vec header (16 байт: ptr64 + count64)
-                    val params = readBufM.parameterTypes
-                    val blob16 = when (params.size) {
-                        1    -> try { readBufM.invoke(rp2, 16L) } catch (t: Throwable) { "ERR:${(t.cause?:t).javaClass.simpleName}:${(t.cause?:t).message?.take(30)}" }
-                        2    -> try { readBufM.invoke(rp2, 16L, LongArray(1)) } catch (t: Throwable) { "ERR:${(t.cause?:t).javaClass.simpleName}:${(t.cause?:t).message?.take(30)}" }
-                        else -> "params=${params.map{it.simpleName}}"
+
+                    // ВАЖНО: сначала читаем Error enum (int32), потом readBuffer для hidl_vec
+                    val errCode = try { readInt32.invoke(rp2) as? Int } catch (_: Throwable) { null }
+                    sb.appendLine("  getInputStreamList Error=$errCode")
+
+                    val rbParams = readBufM.parameterTypes
+                    // hidl_vec<T> header = 16 bytes: uint64 ptr + uint64 count
+                    val vecBlob = when (rbParams.size) {
+                        1    -> try { readBufM.invoke(rp2, 16L) } catch (t: Throwable) {
+                            sb.appendLine("  readBuffer(16) FAIL: ${(t.cause?:t).javaClass.simpleName}: ${(t.cause?:t).message?.take(60)}")
+                            null
+                        }
+                        2    -> try { readBufM.invoke(rp2, 16L, LongArray(1)) } catch (t: Throwable) {
+                            sb.appendLine("  readBuffer(16,handle) FAIL: ${(t.cause?:t).javaClass.simpleName}: ${(t.cause?:t).message?.take(60)}")
+                            null
+                        }
+                        else -> null.also { sb.appendLine("  readBuffer params=${rbParams.map{it.simpleName}}") }
                     }
-                    sb.appendLine("  readBuffer(16) → type=${blob16?.javaClass?.simpleName}")
-                    if (blob16 != null && hwBlobCls2?.isInstance(blob16) == true) {
-                        val ptrLo = blobI32(blob16, 0L)?.toUInt()?.toString(16)
-                        val ptrHi = blobI32(blob16, 4L)?.toUInt()?.toString(16)
-                        val count = blobI32(blob16, 8L)
-                        sb.appendLine("  hidl_vec: ptr=0x${ptrHi}_${ptrLo}  count=$count")
-                        // Пробуем читать embedded элементы QcarcamInputInfo (размер неизвестен)
-                        if (count != null && count > 0 && readEmbM != null) {
+                    sb.appendLine("  readBuffer(16) → ${if (vecBlob == null) "null" else vecBlob.javaClass.simpleName}")
+
+                    if (vecBlob != null && hwBlobCls2?.isInstance(vecBlob) == true) {
+                        // hidl_vec в памяти: [ptr:int64, count:int64]
+                        val count64 = blobI64(vecBlob, 8L) ?: blobI32(vecBlob, 8L)?.toLong()
+                        val count = count64?.toInt() ?: 0
+                        sb.appendLine("  hidl_vec count=$count")
+
+                        if (count > 0 && readEmbM != null) {
                             val embParams = readEmbM.parameterTypes
-                            for (elemSz in listOf(72L, 48L, 32L, 24L)) {
+                            // Из raw hex знаем: embedded buffer = 0x480 = 1152 байт
+                            // Пробуем размеры элемента: 1152/count, и стандартные
+                            val knownEmbSz = 1152L
+                            val candidates = listOf(knownEmbSz / count, 288L, 192L, 96L, 72L, 48L, 32L)
+                                .distinct().filter { it > 0 }
+                            for (elemSz in candidates) {
+                                val totalSz = count * elemSz
                                 val eblob = try {
                                     when (embParams.size) {
-                                        4    -> readEmbM.invoke(rp2, count * elemSz, 0L, 0L, false)
-                                        3    -> readEmbM.invoke(rp2, count * elemSz, 0L, 0L)
+                                        4    -> readEmbM.invoke(rp2, totalSz, 0L, 0L, false)
+                                        3    -> readEmbM.invoke(rp2, totalSz, 0L, 0L)
                                         else -> null
                                     }
                                 } catch (_: Throwable) { null }
                                 if (eblob != null && hwBlobCls2.isInstance(eblob)) {
-                                    sb.appendLine("  readEmbedded(count*$elemSz) → OK  ← QcarcamInputInfo size=$elemSz")
-                                    val f = (0..3).map { i -> blobI32(eblob, i * 4L)?.toUInt()?.toString(16) ?: "?" }
-                                    sb.appendLine("  elem[0] fields: 0x${f[0]} 0x${f[1]} 0x${f[2]} 0x${f[3]}")
+                                    sb.appendLine("  readEmbedded(totalSz=$totalSz, elemSz=$elemSz) → OK")
+                                    // Дамп первых 16 полей по 4 байта каждого элемента
+                                    for (elem in 0 until minOf(count, 3)) {
+                                        val base = elem * elemSz
+                                        val fields = (0 until minOf(16, (elemSz / 4).toInt())).map { i ->
+                                            blobI32(eblob, base + i * 4L)?.toUInt()?.toString(16) ?: "?"
+                                        }
+                                        sb.appendLine("  elem[$elem](base=$base): ${fields.joinToString(" ")}")
+                                    }
                                     break
                                 }
                             }
                         }
+                    } else if (vecBlob == null && errCode == 0) {
+                        // readBuffer вернул null но Error=OK — попробуем через raw readInt32
+                        sb.appendLine("  fallback: raw int32 reads after Error:")
+                        val raws = (0 until 20).mapNotNull {
+                            try { readInt32.invoke(rp2) as? Int } catch (_: Throwable) { null }
+                        }
+                        sb.appendLine("  ${raws.map { "0x${it.toUInt().toString(16)}" }}")
                     }
                 } finally {
                     try { release.invoke(rq2) } catch (_: Throwable) {}
