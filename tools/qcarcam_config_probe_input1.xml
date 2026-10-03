@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<qcarcam_inputs>
+    <input_device>
+        <properties input_id="1" event_callback="1" frame_timeout="500"/>
+        <output_setting width="1280" height="800" stride="1280" format="0x07080102" nbufs="3"/>
+    </input_device>
+</qcarcam_inputs>
