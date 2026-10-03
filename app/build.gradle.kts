@@ -5,6 +5,7 @@ plugins {
 
 android {
     namespace = "com.stasao.gcam"
+    ndkVersion = "28.2.13676358"
     compileSdk {
         version = release(36)
     }
@@ -17,9 +18,30 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+        externalNativeBuild {
+            cmake {
+                cppFlags("")
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1+"
+        }
     }
 
     buildTypes {
+        debug {
+            // Allows development builds to coexist with the differently signed APK already
+            // installed on the head unit. Release keeps com.stasao.gcam.
+            applicationIdSuffix = ".dev"
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
