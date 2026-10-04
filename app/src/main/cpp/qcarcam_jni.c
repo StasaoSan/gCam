@@ -3,6 +3,7 @@
 #include <android/native_window_jni.h>
 #include <dlfcn.h>
 #include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <GLES3/gl3.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -48,15 +49,21 @@ typedef struct {
 typedef struct {
     pthread_mutex_t mutex; pthread_t thread; int created; ANativeWindow *window;
     atomic_bool stop, running; atomic_ullong frames, dropped, first_ms, last_ns;
-    unsigned input; char status[512];
+    unsigned input; int recordable; char status[512];
 } state_t;
 static state_t s = { .mutex=PTHREAD_MUTEX_INITIALIZER, .status="Остановлено" };
+static state_t recorders[4];
+static pthread_once_t recorders_once=PTHREAD_ONCE_INIT;
+
+static void init_recorders(void){
+    for(unsigned i=0;i<4;i++){pthread_mutex_init(&recorders[i].mutex,NULL);recorders[i].input=i;recorders[i].recordable=1;snprintf(recorders[i].status,sizeof(recorders[i].status),"Остановлено");}
+}
 
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000ull+t.tv_nsec; }
-static void statusf(const char *fmt, ...) {
-    va_list ap; pthread_mutex_lock(&s.mutex); va_start(ap,fmt);
-    vsnprintf(s.status,sizeof(s.status),fmt,ap); va_end(ap); pthread_mutex_unlock(&s.mutex);
-    __android_log_print(ANDROID_LOG_INFO, TAG, "%s", s.status);
+static void statusf(state_t *state,const char *fmt, ...) {
+    va_list ap; pthread_mutex_lock(&state->mutex); va_start(ap,fmt);
+    vsnprintf(state->status,sizeof(state->status),fmt,ap); va_end(ap); pthread_mutex_unlock(&state->mutex);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "%s", state->status);
 }
 static void *sym(void *l,const char *n) { void *p=dlsym(l,n); if(!p) LOGE("dlsym %s: %s",n,dlerror()); return p; }
 static int load_api(qapi_t *a,char *err,size_t cap) {
@@ -74,20 +81,34 @@ static int load_api(qapi_t *a,char *err,size_t cap) {
     return 0;
 }
 
+static pthread_mutex_t api_mutex=PTHREAD_MUTEX_INITIALIZER;
+static qapi_t shared_api;
+static int api_loaded=0,api_refs=0;
+static int acquire_api(qapi_t *out,char *err,size_t cap){
+    pthread_mutex_lock(&api_mutex);
+    if(!api_loaded){if(load_api(&shared_api,err,cap)){pthread_mutex_unlock(&api_mutex);return -1;}api_loaded=1;}
+    if(api_refs==0){int rc=shared_api.init();if(rc){snprintf(err,cap,"qcarcam_initialize: ошибка %d",rc);pthread_mutex_unlock(&api_mutex);return -1;}}
+    api_refs++;*out=shared_api;pthread_mutex_unlock(&api_mutex);return 0;
+}
+static void release_api(void){
+    pthread_mutex_lock(&api_mutex);if(api_refs>0&&--api_refs==0)shared_api.uninit();pthread_mutex_unlock(&api_mutex);
+}
+
 typedef struct {
     EGLDisplay d; EGLSurface s; EGLContext c; GLuint program,texture; GLint sampler; int w,h;
-    GLuint pbo[NBUF]; int pbo_upload;
+    GLuint pbo[NBUF]; int pbo_upload,recordable;
+    EGLBoolean (*presentation_time)(EGLDisplay,EGLSurface,EGLnsecsANDROID);
 } renderer_t;
 static GLuint shader(GLenum type,const char *source){
     GLuint x=glCreateShader(type); glShaderSource(x,1,&source,NULL); glCompileShader(x); GLint ok=0; glGetShaderiv(x,GL_COMPILE_STATUS,&ok);
     if(!ok){char log[512];glGetShaderInfoLog(x,sizeof(log),NULL,log);LOGE("shader: %s",log);glDeleteShader(x);return 0;} return x;
 }
-static int renderer_init(renderer_t *r,ANativeWindow *window){
+static int renderer_init(renderer_t *r,ANativeWindow *window,int recordable){
     memset(r,0,sizeof(*r));r->d=eglGetDisplay(EGL_DEFAULT_DISPLAY);if(r->d==EGL_NO_DISPLAY||!eglInitialize(r->d,NULL,NULL))return -1;
-    EGLint attrs[]={EGL_RENDERABLE_TYPE,EGL_OPENGL_ES3_BIT,EGL_SURFACE_TYPE,EGL_WINDOW_BIT,EGL_RED_SIZE,8,EGL_GREEN_SIZE,8,EGL_BLUE_SIZE,8,EGL_NONE};
-    EGLConfig cfg;EGLint count,fmt;if(!eglChooseConfig(r->d,attrs,&cfg,1,&count)||!count)return -1;eglGetConfigAttrib(r->d,cfg,EGL_NATIVE_VISUAL_ID,&fmt);ANativeWindow_setBuffersGeometry(window,0,0,fmt);
+    EGLint attrs[]={EGL_RENDERABLE_TYPE,EGL_OPENGL_ES3_BIT,EGL_SURFACE_TYPE,EGL_WINDOW_BIT,EGL_RED_SIZE,8,EGL_GREEN_SIZE,8,EGL_BLUE_SIZE,8,EGL_RECORDABLE_ANDROID,recordable?EGL_TRUE:EGL_DONT_CARE,EGL_NONE};
+    EGLConfig cfg;EGLint count,fmt;if(!eglChooseConfig(r->d,attrs,&cfg,1,&count)||!count)return -1;eglGetConfigAttrib(r->d,cfg,EGL_NATIVE_VISUAL_ID,&fmt);if(!recordable)ANativeWindow_setBuffersGeometry(window,0,0,fmt);
     r->s=eglCreateWindowSurface(r->d,cfg,window,NULL);EGLint ca[]={EGL_CONTEXT_CLIENT_VERSION,3,EGL_NONE};r->c=eglCreateContext(r->d,cfg,EGL_NO_CONTEXT,ca);
-    if(r->s==EGL_NO_SURFACE||r->c==EGL_NO_CONTEXT||!eglMakeCurrent(r->d,r->s,r->s,r->c))return -1;eglSwapInterval(r->d,1);eglQuerySurface(r->d,r->s,EGL_WIDTH,&r->w);eglQuerySurface(r->d,r->s,EGL_HEIGHT,&r->h);
+    if(r->s==EGL_NO_SURFACE||r->c==EGL_NO_CONTEXT||!eglMakeCurrent(r->d,r->s,r->s,r->c))return -1;r->recordable=recordable;r->presentation_time=(void *)eglGetProcAddress("eglPresentationTimeANDROID");eglSwapInterval(r->d,recordable?0:1);eglQuerySurface(r->d,r->s,EGL_WIDTH,&r->w);eglQuerySurface(r->d,r->s,EGL_HEIGHT,&r->h);
     const char *vs="#version 300 es\nconst vec2 p[3]=vec2[3](vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));out vec2 uv;void main(){gl_Position=vec4(p[gl_VertexID],0.,1.);uv=(p[gl_VertexID]+1.)*.5;}";
     const char *fs="#version 300 es\nprecision highp float;precision highp int;uniform sampler2D packedUyvy;in vec2 uv;out vec4 o;void main(){int x=clamp(int(uv.x*1280.),0,1279);int y=clamp(int((1.-uv.y)*800.),0,799);vec4 q=texelFetch(packedUyvy,ivec2(x/2,y),0);float yy=((x&1)==0?q.g:q.a)*255.;float u=q.r*255.-128.;float v=q.b*255.-128.;yy=1.164*(yy-16.);vec3 c=vec3(yy+1.596*v,yy-.392*u-.813*v,yy+2.017*u)/255.;o=vec4(clamp(c,0.,1.),1.);}";
     GLuint v=shader(GL_VERTEX_SHADER,vs),f=shader(GL_FRAGMENT_SHADER,fs);if(!v||!f)return -1;r->program=glCreateProgram();glAttachShader(r->program,v);glAttachShader(r->program,f);glLinkProgram(r->program);glDeleteShader(v);glDeleteShader(f);GLint linked=0;glGetProgramiv(r->program,GL_LINK_STATUS,&linked);if(!linked)return -1;
@@ -98,9 +119,9 @@ static int draw(renderer_t *r,unsigned idx,const void *p){
     glBindTexture(GL_TEXTURE_2D,r->texture);glBindBuffer(GL_PIXEL_UNPACK_BUFFER,r->pbo[idx]);
     void *staging=glMapBufferRange(GL_PIXEL_UNPACK_BUFFER,0,BYTES,GL_MAP_WRITE_BIT|GL_MAP_INVALIDATE_BUFFER_BIT);if(!staging)return -1;memcpy(staging,p,BYTES);if(!glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER))return -1;
     glTexSubImage2D(GL_TEXTURE_2D,0,0,0,W/2,H,GL_RGBA,GL_UNSIGNED_BYTE,0);glBindBuffer(GL_PIXEL_UNPACK_BUFFER,0);glUseProgram(r->program);glUniform1i(r->sampler,0);
-    int vw=r->w,vh=vw*(int)H/(int)W;if(vh>r->h){vh=r->h;vw=vh*(int)W/(int)H;}glViewport((r->w-vw)/2,(r->h-vh)/2,vw,vh);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT);glDrawArrays(GL_TRIANGLES,0,3);return eglSwapBuffers(r->d,r->s)?0:-1;
+    int vw=r->w,vh=vw*(int)H/(int)W;if(vh>r->h){vh=r->h;vw=vh*(int)W/(int)H;}glViewport((r->w-vw)/2,(r->h-vh)/2,vw,vh);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT);glDrawArrays(GL_TRIANGLES,0,3);if(r->recordable&&r->presentation_time)r->presentation_time(r->d,r->s,(EGLnsecsANDROID)now_ns());return eglSwapBuffers(r->d,r->s)?0:-1;
 }
-static void renderer_free(renderer_t *r){if(!r->d||r->d==EGL_NO_DISPLAY)return;if(r->pbo[0])glDeleteBuffers(NBUF,r->pbo);if(r->texture)glDeleteTextures(1,&r->texture);if(r->program)glDeleteProgram(r->program);eglMakeCurrent(r->d,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);if(r->c&&r->c!=EGL_NO_CONTEXT)eglDestroyContext(r->d,r->c);if(r->s&&r->s!=EGL_NO_SURFACE)eglDestroySurface(r->d,r->s);eglTerminate(r->d);}
+static void renderer_free(renderer_t *r){if(!r->d||r->d==EGL_NO_DISPLAY)return;if(r->pbo[0])glDeleteBuffers(NBUF,r->pbo);if(r->texture)glDeleteTextures(1,&r->texture);if(r->program)glDeleteProgram(r->program);eglMakeCurrent(r->d,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);if(r->c&&r->c!=EGL_NO_CONTEXT)eglDestroyContext(r->d,r->c);if(r->s&&r->s!=EGL_NO_SURFACE)eglDestroySurface(r->d,r->s);/* EGLDisplay is process-global and may still be used by other camera encoders. */}
 
 typedef struct { int fd; void *address; } frame_memory_t;
 typedef struct { uint64_t len; uint32_t heap_mask, flags, fd, unused; } ion_alloc_t;
@@ -127,22 +148,30 @@ static void qcarcam_event(qhandle_t handle, int event, void *payload) {
     (void)handle; (void)event; (void)payload;
 }
 
-static void *stream_thread(void *unused){
-    (void)unused;qapi_t a={0};qhandle_t cam=NULL;frame_memory_t memory[NBUF]={{-1,NULL},{-1,NULL},{-1,NULL}};qbuffers_t qb={0};renderer_t r={.d=EGL_NO_DISPLAY,.s=EGL_NO_SURFACE,.c=EGL_NO_CONTEXT};int inited=0,started=0,rc;char err[384]={0};uint64_t begun=now_ns();
-    statusf("Загрузка QCarCam HIDL…");if(load_api(&a,err,sizeof(err))){statusf("QCarCam недоступен: %s",err);goto done;}rc=a.init();if(rc){statusf("qcarcam_initialize: ошибка %d",rc);goto done;}inited=1;
-    cam=a.open(s.input);if(!cam){statusf("Не удалось открыть QCarCam input %u",s.input);goto done;}if(alloc_buffers(memory,&qb)){statusf("ION недоступен — запустите tools/prepare_ion_access.sh");goto done;}rc=a.buffers(cam,&qb);if(rc){statusf("qcarcam_s_buffers: ошибка %d",rc);goto done;}
-    unsigned char event_value[264]={0}; *(void **)event_value=(void *)qcarcam_event;
-    rc=a.param(cam,1,event_value);if(rc){statusf("qcarcam_s_param(callback): ошибка %d",rc);goto done;}
+static void *stream_thread(void *arg){
+    state_t *state=(state_t *)arg;qapi_t a={0};qhandle_t cam=NULL;frame_memory_t memory[NBUF]={{-1,NULL},{-1,NULL},{-1,NULL}};qbuffers_t qb={0};renderer_t r={.d=EGL_NO_DISPLAY,.s=EGL_NO_SURFACE,.c=EGL_NO_CONTEXT};int acquired=0,started=0,rc;char err[384]={0};uint64_t begun=now_ns();
+    statusf(state,"Загрузка QCarCam HIDL…");if(acquire_api(&a,err,sizeof(err))){statusf(state,"QCarCam недоступен: %s",err);goto done;}acquired=1;
+    cam=a.open(state->input);if(!cam){statusf(state,"Не удалось открыть QCarCam input %u",state->input);goto done;}if(alloc_buffers(memory,&qb)){statusf(state,"ION недоступен — запустите tools/prepare_ion_access.sh");goto done;}rc=a.buffers(cam,&qb);if(rc){statusf(state,"qcarcam_s_buffers: ошибка %d",rc);goto done;}
+    unsigned char event_value[264]={0};*(void **)event_value=(void *)qcarcam_event;
+    rc=a.param(cam,1,event_value);if(rc){statusf(state,"qcarcam_s_param(callback): ошибка %d",rc);goto done;}
     memset(event_value,0,sizeof(event_value));*(uint32_t *)event_value=15;
-    rc=a.param(cam,2,event_value);if(rc){statusf("qcarcam_s_param(mask): ошибка %d",rc);goto done;}
-    if(renderer_init(&r,s.window)){statusf("Ошибка GLES/EGL 0x%x",eglGetError());goto done;}rc=a.start(cam);if(rc){statusf("qcarcam_start: ошибка %d",rc);goto done;}started=1;atomic_store(&s.running,true);statusf("QCarCam input %u · ожидание первого кадра…",s.input);
-    while(!atomic_load(&s.stop)){qframe_t f={0};rc=a.get(cam,&f,500000000ull,0);if(rc){if(!atomic_load(&s.stop))atomic_fetch_add(&s.dropped,1);continue;}if(f.idx>=NBUF){atomic_fetch_add(&s.dropped,1);a.release(cam,f.idx);continue;}void *pixels=memory[f.idx].address;if(pixels){if(draw(&r,f.idx,pixels)){a.release(cam,f.idx);if(!atomic_load(&s.stop))statusf("Ошибка EGL; поток остановлен");break;}uint64_t n=atomic_fetch_add(&s.frames,1)+1,now=now_ns();atomic_store(&s.last_ns,now);if(n==1){atomic_store(&s.first_ms,(now-begun)/1000000ull);statusf("QCarCam input %u · поток активен",s.input);}}else atomic_fetch_add(&s.dropped,1);a.release(cam,f.idx);}
-done:atomic_store(&s.running,false);if(started)a.stop(cam);if(cam&&a.close)a.close(cam);if(inited&&a.uninit)a.uninit();renderer_free(&r);free_buffers(memory,&qb);/* Keep the vendor client loaded: its dispatcher uses TLS destructors while exiting. */if(s.window){ANativeWindow_release(s.window);s.window=NULL;}return NULL;
+    rc=a.param(cam,2,event_value);if(rc){statusf(state,"qcarcam_s_param(mask): ошибка %d",rc);goto done;}
+    if(renderer_init(&r,state->window,state->recordable)){statusf(state,"Ошибка GLES/EGL 0x%x",eglGetError());goto done;}rc=a.start(cam);if(rc){statusf(state,"qcarcam_start: ошибка %d",rc);goto done;}started=1;atomic_store(&state->running,true);statusf(state,"QCarCam input %u · ожидание первого кадра…",state->input);
+    while(!atomic_load(&state->stop)){qframe_t f={0};rc=a.get(cam,&f,500000000ull,0);if(rc){if(!atomic_load(&state->stop))atomic_fetch_add(&state->dropped,1);continue;}if(f.idx>=NBUF){atomic_fetch_add(&state->dropped,1);a.release(cam,f.idx);continue;}void *pixels=memory[f.idx].address;if(pixels){if(draw(&r,f.idx,pixels)){a.release(cam,f.idx);if(!atomic_load(&state->stop))statusf(state,"Ошибка EGL; поток остановлен");break;}uint64_t n=atomic_fetch_add(&state->frames,1)+1,now=now_ns();atomic_store(&state->last_ns,now);if(n==1){atomic_store(&state->first_ms,(now-begun)/1000000ull);statusf(state,"QCarCam input %u · поток активен",state->input);}}else atomic_fetch_add(&state->dropped,1);a.release(cam,f.idx);}
+done:atomic_store(&state->running,false);if(started)a.stop(cam);if(cam&&a.close)a.close(cam);renderer_free(&r);free_buffers(memory,&qb);if(acquired)release_api();if(state->window){ANativeWindow_release(state->window);state->window=NULL;}return NULL;
 }
-static void stop_stream(void){atomic_store(&s.stop,true);pthread_mutex_lock(&s.mutex);int join=s.created;pthread_t t=s.thread;pthread_mutex_unlock(&s.mutex);if(join&&!pthread_equal(pthread_self(),t))pthread_join(t,NULL);pthread_mutex_lock(&s.mutex);s.created=0;pthread_mutex_unlock(&s.mutex);}
+static void stop_state(state_t *state){atomic_store(&state->stop,true);pthread_mutex_lock(&state->mutex);int join=state->created;pthread_t t=state->thread;pthread_mutex_unlock(&state->mutex);if(join&&!pthread_equal(pthread_self(),t))pthread_join(t,NULL);pthread_mutex_lock(&state->mutex);state->created=0;pthread_mutex_unlock(&state->mutex);}
+static jstring start_state(JNIEnv *e,state_t *state,jobject surface,jint input,int recordable){
+    stop_state(state);if(!surface)return (*e)->NewStringUTF(e,"Surface не создан");state->window=ANativeWindow_fromSurface(e,surface);if(!state->window)return (*e)->NewStringUTF(e,"Не удалось получить ANativeWindow");atomic_store(&state->stop,false);atomic_store(&state->running,false);atomic_store(&state->frames,0);atomic_store(&state->dropped,0);atomic_store(&state->first_ms,0);atomic_store(&state->last_ns,0);state->input=(unsigned)input;state->recordable=recordable;statusf(state,"Запуск QCarCam input %d…",input);if(pthread_create(&state->thread,NULL,stream_thread,state)){ANativeWindow_release(state->window);state->window=NULL;statusf(state,"Не удалось создать поток захвата");return (*e)->NewStringUTF(e,state->status);}pthread_mutex_lock(&state->mutex);state->created=1;pthread_mutex_unlock(&state->mutex);return (*e)->NewStringUTF(e,"Запуск принят");
+}
+static jlongArray state_stats(JNIEnv *e,state_t *state){jlong v[5]={atomic_load(&state->running),(jlong)atomic_load(&state->frames),(jlong)atomic_load(&state->dropped),(jlong)atomic_load(&state->first_ms),(jlong)atomic_load(&state->last_ns)};jlongArray a=(*e)->NewLongArray(e,5);if(a)(*e)->SetLongArrayRegion(e,a,0,5,v);return a;}
 
-JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_start(JNIEnv *e,jclass c,jobject surface,jint input){(void)c;stop_stream();if(!surface)return (*e)->NewStringUTF(e,"Surface не создан");s.window=ANativeWindow_fromSurface(e,surface);if(!s.window)return (*e)->NewStringUTF(e,"Не удалось получить ANativeWindow");atomic_store(&s.stop,false);atomic_store(&s.running,false);atomic_store(&s.frames,0);atomic_store(&s.dropped,0);atomic_store(&s.first_ms,0);atomic_store(&s.last_ns,0);s.input=(unsigned)input;statusf("Запуск QCarCam input %d…",input);if(pthread_create(&s.thread,NULL,stream_thread,NULL)){ANativeWindow_release(s.window);s.window=NULL;statusf("Не удалось создать поток захвата");return (*e)->NewStringUTF(e,s.status);}pthread_mutex_lock(&s.mutex);s.created=1;pthread_mutex_unlock(&s.mutex);return (*e)->NewStringUTF(e,"Запуск принят");}
-JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_stop(JNIEnv *e,jclass c){(void)e;(void)c;stop_stream();statusf("Остановлено");}
+JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_start(JNIEnv *e,jclass c,jobject surface,jint input){(void)c;return start_state(e,&s,surface,input,0);}
+JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_stop(JNIEnv *e,jclass c){(void)e;(void)c;stop_state(&s);statusf(&s,"Остановлено");}
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_status(JNIEnv *e,jclass c){(void)c;char x[512];pthread_mutex_lock(&s.mutex);snprintf(x,sizeof(x),"%s",s.status);pthread_mutex_unlock(&s.mutex);return (*e)->NewStringUTF(e,x);}
-JNIEXPORT jlongArray JNICALL Java_com_stasao_gcam_NativeQCarCam_stats(JNIEnv *e,jclass c){(void)c;jlong v[5]={atomic_load(&s.running),(jlong)atomic_load(&s.frames),(jlong)atomic_load(&s.dropped),(jlong)atomic_load(&s.first_ms),(jlong)atomic_load(&s.last_ns)};jlongArray a=(*e)->NewLongArray(e,5);if(a)(*e)->SetLongArrayRegion(e,a,0,5,v);return a;}
-JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_probe(JNIEnv *e,jclass c){(void)c;qapi_t a;char err[384]={0},out[800];if(load_api(&a,err,sizeof(err))){snprintf(out,sizeof(out),"QCarCam HIDL client: недоступен\n%s",err);return (*e)->NewStringUTF(e,out);}int init=a.init(),query=-1;unsigned count=0;if(!init&&a.query)query=a.query(NULL,0,&count);if(!init)a.uninit();snprintf(out,sizeof(out),"QCarCam HIDL client: загружен\ninitialize=%d query=%d inputs=%u",init,query,count);return (*e)->NewStringUTF(e,out);}
+JNIEXPORT jlongArray JNICALL Java_com_stasao_gcam_NativeQCarCam_stats(JNIEnv *e,jclass c){(void)c;return state_stats(e,&s);}
+JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStart(JNIEnv *e,jclass c,jobject surface,jint input){(void)c;pthread_once(&recorders_once,init_recorders);if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");return start_state(e,&recorders[input],surface,input,1);}
+JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStop(JNIEnv *e,jclass c,jint input){(void)e;(void)c;pthread_once(&recorders_once,init_recorders);if(input>=0&&input<4){stop_state(&recorders[input]);statusf(&recorders[input],"Остановлено");}}
+JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStatus(JNIEnv *e,jclass c,jint input){(void)c;pthread_once(&recorders_once,init_recorders);if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");char x[512];pthread_mutex_lock(&recorders[input].mutex);snprintf(x,sizeof(x),"%s",recorders[input].status);pthread_mutex_unlock(&recorders[input].mutex);return (*e)->NewStringUTF(e,x);}
+JNIEXPORT jlongArray JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStats(JNIEnv *e,jclass c,jint input){(void)c;pthread_once(&recorders_once,init_recorders);if(input<0||input>3){state_t empty={0};return state_stats(e,&empty);}return state_stats(e,&recorders[input]);}
+JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_probe(JNIEnv *e,jclass c){(void)c;qapi_t a;char err[384]={0},out[800];if(acquire_api(&a,err,sizeof(err))){snprintf(out,sizeof(out),"QCarCam HIDL client: недоступен\n%s",err);return (*e)->NewStringUTF(e,out);}int query=-1;unsigned count=0;if(a.query)query=a.query(NULL,0,&count);release_api();snprintf(out,sizeof(out),"QCarCam HIDL client: загружен\nquery=%d inputs=%u",query,count);return (*e)->NewStringUTF(e,out);}
