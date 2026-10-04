@@ -34,7 +34,7 @@ typedef struct { qplane_t planes[3]; uint32_t n_planes, reserved; } qbuffer_t;
 typedef struct { uint32_t color_fmt, reserved; qbuffer_t *buffers; uint32_t n_buffers, flags; } qbuffers_t;
 typedef struct { uint32_t idx, flags; uint64_t timestamp; uint32_t sequence, field; } qframe_t;
 typedef void *qhandle_t;
-typedef int (*f_init)(void); typedef int (*f_uninit)(void);
+typedef int (*f_init)(const void *); typedef int (*f_uninit)(void);
 typedef int (*f_query)(void *, unsigned int, unsigned int *);
 typedef qhandle_t (*f_open)(unsigned int); typedef int (*f_handle)(qhandle_t);
 typedef int (*f_buffers)(qhandle_t, qbuffers_t *);
@@ -87,7 +87,8 @@ static int api_loaded=0,api_refs=0;
 static int acquire_api(qapi_t *out,char *err,size_t cap){
     pthread_mutex_lock(&api_mutex);
     if(!api_loaded){if(load_api(&shared_api,err,cap)){pthread_mutex_unlock(&api_mutex);return -1;}api_loaded=1;}
-    if(api_refs==0){int rc=shared_api.init();if(rc){snprintf(err,cap,"qcarcam_initialize: ошибка %d",rc);pthread_mutex_unlock(&api_mutex);return -1;}}
+    /* G636 ABI accepts an optional init struct. NULL selects the stock defaults. */
+    if(api_refs==0){int rc=shared_api.init(NULL);if(rc){snprintf(err,cap,"qcarcam_initialize: ошибка %d",rc);pthread_mutex_unlock(&api_mutex);return -1;}}
     api_refs++;*out=shared_api;pthread_mutex_unlock(&api_mutex);return 0;
 }
 static void release_api(void){
