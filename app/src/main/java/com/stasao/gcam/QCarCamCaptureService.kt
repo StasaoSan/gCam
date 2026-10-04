@@ -12,8 +12,8 @@ import android.view.Surface
  */
 class QCarCamCaptureService : Service() {
     private val binder = object : IQCarCamCapture.Stub() {
-        override fun start(surface: Surface, inputId: Int): String =
-            NativeQCarCam.recorderStart(surface, inputId)
+        override fun start(surface: Surface, inputId: Int, targetFps: Int): String =
+            NativeQCarCam.recorderStart(surface, inputId, targetFps)
 
         override fun stop(inputId: Int) = NativeQCarCam.recorderStop(inputId)
 

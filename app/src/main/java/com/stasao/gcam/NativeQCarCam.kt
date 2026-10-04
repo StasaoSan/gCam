@@ -17,7 +17,7 @@ object NativeQCarCam {
     /** running, frames, dropped/timeouts, firstFrameMs, lastFrameMonotonicNs */
     @JvmStatic external fun stats(): LongArray
 
-    @JvmStatic external fun recorderStart(surface: Surface, inputId: Int): String
+    @JvmStatic external fun recorderStart(surface: Surface, inputId: Int, targetFps: Int): String
     @JvmStatic external fun recorderStop(inputId: Int)
     @JvmStatic external fun recorderStatus(inputId: Int): String
     /** running, frames, dropped/timeouts, firstFrameMs, lastFrameMonotonicNs */

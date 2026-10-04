@@ -155,8 +155,14 @@ class MainActivity : ComponentActivity() {
         item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { cameraInputs.forEach { c ->
             FilterChip(enabled = enabled, selected = c.id in config.cameraIds, onClick = { config = config.copy(cameraIds = config.cameraIds.toMutableSet().apply { if (!add(c.id)) remove(c.id) }) }, label = { Text(c.title) }, modifier = Modifier.weight(1f))
         } } }
-        item { SectionTitle("Качество H.264 на камеру") }
-        item { ChoiceRow(listOf(3 to "Эконом", 4 to "Стандарт", 6 to "Высокое"), config.bitrateMbps, enabled) { config = config.copy(bitrateMbps = it) } }
+        item { SectionTitle("Разрешение записи") }
+        item { ChoiceRow(listOf(640 to "640×400", 960 to "960×600", 1280 to "1280×800"), config.width, enabled) { width ->
+            config = config.copy(width = width, height = when (width) { 640 -> 400; 1280 -> 800; else -> 600 })
+        } }
+        item { SectionTitle("Частота записи") }
+        item { ChoiceRow(listOf(15 to "15 FPS", 20 to "20 FPS", 25 to "25 FPS"), config.fps, enabled) { config = config.copy(fps = it) } }
+        item { SectionTitle("Битрейт H.264 на камеру") }
+        item { ChoiceRow(listOf(2 to "2 Мбит/с", 3 to "3 Мбит/с", 4 to "4 Мбит/с", 6 to "6 Мбит/с"), config.bitrateMbps, enabled) { config = config.copy(bitrateMbps = it) } }
         item { SectionTitle("Длительность сегмента") }
         item { ChoiceRow(listOf(1 to "1 мин", 2 to "2 мин", 3 to "3 мин", 5 to "5 мин"), config.segmentMinutes, enabled) { config = config.copy(segmentMinutes = it) } }
         item { SectionTitle("Лимит архива: ${config.storageLimitGb} ГБ из доступных $maxArchiveGb ГБ")

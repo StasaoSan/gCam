@@ -49,7 +49,7 @@ typedef struct {
 typedef struct {
     pthread_mutex_t mutex; pthread_t thread; int created; ANativeWindow *window;
     atomic_bool stop, running; atomic_ullong frames, dropped, first_ms, last_ns;
-    unsigned input; int recordable; char status[512];
+    unsigned input; int recordable, target_fps; char status[512];
 } state_t;
 static state_t s = { .mutex=PTHREAD_MUTEX_INITIALIZER, .status="Остановлено" };
 static state_t recorders[4];
@@ -153,6 +153,7 @@ static void qcarcam_event(qhandle_t handle, int event, void *payload) {
 
 static void *stream_thread(void *arg){
     state_t *state=(state_t *)arg;qapi_t a={0};qhandle_t cam=NULL;frame_memory_t memory[NBUF]={{-1,NULL},{-1,NULL},{-1,NULL}};qbuffers_t qb={0};renderer_t r={.d=EGL_NO_DISPLAY,.s=EGL_NO_SURFACE,.c=EGL_NO_CONTEXT};int acquired=0,started=0,rc;char err[384]={0};uint64_t begun=now_ns();
+    uint64_t next_frame_ns=0,frame_interval_ns=state->target_fps>0?1000000000ull/(uint64_t)state->target_fps:0;
     statusf(state,"Загрузка QCarCam HIDL…");if(acquire_api(&a,err,sizeof(err))){statusf(state,"QCarCam недоступен: %s",err);goto done;}acquired=1;
     cam=a.open(state->input);if(!cam){statusf(state,"Не удалось открыть QCarCam input %u",state->input);goto done;}if(alloc_buffers(memory,&qb)){statusf(state,"ION недоступен");goto done;}rc=a.buffers(cam,&qb);if(rc){statusf(state,"qcarcam_s_buffers: ошибка %d",rc);goto done;}
     unsigned char event_value[264]={0};*(void **)event_value=(void *)qcarcam_event;
@@ -160,20 +161,26 @@ static void *stream_thread(void *arg){
     memset(event_value,0,sizeof(event_value));*(uint32_t *)event_value=15;
     rc=a.param(cam,2,event_value);if(rc){statusf(state,"qcarcam_s_param(mask): ошибка %d",rc);goto done;}
     if(renderer_init(&r,state->window,state->recordable)){statusf(state,"Ошибка GLES/EGL 0x%x",eglGetError());goto done;}rc=a.start(cam);if(rc){statusf(state,"qcarcam_start: ошибка %d",rc);goto done;}started=1;atomic_store(&state->running,true);statusf(state,"QCarCam input %u · ожидание первого кадра…",state->input);
-    while(!atomic_load(&state->stop)){qframe_t f={0};rc=a.get(cam,&f,500000000ull,0);if(rc){if(!atomic_load(&state->stop))atomic_fetch_add(&state->dropped,1);continue;}if(f.idx>=NBUF){atomic_fetch_add(&state->dropped,1);a.release(cam,f.idx);continue;}void *pixels=memory[f.idx].address;if(pixels){if(draw(&r,f.idx,pixels)){a.release(cam,f.idx);if(!atomic_load(&state->stop))statusf(state,"Ошибка EGL; поток остановлен");break;}uint64_t n=atomic_fetch_add(&state->frames,1)+1,now=now_ns();atomic_store(&state->last_ns,now);if(n==1){atomic_store(&state->first_ms,(now-begun)/1000000ull);statusf(state,"QCarCam input %u · поток активен",state->input);}}else atomic_fetch_add(&state->dropped,1);a.release(cam,f.idx);}
+    while(!atomic_load(&state->stop)){qframe_t f={0};rc=a.get(cam,&f,500000000ull,0);if(rc){if(!atomic_load(&state->stop))atomic_fetch_add(&state->dropped,1);continue;}if(f.idx>=NBUF){atomic_fetch_add(&state->dropped,1);a.release(cam,f.idx);continue;}
+        uint64_t frame_now=now_ns();
+        if(state->recordable&&frame_interval_ns){
+            if(next_frame_ns&&frame_now<next_frame_ns){a.release(cam,f.idx);continue;}
+            if(!next_frame_ns||frame_now>next_frame_ns+frame_interval_ns)next_frame_ns=frame_now+frame_interval_ns;else next_frame_ns+=frame_interval_ns;
+        }
+        void *pixels=memory[f.idx].address;if(pixels){if(draw(&r,f.idx,pixels)){a.release(cam,f.idx);if(!atomic_load(&state->stop))statusf(state,"Ошибка EGL; поток остановлен");break;}uint64_t n=atomic_fetch_add(&state->frames,1)+1,now=now_ns();atomic_store(&state->last_ns,now);if(n==1){atomic_store(&state->first_ms,(now-begun)/1000000ull);statusf(state,"QCarCam input %u · поток активен",state->input);}}else atomic_fetch_add(&state->dropped,1);a.release(cam,f.idx);}
 done:atomic_store(&state->running,false);if(started)a.stop(cam);if(cam&&a.close)a.close(cam);renderer_free(&r);free_buffers(memory,&qb);if(acquired)release_api();if(state->window){ANativeWindow_release(state->window);state->window=NULL;}return NULL;
 }
 static void stop_state(state_t *state){atomic_store(&state->stop,true);pthread_mutex_lock(&state->mutex);int join=state->created;pthread_t t=state->thread;pthread_mutex_unlock(&state->mutex);if(join&&!pthread_equal(pthread_self(),t))pthread_join(t,NULL);pthread_mutex_lock(&state->mutex);state->created=0;pthread_mutex_unlock(&state->mutex);}
-static jstring start_state(JNIEnv *e,state_t *state,jobject surface,jint input,int recordable){
-    stop_state(state);if(!surface)return (*e)->NewStringUTF(e,"Surface не создан");state->window=ANativeWindow_fromSurface(e,surface);if(!state->window)return (*e)->NewStringUTF(e,"Не удалось получить ANativeWindow");atomic_store(&state->stop,false);atomic_store(&state->running,false);atomic_store(&state->frames,0);atomic_store(&state->dropped,0);atomic_store(&state->first_ms,0);atomic_store(&state->last_ns,0);state->input=(unsigned)input;state->recordable=recordable;statusf(state,"Запуск QCarCam input %d…",input);if(pthread_create(&state->thread,NULL,stream_thread,state)){ANativeWindow_release(state->window);state->window=NULL;statusf(state,"Не удалось создать поток захвата");return (*e)->NewStringUTF(e,state->status);}pthread_mutex_lock(&state->mutex);state->created=1;pthread_mutex_unlock(&state->mutex);return (*e)->NewStringUTF(e,"Запуск принят");
+static jstring start_state(JNIEnv *e,state_t *state,jobject surface,jint input,int recordable,int target_fps){
+    stop_state(state);if(!surface)return (*e)->NewStringUTF(e,"Surface не создан");state->window=ANativeWindow_fromSurface(e,surface);if(!state->window)return (*e)->NewStringUTF(e,"Не удалось получить ANativeWindow");atomic_store(&state->stop,false);atomic_store(&state->running,false);atomic_store(&state->frames,0);atomic_store(&state->dropped,0);atomic_store(&state->first_ms,0);atomic_store(&state->last_ns,0);state->input=(unsigned)input;state->recordable=recordable;state->target_fps=target_fps;statusf(state,"Запуск QCarCam input %d…",input);if(pthread_create(&state->thread,NULL,stream_thread,state)){ANativeWindow_release(state->window);state->window=NULL;statusf(state,"Не удалось создать поток захвата");return (*e)->NewStringUTF(e,state->status);}pthread_mutex_lock(&state->mutex);state->created=1;pthread_mutex_unlock(&state->mutex);return (*e)->NewStringUTF(e,"Запуск принят");
 }
 static jlongArray state_stats(JNIEnv *e,state_t *state){jlong v[5]={atomic_load(&state->running),(jlong)atomic_load(&state->frames),(jlong)atomic_load(&state->dropped),(jlong)atomic_load(&state->first_ms),(jlong)atomic_load(&state->last_ns)};jlongArray a=(*e)->NewLongArray(e,5);if(a)(*e)->SetLongArrayRegion(e,a,0,5,v);return a;}
 
-JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_start(JNIEnv *e,jclass c,jobject surface,jint input){(void)c;return start_state(e,&s,surface,input,0);}
+JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_start(JNIEnv *e,jclass c,jobject surface,jint input){(void)c;return start_state(e,&s,surface,input,0,25);}
 JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_stop(JNIEnv *e,jclass c){(void)e;(void)c;stop_state(&s);statusf(&s,"Остановлено");}
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_status(JNIEnv *e,jclass c){(void)c;char x[512];pthread_mutex_lock(&s.mutex);snprintf(x,sizeof(x),"%s",s.status);pthread_mutex_unlock(&s.mutex);return (*e)->NewStringUTF(e,x);}
 JNIEXPORT jlongArray JNICALL Java_com_stasao_gcam_NativeQCarCam_stats(JNIEnv *e,jclass c){(void)c;return state_stats(e,&s);}
-JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStart(JNIEnv *e,jclass c,jobject surface,jint input){(void)c;pthread_once(&recorders_once,init_recorders);if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");return start_state(e,&recorders[input],surface,input,1);}
+JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStart(JNIEnv *e,jclass c,jobject surface,jint input,jint target_fps){(void)c;pthread_once(&recorders_once,init_recorders);if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");if(target_fps<1)target_fps=1;if(target_fps>25)target_fps=25;return start_state(e,&recorders[input],surface,input,1,target_fps);}
 JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStop(JNIEnv *e,jclass c,jint input){(void)e;(void)c;pthread_once(&recorders_once,init_recorders);if(input>=0&&input<4){stop_state(&recorders[input]);statusf(&recorders[input],"Остановлено");}}
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStatus(JNIEnv *e,jclass c,jint input){(void)c;pthread_once(&recorders_once,init_recorders);if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");char x[512];pthread_mutex_lock(&recorders[input].mutex);snprintf(x,sizeof(x),"%s",recorders[input].status);pthread_mutex_unlock(&recorders[input].mutex);return (*e)->NewStringUTF(e,x);}
 JNIEXPORT jlongArray JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStats(JNIEnv *e,jclass c,jint input){(void)c;pthread_once(&recorders_once,init_recorders);if(input<0||input>3){state_t empty={0};return state_stats(e,&empty);}return state_stats(e,&recorders[input]);}

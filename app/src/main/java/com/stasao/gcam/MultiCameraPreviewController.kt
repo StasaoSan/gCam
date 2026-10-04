@@ -16,7 +16,7 @@ class MultiCameraPreviewController(context: Context) {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             capture = IQCarCamCapture.Stub.asInterface(service)
             surfaces.forEach { (id, surface) ->
-                if (surface.isValid) runCatching { capture?.start(surface, id) }
+                if (surface.isValid) runCatching { capture?.start(surface, id, 25) }
             }
         }
 
@@ -34,7 +34,7 @@ class MultiCameraPreviewController(context: Context) {
     fun start(surface: Surface, inputId: Int): String {
         surfaces.put(inputId, surface)?.takeIf { it !== surface }?.release()
         val remote = capture ?: return "Подключение к QCarCam…"
-        return runCatching { remote.start(surface, inputId) }
+        return runCatching { remote.start(surface, inputId, 25) }
             .getOrElse { it.message ?: "Ошибка подключения" }
     }
 

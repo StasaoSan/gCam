@@ -29,18 +29,21 @@ class CameraEncoder(
         check(running.compareAndSet(false, true))
         this.capture = capture
         try {
-            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, WIDTH, HEIGHT).apply {
+            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, config.width, config.height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, config.bitrateMbps * 1_000_000)
-                setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                setInteger(MediaFormat.KEY_FRAME_RATE, config.fps)
+                setInteger(MediaFormat.KEY_OPERATING_RATE, config.fps)
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
             }
             codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             inputSurface = codec.createInputSurface()
             codec.start()
-            val nativeStatus = capture.start(inputSurface, inputId)
+            val nativeStatus = capture.start(inputSurface, inputId, config.fps)
             check(nativeStatus.contains("принят", ignoreCase = true)) { nativeStatus }
             drainThread = Thread(::drain, "gcam-encoder-$inputId").also { it.start() }
         } catch (t: Throwable) {
@@ -156,11 +159,5 @@ class CameraEncoder(
         runCatching { codec.stop() }
         runCatching { codec.release() }
         if (::inputSurface.isInitialized) runCatching { inputSurface.release() }
-    }
-
-    companion object {
-        private const val WIDTH = 1280
-        private const val HEIGHT = 800
-        private const val FPS = 25
     }
 }
