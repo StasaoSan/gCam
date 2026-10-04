@@ -1,12 +1,17 @@
 package com.stasao.gcam
 
 import android.graphics.SurfaceTexture
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Bundle
 import android.view.Surface
 import android.view.TextureView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -31,9 +36,33 @@ private data class CameraInput(val id: Int, val title: String)
 private val cameraInputs = listOf(CameraInput(0, "Левая"), CameraInput(1, "Правая"), CameraInput(2, "Перед"), CameraInput(3, "Зад"))
 
 class MainActivity : ComponentActivity() {
+    private val recorderStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == DashcamService.ACTION_STATE) {
+                RecorderRepository.update(DashcamService.stateFrom(intent))
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState); enableEdgeToEdge()
         setContent { GCamTheme { GCamApp() } }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        ContextCompat.registerReceiver(
+            this,
+            recorderStateReceiver,
+            IntentFilter(DashcamService.ACTION_STATE),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        DashcamService.query(this)
+    }
+
+    override fun onStop() {
+        unregisterReceiver(recorderStateReceiver)
+        super.onStop()
     }
 }
 

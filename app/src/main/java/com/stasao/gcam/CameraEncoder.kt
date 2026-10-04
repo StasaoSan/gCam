@@ -24,8 +24,11 @@ class CameraEncoder(
     private lateinit var inputSurface: Surface
     private var drainThread: Thread? = null
 
-    fun start() {
+    private lateinit var capture: IQCarCamCapture
+
+    fun start(capture: IQCarCamCapture) {
         check(running.compareAndSet(false, true))
+        this.capture = capture
         try {
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, WIDTH, HEIGHT).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
@@ -38,7 +41,7 @@ class CameraEncoder(
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             inputSurface = codec.createInputSurface()
             codec.start()
-            val nativeStatus = NativeQCarCam.recorderStart(inputSurface, inputId)
+            val nativeStatus = capture.start(inputSurface, inputId)
             check(nativeStatus.contains("принят", ignoreCase = true)) { nativeStatus }
             drainThread = Thread(::drain, "gcam-encoder-$inputId").also { it.start() }
         } catch (t: Throwable) {
@@ -50,7 +53,7 @@ class CameraEncoder(
 
     fun stop() {
         if (!running.getAndSet(false)) return
-        NativeQCarCam.recorderStop(inputId)
+        if (::capture.isInitialized) runCatching { capture.stop(inputId) }
         runCatching { codec.signalEndOfInputStream() }
         drainThread?.join(5_000)
         drainThread = null

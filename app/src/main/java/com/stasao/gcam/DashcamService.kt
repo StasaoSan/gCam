@@ -5,8 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
@@ -25,6 +27,23 @@ class DashcamService : Service() {
     private val errors = ConcurrentHashMap<Int, String>()
     private var statsJob: Job? = null
     private var config = RecorderConfig()
+    private var capture: IQCarCamCapture? = null
+    private var captureBound = false
+    private var starting = false
+    private var currentState = RecorderState()
+    private val captureConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            capture = IQCarCamCapture.Stub.asInterface(service)
+            captureBound = true
+            scope.launch { startEncoders() }
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            capture = null
+            captureBound = false
+            errors[-1] = "Сервис камер отключился"
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -34,29 +53,54 @@ class DashcamService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> stopRecording()
+            ACTION_QUERY -> publish(currentState)
             else -> startRecording()
         }
-        return START_STICKY
+        return if (intent?.action == ACTION_QUERY) START_NOT_STICKY else START_STICKY
     }
 
     private fun startRecording() {
-        if (encoders.isNotEmpty()) return
+        if (starting || encoders.isNotEmpty()) return
+        starting = true
         config = RecorderSettings.load(this)
         RecordingStore.removeInterrupted(this)
         RecordingStore.enforceLimit(this, config)
         if (config.cameraIds.isEmpty()) {
-            RecorderRepository.update(RecorderState(status = "Выберите хотя бы одну камеру"))
+            publish(RecorderState(status = "Выберите хотя бы одну камеру"))
+            starting = false
             stopSelf()
             return
         }
         startForeground(NOTIFICATION_ID, notification("Запуск камер…"))
         errors.clear()
+        val intent = Intent(this, QCarCamCaptureService::class.java)
+        if (!bindService(intent, captureConnection, BIND_AUTO_CREATE)) {
+            starting = false
+            publish(RecorderState(status = "Не удалось запустить сервис камер"))
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    private fun startEncoders() {
+        val remote = capture ?: return
         config.cameraIds.sorted().forEach { id ->
             runCatching {
                 CameraEncoder(this, id, config) { message -> errors[id] = message }.also {
-                    it.start(); encoders[id] = it
+                    it.start(remote); encoders[id] = it
                 }
             }.onFailure { errors[id] = it.message ?: it.javaClass.simpleName }
+        }
+        starting = false
+        if (encoders.isEmpty()) {
+            val cameras = config.cameraIds.associateWith { id ->
+                CameraRecordingState(id, error = errors[id] ?: "Не удалось запустить")
+            }
+            publish(RecorderState(cameras = cameras, usedBytes = RecordingStore.usedBytes(this), status = "Запись не запущена"))
+            unbindCapture()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
         }
         statsJob?.cancel()
         statsJob = scope.launch {
@@ -66,13 +110,13 @@ class DashcamService : Service() {
             while (isActive && encoders.isNotEmpty()) {
                 val now = System.nanoTime()
                 val cameras = config.cameraIds.associateWith { id ->
-                    val stats = NativeQCarCam.recorderStats(id)
+                    val stats = runCatching { remote.stats(id) }.getOrDefault(longArrayOf())
                     val frames = stats.getOrElse(1) { 0 }
                     val old = previous[id] ?: (frames to now)
                     val fps = (frames - old.first).coerceAtLeast(0) /
                         ((now - old.second).coerceAtLeast(1) / 1_000_000_000.0)
                     previous[id] = frames to now
-                    val nativeStatus = NativeQCarCam.recorderStatus(id)
+                    val nativeStatus = runCatching { remote.status(id) }.getOrDefault("Сервис камер недоступен")
                     val nativeError = nativeStatus.takeIf { !it.contains("ожидание", true) && !it.contains("активен", true) &&
                         !it.contains("загрузка", true) && !it.contains("запуск", true) }
                     CameraRecordingState(id, frames, fps, stats.getOrElse(0) { 0 } != 0L, errors[id] ?: nativeError)
@@ -81,7 +125,7 @@ class DashcamService : Service() {
                 val status = if (cameras.values.none { it.error != null }) "Запись: $active/${config.cameraIds.size} камер"
                     else "Запись с ошибками: $active/${config.cameraIds.size}"
                 if (tick++ % 10 == 0) usedBytes = RecordingStore.usedBytes(this@DashcamService)
-                RecorderRepository.update(RecorderState(true, cameras, usedBytes, status))
+                publish(RecorderState(true, cameras, usedBytes, status))
                 getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(status))
                 delay(1_000)
             }
@@ -92,7 +136,9 @@ class DashcamService : Service() {
         statsJob?.cancel(); statsJob = null
         encoders.values.toList().forEach { runCatching { it.stop() } }
         encoders.clear()
-        RecorderRepository.update(RecorderState(usedBytes = RecordingStore.usedBytes(this)))
+        starting = false
+        unbindCapture()
+        publish(RecorderState(usedBytes = RecordingStore.usedBytes(this)))
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -104,6 +150,28 @@ class DashcamService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun unbindCapture() {
+        if (captureBound) runCatching { unbindService(captureConnection) }
+        captureBound = false
+        capture = null
+    }
+
+    private fun publish(state: RecorderState) {
+        currentState = state
+        RecorderRepository.update(state)
+        val cameras = state.cameras.values.sortedBy(CameraRecordingState::inputId)
+        sendBroadcast(Intent(ACTION_STATE).setPackage(packageName).apply {
+            putExtra(EXTRA_RECORDING, state.recording)
+            putExtra(EXTRA_USED_BYTES, state.usedBytes)
+            putExtra(EXTRA_STATUS, state.status)
+            putExtra(EXTRA_CAMERA_IDS, cameras.map(CameraRecordingState::inputId).toIntArray())
+            putExtra(EXTRA_FRAMES, cameras.map(CameraRecordingState::frames).toLongArray())
+            putExtra(EXTRA_FPS, cameras.map(CameraRecordingState::fps).toDoubleArray())
+            putExtra(EXTRA_CAMERA_RECORDING, cameras.map(CameraRecordingState::recording).toBooleanArray())
+            putExtra(EXTRA_ERRORS, cameras.map { it.error.orEmpty() }.toTypedArray())
+        })
+    }
 
     private fun createChannel() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(
@@ -131,6 +199,16 @@ class DashcamService : Service() {
         private const val NOTIFICATION_ID = 360
         const val ACTION_START = "com.stasao.gcam.START_RECORDING"
         const val ACTION_STOP = "com.stasao.gcam.STOP_RECORDING"
+        const val ACTION_QUERY = "com.stasao.gcam.QUERY_RECORDING"
+        const val ACTION_STATE = "com.stasao.gcam.RECORDING_STATE"
+        private const val EXTRA_RECORDING = "recording"
+        private const val EXTRA_USED_BYTES = "used_bytes"
+        private const val EXTRA_STATUS = "status"
+        private const val EXTRA_CAMERA_IDS = "camera_ids"
+        private const val EXTRA_FRAMES = "frames"
+        private const val EXTRA_FPS = "fps"
+        private const val EXTRA_CAMERA_RECORDING = "camera_recording"
+        private const val EXTRA_ERRORS = "errors"
 
         fun start(context: Context) = context.startForegroundService(
             Intent(context, DashcamService::class.java).setAction(ACTION_START)
@@ -138,5 +216,31 @@ class DashcamService : Service() {
         fun stop(context: Context) = context.startService(
             Intent(context, DashcamService::class.java).setAction(ACTION_STOP)
         )
+
+        fun query(context: Context) = context.startService(
+            Intent(context, DashcamService::class.java).setAction(ACTION_QUERY)
+        )
+
+        fun stateFrom(intent: Intent): RecorderState {
+            val ids = intent.getIntArrayExtra(EXTRA_CAMERA_IDS) ?: intArrayOf()
+            val frames = intent.getLongArrayExtra(EXTRA_FRAMES) ?: longArrayOf()
+            val fps = intent.getDoubleArrayExtra(EXTRA_FPS) ?: doubleArrayOf()
+            val recording = intent.getBooleanArrayExtra(EXTRA_CAMERA_RECORDING) ?: booleanArrayOf()
+            val errors = intent.getStringArrayExtra(EXTRA_ERRORS) ?: emptyArray()
+            val cameras = ids.mapIndexed { index, id ->
+                id to CameraRecordingState(
+                    id,
+                    frames.getOrElse(index) { 0L },
+                    fps.getOrElse(index) { 0.0 },
+                    recording.getOrElse(index) { false },
+                    errors.getOrNull(index)?.takeIf(String::isNotEmpty)
+                )
+            }.toMap()
+            return RecorderState(
+                intent.getBooleanExtra(EXTRA_RECORDING, false), cameras,
+                intent.getLongExtra(EXTRA_USED_BYTES, 0),
+                intent.getStringExtra(EXTRA_STATUS) ?: "Регистратор остановлен"
+            )
+        }
     }
 }

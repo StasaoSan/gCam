@@ -31,7 +31,12 @@
             android:name=".DashcamService"
             android:exported="false"
             android:foregroundServiceType="dataSync"
+            android:process=":recorder"
             android:stopWithTask="false" />
+        <service
+            android:name=".QCarCamCaptureService"
+            android:exported="false"
+            android:process=":qcarcam" />
     </application>
 
 </manifest>
