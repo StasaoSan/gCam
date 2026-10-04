@@ -4,8 +4,7 @@ data class RecorderConfig(
     val cameraIds: Set<Int> = setOf(2, 3),
     val bitrateMbps: Int = 4,
     val segmentMinutes: Int = 2,
-    val storageLimitGb: Int = 40,
-    val reserveGb: Int = 5
+    val storageLimitGb: Int = 40
 )
 
 data class CameraRecordingState(
@@ -24,7 +23,7 @@ data class RecorderState(
 )
 
 data class RecordingFile(
-    val path: String,
+    val uri: String,
     val name: String,
     val inputId: Int,
     val sizeBytes: Long,

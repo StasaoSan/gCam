@@ -130,7 +130,9 @@ typedef struct { uint64_t len; uint32_t heap_mask, flags, fd, unused; } ion_allo
 
 static int alloc_buffers(frame_memory_t *memory,qbuffers_t *q){
     memset(q,0,sizeof(*q));q->color_fmt=UYVY8;q->n_buffers=NBUF;q->buffers=calloc(NBUF,sizeof(qbuffer_t));if(!q->buffers)return -1;
-    int ion=open("/dev/ion",O_RDWR|O_CLOEXEC);if(ion<0){LOGE("open /dev/ion: %s",strerror(errno));return -1;}
+    /* ION control ioctls only require a readable control fd. The returned DMA
+       buffer fds remain read/write, matching Android's stock libion behavior. */
+    int ion=open("/dev/ion",O_RDONLY|O_CLOEXEC);if(ion<0){LOGE("open /dev/ion: %s",strerror(errno));return -1;}
     for(unsigned i=0;i<NBUF;i++){
         /* Non-secure heap selected by the stock libais_test_util on G636. */
         ion_alloc_t allocation={.len=(BYTES+4095u)&~4095u,.heap_mask=0x02000000,.flags=0,.fd=0};
@@ -152,7 +154,7 @@ static void qcarcam_event(qhandle_t handle, int event, void *payload) {
 static void *stream_thread(void *arg){
     state_t *state=(state_t *)arg;qapi_t a={0};qhandle_t cam=NULL;frame_memory_t memory[NBUF]={{-1,NULL},{-1,NULL},{-1,NULL}};qbuffers_t qb={0};renderer_t r={.d=EGL_NO_DISPLAY,.s=EGL_NO_SURFACE,.c=EGL_NO_CONTEXT};int acquired=0,started=0,rc;char err[384]={0};uint64_t begun=now_ns();
     statusf(state,"Загрузка QCarCam HIDL…");if(acquire_api(&a,err,sizeof(err))){statusf(state,"QCarCam недоступен: %s",err);goto done;}acquired=1;
-    cam=a.open(state->input);if(!cam){statusf(state,"Не удалось открыть QCarCam input %u",state->input);goto done;}if(alloc_buffers(memory,&qb)){statusf(state,"ION недоступен — запустите tools/prepare_ion_access.sh");goto done;}rc=a.buffers(cam,&qb);if(rc){statusf(state,"qcarcam_s_buffers: ошибка %d",rc);goto done;}
+    cam=a.open(state->input);if(!cam){statusf(state,"Не удалось открыть QCarCam input %u",state->input);goto done;}if(alloc_buffers(memory,&qb)){statusf(state,"ION недоступен");goto done;}rc=a.buffers(cam,&qb);if(rc){statusf(state,"qcarcam_s_buffers: ошибка %d",rc);goto done;}
     unsigned char event_value[264]={0};*(void **)event_value=(void *)qcarcam_event;
     rc=a.param(cam,1,event_value);if(rc){statusf(state,"qcarcam_s_param(callback): ошибка %d",rc);goto done;}
     memset(event_value,0,sizeof(event_value));*(uint32_t *)event_value=15;

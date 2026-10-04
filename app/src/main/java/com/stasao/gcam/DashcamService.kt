@@ -63,6 +63,7 @@ class DashcamService : Service() {
         if (starting || encoders.isNotEmpty()) return
         starting = true
         config = RecorderSettings.load(this)
+        RecordingStore.migrateLegacy(this)
         RecordingStore.removeInterrupted(this)
         RecordingStore.enforceLimit(this, config)
         if (config.cameraIds.isEmpty()) {

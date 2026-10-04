@@ -7,7 +7,6 @@ import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.os.Bundle
 import android.view.Surface
-import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -65,7 +64,8 @@ class CameraEncoder(
         var outputFormat: MediaFormat? = null
         var muxer: MediaMuxer? = null
         var track = -1
-        var tempFile: File? = null
+        var target: RecordingTarget? = null
+        var segmentHasSamples = false
         var segmentFirstPts = -1L
         var syncRequested = false
         val segmentUs = config.segmentMinutes * 60L * 1_000_000L
@@ -78,13 +78,14 @@ class CameraEncoder(
             if (active != null) {
                 runCatching { active.stop() }
                 runCatching { active.release() }
-                tempFile?.let { temp ->
-                    if (temp.length() > 0) temp.renameTo(File(temp.parentFile, temp.name.removeSuffix(".tmp") + ".mp4"))
-                    else temp.delete()
+                target?.let { segment ->
+                    if (segmentHasSamples) RecordingStore.finishSegment(context, segment)
+                    else RecordingStore.abortSegment(context, segment)
                 }
                 RecordingStore.enforceLimit(context, config)
             }
-            tempFile = null
+            target = null
+            segmentHasSamples = false
             track = -1
             segmentFirstPts = -1L
             syncRequested = false
@@ -92,10 +93,17 @@ class CameraEncoder(
 
         fun openSegment(format: MediaFormat) {
             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-            tempFile = File(RecordingStore.cameraDir(context, inputId), "cam${inputId}_$stamp.tmp")
-            muxer = MediaMuxer(tempFile!!.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4).also {
-                track = it.addTrack(MediaFormat(format))
-                it.start()
+            val segment = RecordingStore.createSegment(context, inputId, "cam${inputId}_$stamp.mp4")
+            target = segment
+            try {
+                muxer = MediaMuxer(segment.descriptor.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4).also {
+                    track = it.addTrack(MediaFormat(format))
+                    it.start()
+                }
+            } catch (t: Throwable) {
+                RecordingStore.abortSegment(context, segment)
+                target = null
+                throw t
             }
         }
 
@@ -131,6 +139,7 @@ class CameraEncoder(
                                 set(info.offset, info.size, info.presentationTimeUs - segmentFirstPts, info.flags)
                             }
                             muxer?.writeSampleData(track, buffer, writeInfo)
+                            segmentHasSamples = true
                         }
                         codec.releaseOutputBuffer(index, false)
                     }

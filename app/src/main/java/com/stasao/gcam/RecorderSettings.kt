@@ -14,8 +14,7 @@ object RecorderSettings {
             cameraIds = cameras,
             bitrateMbps = p.getInt("bitrate_mbps", 4).coerceIn(2, 8),
             segmentMinutes = p.getInt("segment_minutes", 2).coerceIn(1, 5),
-            storageLimitGb = p.getInt("storage_limit_gb", 40).coerceIn(5, 100),
-            reserveGb = p.getInt("reserve_gb", 5).coerceIn(2, 20)
+            storageLimitGb = p.getInt("storage_limit_gb", 40).coerceIn(1, 512)
         )
     }
 
@@ -25,7 +24,16 @@ object RecorderSettings {
             putInt("bitrate_mbps", config.bitrateMbps)
             putInt("segment_minutes", config.segmentMinutes)
             putInt("storage_limit_gb", config.storageLimitGb)
-            putInt("reserve_gb", config.reserveGb)
         }.apply()
+    }
+
+    fun loadUiScale(context: Context): Float {
+        val saved = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getFloat("ui_scale", 1.5f)
+        return saved.takeIf { it in 1.3f..1.8f } ?: 1.5f
+    }
+
+    fun saveUiScale(context: Context, scale: Float) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putFloat("ui_scale", scale.coerceIn(1.3f, 1.8f)).apply()
     }
 }
