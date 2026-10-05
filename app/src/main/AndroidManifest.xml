@@ -2,6 +2,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <permission
+        android:name="${applicationId}.permission.QCARCAM_CAPTURE"
+        android:protectionLevel="signature" />
+
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
@@ -37,7 +41,8 @@
             android:stopWithTask="false" />
         <service
             android:name=".QCarCamCaptureService"
-            android:exported="false"
+            android:exported="true"
+            android:permission="${applicationId}.permission.QCARCAM_CAPTURE"
             android:process=":qcarcam" />
     </application>
 

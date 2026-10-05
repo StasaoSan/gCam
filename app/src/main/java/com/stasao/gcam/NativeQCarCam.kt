@@ -11,6 +11,7 @@ object NativeQCarCam {
     external fun probe(): String
 
     @JvmStatic external fun start(surface: Surface, inputId: Int): String
+    @JvmStatic external fun hudStart(surface: Surface, inputId: Int, targetFps: Int): String
     @JvmStatic external fun stop()
     @JvmStatic external fun status(): String
 

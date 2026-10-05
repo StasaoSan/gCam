@@ -20,6 +20,21 @@ class QCarCamCaptureService : Service() {
         override fun status(inputId: Int): String = NativeQCarCam.recorderStatus(inputId)
 
         override fun stats(inputId: Int): LongArray = NativeQCarCam.recorderStats(inputId)
+
+        override fun startHud(surface: Surface, inputId: Int, targetFps: Int): String {
+            val recorderRunning = NativeQCarCam.recorderStats(inputId).firstOrNull() == 1L
+            return if (recorderRunning) {
+                "QCarCam input $inputId занят видеорегистратором"
+            } else {
+                NativeQCarCam.hudStart(surface, inputId, targetFps)
+            }
+        }
+
+        override fun stopHud() = NativeQCarCam.stop()
+
+        override fun hudStatus(): String = NativeQCarCam.status()
+
+        override fun hudStats(): LongArray = NativeQCarCam.stats()
     }
 
     override fun onBind(intent: Intent?): IBinder = binder

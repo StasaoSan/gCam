@@ -242,7 +242,7 @@ static void *stream_thread(void *arg){
         if(r.upload_mode==UPLOAD_DMABUF_RGBA){if(release_completed_frames(&r,&a,cam,0)<0)break;if(pending_fences(&r)>=NBUF&&release_completed_frames(&r,&a,cam,1)<=0){statusf(state,"GPU fence timeout; поток остановлен");break;}}
         qframe_t f={0};rc=a.get(cam,&f,500000000ull,0);if(rc){if(!atomic_load(&state->stop))atomic_fetch_add(&state->dropped,1);continue;}if(f.idx>=NBUF){atomic_fetch_add(&state->dropped,1);a.release(cam,f.idx);continue;}
         uint64_t frame_now=now_ns();
-        if(state->recordable&&frame_interval_ns){
+        if(frame_interval_ns){
             if(next_frame_ns&&frame_now<next_frame_ns){a.release(cam,f.idx);continue;}
             if(!next_frame_ns||frame_now>next_frame_ns+frame_interval_ns)next_frame_ns=frame_now+frame_interval_ns;else next_frame_ns+=frame_interval_ns;
         }
@@ -256,6 +256,7 @@ static jstring start_state(JNIEnv *e,state_t *state,jobject surface,jint input,i
 static jlongArray state_stats(JNIEnv *e,state_t *state){jlong v[5]={atomic_load(&state->running),(jlong)atomic_load(&state->frames),(jlong)atomic_load(&state->dropped),(jlong)atomic_load(&state->first_ms),(jlong)atomic_load(&state->last_ns)};jlongArray a=(*e)->NewLongArray(e,5);if(a)(*e)->SetLongArrayRegion(e,a,0,5,v);return a;}
 
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_start(JNIEnv *e,jclass c,jobject surface,jint input){(void)c;return start_state(e,&s,surface,input,0,25);}
+JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStart(JNIEnv *e,jclass c,jobject surface,jint input,jint target_fps){(void)c;if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");if(target_fps<1)target_fps=1;if(target_fps>20)target_fps=20;return start_state(e,&s,surface,input,0,target_fps);}
 JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_stop(JNIEnv *e,jclass c){(void)e;(void)c;stop_state(&s);statusf(&s,"Остановлено");}
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_status(JNIEnv *e,jclass c){(void)c;char x[512];pthread_mutex_lock(&s.mutex);snprintf(x,sizeof(x),"%s",s.status);pthread_mutex_unlock(&s.mutex);return (*e)->NewStringUTF(e,x);}
 JNIEXPORT jlongArray JNICALL Java_com_stasao_gcam_NativeQCarCam_stats(JNIEnv *e,jclass c){(void)c;return state_stats(e,&s);}
