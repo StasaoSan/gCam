@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -120,6 +121,26 @@ class DashcamService : Service() {
                     val nativeStatus = runCatching { remote.status(id) }.getOrDefault("Сервис камер недоступен")
                     val nativeError = nativeStatus.takeIf { !it.contains("ожидание", true) && !it.contains("активен", true) &&
                         !it.contains("загрузка", true) && !it.contains("запуск", true) }
+                    if (tick > 0 && tick % PERF_LOG_INTERVAL_SECONDS == 0) {
+                        Log.i(PERF_TAG, buildString {
+                            append("input=$id mode=")
+                            append(if (stats.getOrElse(16) { 0 } != 0L) "zero-copy" else "PBO")
+                            append(" fps=").append("%.2f".format(fps))
+                            append(" frames=").append(frames)
+                            append(" timeouts=").append(stats.getOrElse(2) { 0 })
+                            append(" getAvgUs=").append(stats.getOrElse(5) { 0 })
+                            append(" getMaxUs=").append(stats.getOrElse(6) { 0 })
+                            append(" memcpyAvgUs=").append(stats.getOrElse(7) { 0 })
+                            append(" memcpyMaxUs=").append(stats.getOrElse(8) { 0 })
+                            append(" gpuSubmitAvgUs=").append(stats.getOrElse(9) { 0 })
+                            append(" gpuSubmitMaxUs=").append(stats.getOrElse(10) { 0 })
+                            append(" swapAvgUs=").append(stats.getOrElse(11) { 0 })
+                            append(" swapMaxUs=").append(stats.getOrElse(12) { 0 })
+                            append(" holdAvgUs=").append(stats.getOrElse(13) { 0 })
+                            append(" holdMaxUs=").append(stats.getOrElse(14) { 0 })
+                            append(" maxGapUs=").append(stats.getOrElse(15) { 0 })
+                        })
+                    }
                     CameraRecordingState(id, frames, fps, stats.getOrElse(0) { 0 } != 0L, errors[id] ?: nativeError)
                 }
                 val active = cameras.values.count(CameraRecordingState::recording)
@@ -198,6 +219,8 @@ class DashcamService : Service() {
     companion object {
         private const val CHANNEL_ID = "dashcam_recording"
         private const val NOTIFICATION_ID = 360
+        private const val PERF_TAG = "GCAM_PERF"
+        private const val PERF_LOG_INTERVAL_SECONDS = 5
         const val ACTION_START = "com.stasao.gcam.START_RECORDING"
         const val ACTION_STOP = "com.stasao.gcam.STOP_RECORDING"
         const val ACTION_QUERY = "com.stasao.gcam.QUERY_RECORDING"
