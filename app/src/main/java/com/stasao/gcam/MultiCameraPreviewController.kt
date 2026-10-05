@@ -42,6 +42,10 @@ class MultiCameraPreviewController(context: Context) {
         capture?.status(inputId) ?: "Подключение к QCarCam…"
     }.getOrElse { it.message ?: "Ошибка подключения" }
 
+    fun stats(inputId: Int): LongArray = runCatching {
+        capture?.stats(inputId) ?: longArrayOf()
+    }.getOrDefault(longArrayOf())
+
     fun stop(inputId: Int) {
         runCatching { capture?.stop(inputId) }
         surfaces.remove(inputId)?.release()

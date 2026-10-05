@@ -141,7 +141,16 @@ class DashcamService : Service() {
                             append(" maxGapUs=").append(stats.getOrElse(15) { 0 })
                         })
                     }
-                    CameraRecordingState(id, frames, fps, stats.getOrElse(0) { 0 } != 0L, errors[id] ?: nativeError)
+                    CameraRecordingState(
+                        inputId = id,
+                        frames = frames,
+                        fps = fps,
+                        recording = stats.getOrElse(0) { 0 } != 0L,
+                        error = errors[id] ?: nativeError,
+                        zeroCopy = stats.getOrNull(16)?.takeIf { frames > 0 }?.let { it != 0L },
+                        maxGapMs = stats.getOrElse(15) { 0 } / 1_000.0,
+                        timeouts = stats.getOrElse(2) { 0 }
+                    )
                 }
                 val active = cameras.values.count(CameraRecordingState::recording)
                 val status = if (cameras.values.none { it.error != null }) "Запись: $active/${config.cameraIds.size} камер"
@@ -192,6 +201,10 @@ class DashcamService : Service() {
             putExtra(EXTRA_FPS, cameras.map(CameraRecordingState::fps).toDoubleArray())
             putExtra(EXTRA_CAMERA_RECORDING, cameras.map(CameraRecordingState::recording).toBooleanArray())
             putExtra(EXTRA_ERRORS, cameras.map { it.error.orEmpty() }.toTypedArray())
+            putExtra(EXTRA_DIAGNOSTICS_AVAILABLE, cameras.map { it.zeroCopy != null }.toBooleanArray())
+            putExtra(EXTRA_ZERO_COPY, cameras.map { it.zeroCopy == true }.toBooleanArray())
+            putExtra(EXTRA_MAX_GAP_MS, cameras.map(CameraRecordingState::maxGapMs).toDoubleArray())
+            putExtra(EXTRA_TIMEOUTS, cameras.map(CameraRecordingState::timeouts).toLongArray())
         })
     }
 
@@ -233,6 +246,10 @@ class DashcamService : Service() {
         private const val EXTRA_FPS = "fps"
         private const val EXTRA_CAMERA_RECORDING = "camera_recording"
         private const val EXTRA_ERRORS = "errors"
+        private const val EXTRA_DIAGNOSTICS_AVAILABLE = "diagnostics_available"
+        private const val EXTRA_ZERO_COPY = "zero_copy"
+        private const val EXTRA_MAX_GAP_MS = "max_gap_ms"
+        private const val EXTRA_TIMEOUTS = "timeouts"
 
         fun start(context: Context) = context.startForegroundService(
             Intent(context, DashcamService::class.java).setAction(ACTION_START)
@@ -251,13 +268,20 @@ class DashcamService : Service() {
             val fps = intent.getDoubleArrayExtra(EXTRA_FPS) ?: doubleArrayOf()
             val recording = intent.getBooleanArrayExtra(EXTRA_CAMERA_RECORDING) ?: booleanArrayOf()
             val errors = intent.getStringArrayExtra(EXTRA_ERRORS) ?: emptyArray()
+            val diagnostics = intent.getBooleanArrayExtra(EXTRA_DIAGNOSTICS_AVAILABLE) ?: booleanArrayOf()
+            val zeroCopy = intent.getBooleanArrayExtra(EXTRA_ZERO_COPY) ?: booleanArrayOf()
+            val maxGapMs = intent.getDoubleArrayExtra(EXTRA_MAX_GAP_MS) ?: doubleArrayOf()
+            val timeouts = intent.getLongArrayExtra(EXTRA_TIMEOUTS) ?: longArrayOf()
             val cameras = ids.mapIndexed { index, id ->
                 id to CameraRecordingState(
-                    id,
-                    frames.getOrElse(index) { 0L },
-                    fps.getOrElse(index) { 0.0 },
-                    recording.getOrElse(index) { false },
-                    errors.getOrNull(index)?.takeIf(String::isNotEmpty)
+                    inputId = id,
+                    frames = frames.getOrElse(index) { 0L },
+                    fps = fps.getOrElse(index) { 0.0 },
+                    recording = recording.getOrElse(index) { false },
+                    error = errors.getOrNull(index)?.takeIf(String::isNotEmpty),
+                    zeroCopy = if (diagnostics.getOrElse(index) { false }) zeroCopy.getOrElse(index) { false } else null,
+                    maxGapMs = maxGapMs.getOrElse(index) { 0.0 },
+                    timeouts = timeouts.getOrElse(index) { 0L }
                 )
             }.toMap()
             return RecorderState(

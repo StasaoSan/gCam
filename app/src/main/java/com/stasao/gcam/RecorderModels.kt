@@ -15,7 +15,10 @@ data class CameraRecordingState(
     val frames: Long = 0,
     val fps: Double = 0.0,
     val recording: Boolean = false,
-    val error: String? = null
+    val error: String? = null,
+    val zeroCopy: Boolean? = null,
+    val maxGapMs: Double = 0.0,
+    val timeouts: Long = 0
 )
 
 data class RecorderState(

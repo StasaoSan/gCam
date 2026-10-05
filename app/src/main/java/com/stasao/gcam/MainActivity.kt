@@ -46,6 +46,7 @@ import java.util.Date
 import java.util.Locale
 
 private data class CameraInput(val id: Int, val title: String)
+private data class CameraDiagnostics(val zeroCopy: Boolean, val fps: Double, val maxGapMs: Double)
 private val cameraInputs = listOf(CameraInput(0, "Левая"), CameraInput(1, "Правая"), CameraInput(2, "Перед"), CameraInput(3, "Зад"))
 
 class MainActivity : ComponentActivity() {
@@ -148,7 +149,11 @@ class MainActivity : ComponentActivity() {
         }
         item { Surface(color = if (state.recording) Color(0xFF1B5E20) else MaterialTheme.colorScheme.surfaceVariant, shape = MaterialTheme.shapes.medium) {
             Column(Modifier.fillMaxWidth().padding(14.dp)) { Text(state.status, color = if (state.recording) Color.White else MaterialTheme.colorScheme.onSurface)
-                state.cameras.values.sortedBy { it.inputId }.forEach { c -> Text("${recorderCameraNames[c.inputId]}: ${"%.1f".format(Locale.US, c.fps)} fps${c.error?.let { " · $it" } ?: ""}", fontSize = 12.sp, color = if (state.recording) Color.White else MaterialTheme.colorScheme.onSurface) }
+                state.cameras.values.sortedBy { it.inputId }.forEach { c ->
+                    val mode = when (c.zeroCopy) { true -> "ZERO-COPY"; false -> "PBO fallback"; null -> "проверка…" }
+                    val pause = if (c.maxGapMs > 0) " · макс. пауза ${c.maxGapMs.toInt()} мс" else ""
+                    Text("${recorderCameraNames[c.inputId]}: $mode · ${"%.1f".format(Locale.US, c.fps)} fps$pause${c.error?.let { " · $it" } ?: ""}", fontSize = 12.sp, color = if (state.recording) Color.White else MaterialTheme.colorScheme.onSurface)
+                }
             }
         } }
         item { SectionTitle("Камеры для записи") }
@@ -208,6 +213,7 @@ class MainActivity : ComponentActivity() {
 @Composable private fun CameraTile(controller: MultiCameraPreviewController, input: CameraInput, modifier: Modifier = Modifier) {
     val scope = rememberCoroutineScope()
     var status by remember { mutableStateOf("Подключение…") }
+    var diagnostics by remember { mutableStateOf<CameraDiagnostics?>(null) }
     var pollJob by remember { mutableStateOf<Job?>(null) }
     DisposableEffect(Unit) { onDispose { pollJob?.cancel(); controller.stop(input.id) } }
     Box(modifier.aspectRatio(1.6f).background(Color.Black)) {
@@ -219,9 +225,21 @@ class MainActivity : ComponentActivity() {
                     pollJob = scope.launch(Dispatchers.IO) {
                         status = controller.start(surface, input.id)
                         if (!status.contains("Нет доступа", true)) {
+                            var previousFrames = 0L
+                            var previousTime = System.nanoTime()
                             while (true) {
                                 delay(500)
                                 status = controller.status(input.id)
+                                val stats = controller.stats(input.id)
+                                val now = System.nanoTime()
+                                if (stats.size >= 17 && stats[1] > 0) {
+                                    val frames = stats[1]
+                                    val elapsed = (now - previousTime).coerceAtLeast(1L) / 1_000_000_000.0
+                                    val fps = if (previousFrames > 0) (frames - previousFrames).coerceAtLeast(0) / elapsed else 0.0
+                                    diagnostics = CameraDiagnostics(stats[16] != 0L, fps, stats[15] / 1_000.0)
+                                    previousFrames = frames
+                                    previousTime = now
+                                }
                             }
                         }
                     }
@@ -238,6 +256,14 @@ class MainActivity : ComponentActivity() {
         Surface(color = Color(0xAA000000), modifier = Modifier.align(Alignment.TopStart)) {
             Column(Modifier.padding(horizontal = 7.dp, vertical = 4.dp)) {
                 Text(input.title, color = Color.White, fontSize = 12.sp)
+                diagnostics?.let { d ->
+                    Text(
+                        "${if (d.zeroCopy) "ZERO-COPY" else "PBO fallback"} · ${"%.1f".format(Locale.US, d.fps)} fps · пауза ${d.maxGapMs.toInt()} мс",
+                        color = if (d.zeroCopy) Color(0xFF69F0AE) else Color(0xFFFFCC80),
+                        fontSize = 8.sp,
+                        maxLines = 1
+                    )
+                }
                 Text(status, color = Color.White, fontSize = 8.sp, maxLines = 1)
             }
         }

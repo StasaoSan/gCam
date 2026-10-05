@@ -3,12 +3,12 @@ set -euo pipefail
 
 usage() {
   echo "Usage: $0 [-s adb-serial] [--package app.id] [--duration seconds] [--cycles count] [--restart-duration seconds]"
-  echo "Example: $0 -s 192.168.119.246:5555 --duration 600 --cycles 10"
+  echo "Example: $0 -s 192.168.119.246:5555 --duration 20"
 }
 
 serial=""
 package_name="com.stasao.gcam.dev"
-duration=600
+duration=20
 cycles=1
 restart_duration=10
 while [[ $# -gt 0 ]]; do
