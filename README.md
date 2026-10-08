@@ -254,60 +254,49 @@ export JAVA_HOME="/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
 Проект собирает только `arm64-v8a`, что соответствует G636. Нужны Android SDK и NDK
 `28.2.13676358`.
 
-### Автоматическая сборка по тегу
+### Выпуск и обновление через GitHub
 
-GitHub Actions собирает и тестирует устанавливаемый debug APK при отправке тега, начинающегося
-с `v` (`v4.7`, `v4.7.1` и т. п.). Готовый APK находится в артефактах запуска Actions и хранится
-1 день. Постоянный GitHub Release автоматически не создаётся, а Gradle-кэш не сохраняется, чтобы
-не расходовать квоту бесплатного аккаунта.
+При отправке тега `v*` GitHub Actions запускает тесты, собирает подписанный release APK и создаёт
+GitHub Release с заметками из [`CHANGELOG.md`](CHANGELOG.md). Для тега `v4.8` файл называется
+`gCam_[v4.8].apk`. Временная копия в Actions хранится 1 день; APK в GitHub Release остаётся
+доступен для обновлений. Ручной запуск workflow собирает APK, но не публикует Release.
 
-Перед выпуском обновите `versionName`/`versionCode` в `app/build.gradle.kts` и добавьте раздел
-для этого тега в [`CHANGELOG.md`](CHANGELOG.md). Workflow остановится с понятной ошибкой, если
-тег, версия приложения и changelog не совпадают. Для тега `v4.7` результат называется
-`gCam_[v4.7].apk`, а заметки версии — `gCam_[v4.7]_CHANGELOG.txt`.
+Для первого выпуска один раз подготовьте постоянный ключ подписи. В GitHub-репозитории откройте
+**Settings → Secrets and variables → Actions** и добавьте четыре секрета:
+
+- `SIGNING_KEYSTORE_BASE64` — содержимое keystore, закодированное Base64;
+- `SIGNING_STORE_PASSWORD` — пароль хранилища;
+- `SIGNING_KEY_ALIAS` — имя ключа;
+- `SIGNING_KEY_PASSWORD` — пароль ключа.
+
+Пример создания нового ключа на Mac (сохраните `.jks` и пароли отдельно от репозитория):
 
 ```bash
-git tag v4.7
-git push origin v4.7
+keytool -genkeypair -v -keystore gcam-release.jks -alias gcam \
+  -keyalg RSA -keysize 3072 -validity 10000
+base64 -i gcam-release.jks | tr -d '\n'
 ```
 
-Workflow также можно запустить вручную через кнопку **Run workflow** на странице GitHub Actions.
+Если у установленного `com.stasao.gcam` уже есть постоянный ключ, используйте именно его:
+Android принимает обновление только с прежней подписью. Подпись release gCam также должна
+соответствовать подписи release ANHUD для защищённого AIDL-моста. Сборка `com.stasao.gcam.dev`
+является отдельным приложением; первый подписанный release APK устанавливается вручную один раз.
 
-#### Публикация в Google Drive
+Перед выпуском увеличьте `versionCode`, установите соответствующий тегу `versionName` в
+`app/build.gradle.kts` и добавьте раздел в changelog. Затем отправьте коммит в основную ветку и
+выпустите тег на этом коммите:
 
-Workflow может дополнительно копировать APK и changelog в общедоступную папку Google Drive.
-Папка уже открыта всем по ссылке с правом «Редактор». Для автоматической загрузки через Drive API
-workflow всё равно нужен OAuth-токен: публичная ссылка не заменяет авторизацию API. Можно
-использовать свой обычный Google-аккаунт; отдельный аккаунт необязателен. Обычное использование
-Drive API не требует оплаты в пределах стандартных квот.
+```bash
+git tag v4.8
+git push origin main
+git push origin v4.8
+```
 
-1. В [Google Cloud Console](https://console.cloud.google.com/) создайте проект, включите Google
-   Drive API и настройте OAuth consent screen для External. Добавьте свой аккаунт в тестовые
-   пользователи, затем создайте OAuth Client ID типа **Desktop app**. Запишите Client ID и Client
-   Secret. Для длительной работы переведите приложение из **Testing** в **In production**: в
-   режиме Testing разрешение может истечь через семь дней. Для личного использования может
-   появиться предупреждение о непроверенном приложении при авторизации.
-2. Установите `rclone` на Mac и создайте конфиг с remote по имени `gdrive`:
-
-   ```bash
-   brew install rclone
-   rclone --config "$PWD/gcam-rclone.conf" config
-   ```
-
-   Выберите тип `drive`, введите созданные Client ID/Secret и войдите в браузере в аккаунт,
-   которому доступна папка. Конфиг не добавляйте в Git: он содержит OAuth refresh token. Общий
-   Client ID самого `rclone` выводится из эксплуатации в 2026 году, поэтому нужен свой.
-
-3. В настройках GitHub-репозитория откройте **Settings → Secrets and variables → Actions** и
-   создайте secret `GDRIVE_RCLONE_CONFIG`, содержащий весь файл `gcam-rclone.conf`.
-
-ID целевой публичной папки уже записан в workflow:
-`1Jw1z67q-395SoFbbN-2tWeG2ytap0Rwl`.
-
-Если secret отсутствует, этап Google Drive будет пропущен, но сборка и однодневный
-GitHub artifact останутся рабочими. При повторном выпуске с тем же именем `rclone` обновит файл в
-этой папке. Google Drive хранит опубликованные APK постоянно; ограничение в 1 день относится
-только к временному GitHub artifact.
+Во вкладке «Обновление» gCam проверяет последний публичный GitHub Release, показывает заметки,
+скачивает APK и проверяет его размер, SHA-256, пакет, версию и подпись. Затем открывает системный
+установщик. При первом обновлении Android попросит разрешить установку из gCam. Установку нужно
+подтвердить вручную; во время записи сначала завершите текущие MP4. Для проверки релизов из
+самого приложения репозиторий с APK должен быть публичным.
 
 Готовый debug APK после сборки: `app/build/outputs/apk/debug/app-debug.apk`. Установка на
 конкретную машину, когда ADB видит несколько устройств:

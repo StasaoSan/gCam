@@ -109,7 +109,7 @@ class MainActivity : ComponentActivity() {
     CompositionLocalProvider(LocalDensity provides Density(baseDensity.density * uiScale, baseDensity.fontScale)) {
     Scaffold(topBar = { Column {
         TopAppBar(title = { Text("Камеры 360°") }, colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primaryContainer))
-        PrimaryTabRow(selectedTabIndex = tab) { listOf("Камеры и запись", "Записи").forEachIndexed { i, title ->
+        PrimaryTabRow(selectedTabIndex = tab) { listOf("Камеры и запись", "Записи", "Обновление").forEachIndexed { i, title ->
             Tab(selected = tab == i, onClick = { tab = i }, text = { Text(title) })
         } }
     } }) { padding -> Box(Modifier.fillMaxSize().padding(padding)) {
@@ -118,9 +118,92 @@ class MainActivity : ComponentActivity() {
                 uiScale = it
                 RecorderSettings.saveUiScale(context, it)
             }
-            else -> RecordingsScreen()
+            1 -> RecordingsScreen()
+            else -> UpdateScreen(recorder.recording)
         }
     } }
+    }
+}
+
+@Composable private fun UpdateScreen(recording: Boolean) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var release by remember { mutableStateOf<GCamRelease?>(null) }
+    var downloaded by remember { mutableStateOf<java.io.File?>(null) }
+    var status by remember { mutableStateOf("Проверка обновлений…") }
+    var busy by remember { mutableStateOf(false) }
+    var progress by remember { mutableFloatStateOf(0f) }
+
+    fun check() {
+        if (!GCamUpdater.supportsUpdates(context)) {
+            status = "Это debug-сборка. Обновления доступны после установки release APK."
+            return
+        }
+        busy = true
+        scope.launch {
+            runCatching { GCamUpdater.latestRelease(context) }
+                .onSuccess { found ->
+                    release = found
+                    downloaded = null
+                    status = if (found == null) "Установлена актуальная версия" else "Доступна версия ${found.tag}"
+                }
+                .onFailure { status = "Ошибка проверки: ${it.message}" }
+            busy = false
+        }
+    }
+
+    LaunchedEffect(Unit) { check() }
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        item { SectionTitle("Обновление gCam") }
+        item { Text("Установлена версия ${GCamUpdater.installedVersion(context)}") }
+        item { Text(status) }
+        item {
+            OutlinedButton(onClick = { check() }, enabled = !busy && GCamUpdater.supportsUpdates(context)) {
+                Text("Проверить обновления")
+            }
+        }
+        release?.let { current ->
+            if (current.notes.isNotBlank()) item {
+                Text("Что нового в ${current.tag}", style = MaterialTheme.typography.titleMedium)
+                Text(current.notes)
+            }
+            item {
+                if (busy) LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+                else if (downloaded == null) Button(onClick = {
+                    busy = true
+                    progress = 0f
+                    status = "Загрузка ${current.tag}…"
+                    scope.launch {
+                        runCatching { GCamUpdater.download(context, current) { progress = it } }
+                            .onSuccess { file ->
+                                downloaded = file
+                                status = "APK проверен. Можно установить ${current.tag}"
+                            }
+                            .onFailure { status = "Ошибка загрузки: ${it.message}" }
+                        busy = false
+                    }
+                }) { Text("Скачать обновление") }
+                else Button(onClick = {
+                    runCatching {
+                        if (GCamUpdater.canInstall(context)) {
+                            GCamUpdater.launchInstaller(context, downloaded!!)
+                        } else {
+                            status = "Разрешите установку из gCam, затем нажмите кнопку ещё раз"
+                            GCamUpdater.openInstallPermission(context)
+                        }
+                    }
+                        .onFailure { status = "Не удалось открыть установщик: ${it.message}" }
+                }, enabled = !recording) { Text("Установить ${current.tag}") }
+            }
+            if (recording) item {
+                Text("Идёт запись. Перед установкой завершите её, чтобы MP4-файлы закрылись корректно.")
+            }
+        }
+        item { Text("Установку подтверждает системный экран Android. При обновлении приложение будет перезапущено.", fontSize = 12.sp) }
     }
 }
 

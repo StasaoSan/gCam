@@ -1,4 +1,4 @@
-name: Build tagged APK
+name: Build and publish gCam
 
 on:
   push:
@@ -7,14 +7,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-
-env:
-  GDRIVE_FOLDER_ID: "1Jw1z67q-395SoFbbN-2tWeG2ytap0Rwl"
+  contents: write
 
 jobs:
   build:
-    name: Build gCam APK
+    name: Build signed gCam APK
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -40,7 +37,7 @@ jobs:
             "cmake;3.22.1"
 
       - name: Build and test
-        run: ./gradlew --no-daemon clean testDebugUnitTest assembleDebug
+        run: ./gradlew --no-daemon clean testDebugUnitTest assembleRelease
 
       - name: Resolve and verify release version
         id: release
@@ -71,16 +68,41 @@ jobs:
           echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
           echo "base_name=gCam_[${TAG_NAME}]" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare APK and release notes
+      - name: Sign release APK
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          BASE_NAME: ${{ steps.release.outputs.base_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${SIGNING_KEYSTORE_BASE64:?Missing SIGNING_KEYSTORE_BASE64 secret}"
+          : "${SIGNING_STORE_PASSWORD:?Missing SIGNING_STORE_PASSWORD secret}"
+          : "${SIGNING_KEY_ALIAS:?Missing SIGNING_KEY_ALIAS secret}"
+          : "${SIGNING_KEY_PASSWORD:?Missing SIGNING_KEY_PASSWORD secret}"
+          mkdir -p dist
+          KEYSTORE_FILE="${RUNNER_TEMP}/gcam-release.jks"
+          printf '%s' "$SIGNING_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_FILE"
+          chmod 600 "$KEYSTORE_FILE"
+          "${ANDROID_HOME}/build-tools/36.0.0/apksigner" sign \
+            --ks "$KEYSTORE_FILE" \
+            --ks-key-alias "$SIGNING_KEY_ALIAS" \
+            --ks-pass env:SIGNING_STORE_PASSWORD \
+            --key-pass env:SIGNING_KEY_PASSWORD \
+            --out "dist/${BASE_NAME}.apk" \
+            app/build/outputs/apk/release/app-release-unsigned.apk
+          "${ANDROID_HOME}/build-tools/36.0.0/apksigner" verify --verbose \
+            "dist/${BASE_NAME}.apk"
+
+      - name: Prepare release notes
         env:
           TAG_NAME: ${{ steps.release.outputs.tag_name }}
           BASE_NAME: ${{ steps.release.outputs.base_name }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk "dist/${BASE_NAME}.apk"
-
           awk -v heading="## [${TAG_NAME}]" '
             $0 == heading || index($0, heading " - ") == 1 { found=1; print; next }
             found && /^## \[/ { exit }
@@ -89,7 +111,7 @@ jobs:
 
           test -s "dist/${BASE_NAME}_CHANGELOG.txt"
 
-      - name: Upload build for one day
+      - name: Upload temporary build for one day
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.release.outputs.base_name }}
@@ -98,46 +120,16 @@ jobs:
           retention-days: 1
           compression-level: 0
 
-      - name: Check Google Drive configuration
-        id: drive
+      - name: Publish GitHub Release
+        if: ${{ github.ref_type == 'tag' }}
         env:
-          GDRIVE_RCLONE_CONFIG: ${{ secrets.GDRIVE_RCLONE_CONFIG }}
-        shell: bash
-        run: |
-          if [[ -n "$GDRIVE_RCLONE_CONFIG" && -n "$GDRIVE_FOLDER_ID" ]]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Install rclone for Google Drive
-        if: ${{ steps.drive.outputs.enabled == 'true' }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes rclone
-
-      - name: Upload APK and changelog to Google Drive
-        if: ${{ steps.drive.outputs.enabled == 'true' }}
-        env:
-          GDRIVE_RCLONE_CONFIG: ${{ secrets.GDRIVE_RCLONE_CONFIG }}
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+          BASE_NAME: ${{ steps.release.outputs.base_name }}
         shell: bash
         run: |
           set -euo pipefail
-          RCLONE_CONFIG_FILE="${RUNNER_TEMP}/gcam-rclone.conf"
-          printf '%s' "$GDRIVE_RCLONE_CONFIG" > "$RCLONE_CONFIG_FILE"
-          chmod 600 "$RCLONE_CONFIG_FILE"
-
-          rclone --config "$RCLONE_CONFIG_FILE" copy dist gdrive: \
-            --drive-root-folder-id "$GDRIVE_FOLDER_ID" \
-            --checkers 2 \
-            --transfers 1
-
-          rclone --config "$RCLONE_CONFIG_FILE" lsf gdrive: \
-            --drive-root-folder-id "$GDRIVE_FOLDER_ID" \
-            --files-only
-
-      - name: Explain skipped Google Drive upload
-        if: ${{ steps.drive.outputs.enabled != 'true' }}
-        run: |
-          echo "Google Drive upload is disabled: configure the GDRIVE_RCLONE_CONFIG secret." \
-            >> "$GITHUB_STEP_SUMMARY"
+          gh release create "$TAG_NAME" "dist/${BASE_NAME}.apk" \
+            --verify-tag \
+            --title "gCam ${TAG_NAME}" \
+            --notes-file "dist/${BASE_NAME}_CHANGELOG.txt"
