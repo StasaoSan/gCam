@@ -79,9 +79,10 @@ internal object GCamUpdater {
             val apk = File(folder, "gCam-${release.tag}.apk")
             val partial = File(folder, "gCam-${release.tag}.apk.part")
             if (apk.isFile && apk.length() == release.sizeBytes && sha256(apk) == release.sha256) {
-                verifyPackage(context, apk, release)
-                onProgress(1f)
-                return@withContext apk
+                if (runCatching { verifyPackage(context, apk, release) }.isSuccess) {
+                    onProgress(1f)
+                    return@withContext apk
+                }
             }
             apk.delete()
 
@@ -107,8 +108,13 @@ internal object GCamUpdater {
                 }
                 require(copied == release.sizeBytes) { "APK скачан не полностью" }
                 require(sha256(partial) == release.sha256) { "Контрольная сумма APK не совпадает" }
-                verifyPackage(context, partial, release)
                 require(partial.renameTo(apk)) { "Не удалось сохранить APK" }
+                try {
+                    verifyPackage(context, apk, release)
+                } catch (error: Exception) {
+                    apk.delete()
+                    throw error
+                }
                 apk
             } finally {
                 connection.disconnect()
