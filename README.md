@@ -292,10 +292,13 @@ Google-аккаунтом, которому эта папка доступна �
 
 2. В настройках GitHub-репозитория откройте **Settings → Secrets and variables → Actions** и
    создайте secret `GDRIVE_RCLONE_CONFIG`, содержащий весь файл `gcam-rclone.conf`.
-3. Там же создайте repository variable `GDRIVE_FOLDER_ID`. ID — часть адреса общей папки после
-   `/folders/`.
 
-Если secret или variable отсутствуют, этап Google Drive будет пропущен, но сборка и однодневный
+ID целевой публичной папки уже записан в workflow:
+`1Jw1z67q-395SoFbbN-2tWeG2ytap0Rwl`. Публичная роль «Редактор» разрешает работу по ссылке в
+браузере, но метод Drive API `files.create` всё равно требует OAuth-токен; одна ссылка не является
+учётными данными API.
+
+Если secret отсутствует, этап Google Drive будет пропущен, но сборка и однодневный
 GitHub artifact останутся рабочими. При повторном выпуске с тем же именем `rclone` обновит файл в
 этой папке. Google Drive хранит опубликованные APK постоянно; ограничение в 1 день относится
 только к временному GitHub artifact.
