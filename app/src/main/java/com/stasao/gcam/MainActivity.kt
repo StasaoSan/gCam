@@ -105,11 +105,18 @@ class MainActivity : ComponentActivity() {
     val baseDensity = LocalDensity.current
     var uiScale by remember { mutableFloatStateOf(RecorderSettings.loadUiScale(context)) }
     var tab by remember { mutableIntStateOf(0) }
+    var updateAvailable by remember { mutableStateOf(false) }
     val recorder by RecorderRepository.state.collectAsState()
+    LaunchedEffect(Unit) {
+        if (GCamUpdater.supportsUpdates(context)) {
+            runCatching { GCamUpdater.latestRelease(context) }
+                .onSuccess { updateAvailable = it != null }
+        }
+    }
     CompositionLocalProvider(LocalDensity provides Density(baseDensity.density * uiScale, baseDensity.fontScale)) {
     Scaffold(topBar = { Column {
         TopAppBar(title = { Text("Камеры 360°") }, colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primaryContainer))
-        PrimaryTabRow(selectedTabIndex = tab) { listOf("Камеры и запись", "Записи", "Обновление").forEachIndexed { i, title ->
+        PrimaryTabRow(selectedTabIndex = tab) { listOf("Камеры и запись", "Записи", if (updateAvailable) "Обновление ●" else "Обновление").forEachIndexed { i, title ->
             Tab(selected = tab == i, onClick = { tab = i }, text = { Text(title) })
         } }
     } }) { padding -> Box(Modifier.fillMaxSize().padding(padding)) {
