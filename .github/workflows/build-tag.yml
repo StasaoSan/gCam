@@ -39,18 +39,104 @@ jobs:
       - name: Build and test
         run: ./gradlew --no-daemon clean testDebugUnitTest assembleDebug
 
-      - name: Prepare tagged APK
-        env:
-          TAG_NAME: ${{ github.ref_name }}
+      - name: Resolve and verify release version
+        id: release
+        shell: bash
         run: |
-          mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk "dist/gCam-${TAG_NAME}.apk"
+          set -euo pipefail
+          APP_VERSION=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts)
+          if [[ -z "$APP_VERSION" ]]; then
+            echo "Cannot read versionName from app/build.gradle.kts" >&2
+            exit 1
+          fi
 
-      - name: Upload APK for one day
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+            if [[ "$TAG_NAME" != "v${APP_VERSION}" ]]; then
+              echo "Tag ${TAG_NAME} does not match app version v${APP_VERSION}" >&2
+              exit 1
+            fi
+          else
+            TAG_NAME="v${APP_VERSION}"
+          fi
+
+          if ! grep -Fq "## [${TAG_NAME}]" CHANGELOG.md; then
+            echo "CHANGELOG.md has no section for ${TAG_NAME}" >&2
+            exit 1
+          fi
+
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "base_name=gCam_[${TAG_NAME}]" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare APK and release notes
+        env:
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+          BASE_NAME: ${{ steps.release.outputs.base_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/${BASE_NAME}.apk"
+
+          awk -v heading="## [${TAG_NAME}]" '
+            $0 == heading || index($0, heading " - ") == 1 { found=1; print; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > "dist/${BASE_NAME}_CHANGELOG.txt"
+
+          test -s "dist/${BASE_NAME}_CHANGELOG.txt"
+
+      - name: Upload build for one day
         uses: actions/upload-artifact@v4
         with:
-          name: gCam-${{ github.ref_name }}
-          path: dist/*.apk
+          name: ${{ steps.release.outputs.base_name }}
+          path: dist/*
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
+
+      - name: Check Google Drive configuration
+        id: drive
+        env:
+          GDRIVE_RCLONE_CONFIG: ${{ secrets.GDRIVE_RCLONE_CONFIG }}
+          GDRIVE_FOLDER_ID: ${{ vars.GDRIVE_FOLDER_ID }}
+        shell: bash
+        run: |
+          if [[ -n "$GDRIVE_RCLONE_CONFIG" && -n "$GDRIVE_FOLDER_ID" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install rclone for Google Drive
+        if: ${{ steps.drive.outputs.enabled == 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes rclone
+
+      - name: Upload APK and changelog to Google Drive
+        if: ${{ steps.drive.outputs.enabled == 'true' }}
+        env:
+          GDRIVE_RCLONE_CONFIG: ${{ secrets.GDRIVE_RCLONE_CONFIG }}
+          GDRIVE_FOLDER_ID: ${{ vars.GDRIVE_FOLDER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RCLONE_CONFIG_FILE="${RUNNER_TEMP}/gcam-rclone.conf"
+          printf '%s' "$GDRIVE_RCLONE_CONFIG" > "$RCLONE_CONFIG_FILE"
+          chmod 600 "$RCLONE_CONFIG_FILE"
+
+          rclone --config "$RCLONE_CONFIG_FILE" copy dist gdrive: \
+            --drive-root-folder-id "$GDRIVE_FOLDER_ID" \
+            --checkers 2 \
+            --transfers 1
+
+          rclone --config "$RCLONE_CONFIG_FILE" lsf gdrive: \
+            --drive-root-folder-id "$GDRIVE_FOLDER_ID" \
+            --files-only
+
+      - name: Explain skipped Google Drive upload
+        if: ${{ steps.drive.outputs.enabled != 'true' }}
+        run: |
+          echo "Google Drive upload is disabled: configure GDRIVE_RCLONE_CONFIG secret and GDRIVE_FOLDER_ID variable." \
+            >> "$GITHUB_STEP_SUMMARY"

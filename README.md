@@ -261,12 +261,44 @@ GitHub Actions собирает и тестирует устанавливаем
 1 день. Постоянный GitHub Release автоматически не создаётся, а Gradle-кэш не сохраняется, чтобы
 не расходовать квоту бесплатного аккаунта.
 
+Перед выпуском обновите `versionName`/`versionCode` в `app/build.gradle.kts` и добавьте раздел
+для этого тега в [`CHANGELOG.md`](CHANGELOG.md). Workflow остановится с понятной ошибкой, если
+тег, версия приложения и changelog не совпадают. Для тега `v4.7` результат называется
+`gCam_[v4.7].apk`, а заметки версии — `gCam_[v4.7]_CHANGELOG.txt`.
+
 ```bash
 git tag v4.7
 git push origin v4.7
 ```
 
 Workflow также можно запустить вручную через кнопку **Run workflow** на странице GitHub Actions.
+
+#### Публикация в Google Drive
+
+Workflow может дополнительно копировать APK и changelog в общедоступную папку Google Drive.
+Публичный доступ сам по себе даёт посетителям только скачивание: workflow должен войти под
+Google-аккаунтом, которому эта папка доступна как редактор. Лучше завести отдельный аккаунт только
+для загрузки релизов и дать ему доступ только к этой папке.
+
+1. Установите `rclone` на Mac и создайте отдельный конфиг с remote, который называется `gdrive`:
+
+   ```bash
+   brew install rclone
+   rclone --config "$PWD/gcam-rclone.conf" config
+   ```
+
+   Для Google Drive используйте собственный OAuth Client ID/Secret и авторизуйте отдельный
+   аккаунт-загрузчик. Конфиг не добавляйте в Git: он содержит OAuth refresh token.
+
+2. В настройках GitHub-репозитория откройте **Settings → Secrets and variables → Actions** и
+   создайте secret `GDRIVE_RCLONE_CONFIG`, содержащий весь файл `gcam-rclone.conf`.
+3. Там же создайте repository variable `GDRIVE_FOLDER_ID`. ID — часть адреса общей папки после
+   `/folders/`.
+
+Если secret или variable отсутствуют, этап Google Drive будет пропущен, но сборка и однодневный
+GitHub artifact останутся рабочими. При повторном выпуске с тем же именем `rclone` обновит файл в
+этой папке. Google Drive хранит опубликованные APK постоянно; ограничение в 1 день относится
+только к временному GitHub artifact.
 
 Готовый debug APK после сборки: `app/build/outputs/apk/debug/app-debug.apk`. Установка на
 конкретную машину, когда ADB видит несколько устройств:

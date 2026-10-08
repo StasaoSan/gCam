@@ -1,6 +1,7 @@
 *.iml
 .gradle
 /.kotlin
+/gcam-rclone.conf
 /local.properties
 /.idea/caches
 /.idea/libraries
