@@ -66,14 +66,26 @@ typedef struct {
     atomic_ullong get_total_ns, get_max_ns, get_count, memcpy_total_ns, memcpy_max_ns, memcpy_count;
     atomic_ullong draw_total_ns, draw_max_ns, draw_count, swap_total_ns, swap_max_ns, swap_count;
     atomic_ullong hold_total_ns, hold_max_ns, hold_count, gap_max_ns;
-    unsigned input; int recordable, target_fps; char status[512];
+    unsigned input; int recordable, target_fps;
+    _Atomic float crop_x, crop_y, crop_zoom, fisheye;
+    atomic_int shape;
+    char status[512];
 } state_t;
-static state_t s = { .mutex=PTHREAD_MUTEX_INITIALIZER, .status="Остановлено" };
+static state_t s = {
+    .mutex=PTHREAD_MUTEX_INITIALIZER,
+    .crop_x=0.5f, .crop_y=0.5f, .crop_zoom=1.0f, .fisheye=0.0f,
+    .status="Остановлено"
+};
 static state_t recorders[4];
+static state_t hud_streams[2];
 static pthread_once_t recorders_once=PTHREAD_ONCE_INIT;
+static pthread_once_t hud_streams_once=PTHREAD_ONCE_INIT;
 
 static void init_recorders(void){
-    for(unsigned i=0;i<4;i++){pthread_mutex_init(&recorders[i].mutex,NULL);recorders[i].input=i;recorders[i].recordable=1;snprintf(recorders[i].status,sizeof(recorders[i].status),"Остановлено");}
+    for(unsigned i=0;i<4;i++){pthread_mutex_init(&recorders[i].mutex,NULL);recorders[i].input=i;recorders[i].recordable=1;atomic_store(&recorders[i].crop_x,0.5f);atomic_store(&recorders[i].crop_y,0.5f);atomic_store(&recorders[i].crop_zoom,1.0f);atomic_store(&recorders[i].fisheye,0.0f);snprintf(recorders[i].status,sizeof(recorders[i].status),"Остановлено");}
+}
+static void init_hud_streams(void){
+    for(unsigned i=0;i<2;i++){pthread_mutex_init(&hud_streams[i].mutex,NULL);atomic_store(&hud_streams[i].crop_x,0.5f);atomic_store(&hud_streams[i].crop_y,0.5f);atomic_store(&hud_streams[i].crop_zoom,1.0f);atomic_store(&hud_streams[i].fisheye,0.0f);snprintf(hud_streams[i].status,sizeof(hud_streams[i].status),"Остановлено");}
 }
 
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000ull+t.tv_nsec; }
@@ -124,13 +136,19 @@ typedef void (*f_image_target_texture)(GLenum target,void *image);
 
 typedef enum { UPLOAD_PBO=0, UPLOAD_DMABUF_RGBA=1 } upload_mode_t;
 typedef struct {
-    EGLDisplay d; EGLSurface s; EGLContext c; GLuint program,texture; GLint sampler; int w,h;
+    EGLDisplay d; EGLSurface s; EGLContext c; GLuint program,texture;
+    GLint sampler,crop_center,crop_zoom,fisheye,output_aspect,shape; int w,h;
     GLuint pbo[NBUF],imported_texture[NBUF]; EGLImageKHR image[NBUF]; GLsync fence[NBUF];
     int pbo_upload,recordable; upload_mode_t upload_mode;
     PFNEGLCREATEIMAGEKHRPROC create_image; PFNEGLDESTROYIMAGEKHRPROC destroy_image;
     f_image_target_texture image_target_texture;
     EGLBoolean (*presentation_time)(EGLDisplay,EGLSurface,EGLnsecsANDROID);
+    char fallback_reason[160];
 } renderer_t;
+static void fallback_reason(renderer_t *r,const char *fmt,...){
+    va_list ap;va_start(ap,fmt);vsnprintf(r->fallback_reason,sizeof(r->fallback_reason),fmt,ap);va_end(ap);
+    LOGE("zero-copy unavailable: %s",r->fallback_reason);
+}
 static GLuint shader(GLenum type,const char *source){
     GLuint x=glCreateShader(type); glShaderSource(x,1,&source,NULL); glCompileShader(x); GLint ok=0; glGetShaderiv(x,GL_COMPILE_STATUS,&ok);
     if(!ok){char log[512];glGetShaderInfoLog(x,sizeof(log),NULL,log);LOGE("shader: %s",log);glDeleteShader(x);return 0;} return x;
@@ -183,17 +201,18 @@ static int try_dmabuf_import(renderer_t *r,frame_memory_t *memory){
     const char *egl_extensions=eglQueryString(r->d,EGL_EXTENSIONS),*gl_extensions=(const char *)glGetString(GL_EXTENSIONS);
     r->create_image=(PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");r->destroy_image=(PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");r->image_target_texture=(f_image_target_texture)eglGetProcAddress("glEGLImageTargetTexture2DOES");
     probe_egl_imports(r,memory,egl_extensions,gl_extensions);
-    if(!has_extension(egl_extensions,"EGL_EXT_image_dma_buf_import")||!has_extension(gl_extensions,"GL_OES_EGL_image")){LOGE("zero-copy unavailable: required EGL/GL extensions missing");return -1;}
-    if(!r->create_image||!r->destroy_image||!r->image_target_texture){LOGE("zero-copy unavailable: EGLImage entry points missing");return -1;}
+    int has_dma_buf=has_extension(egl_extensions,"EGL_EXT_image_dma_buf_import"),has_egl_image=has_extension(gl_extensions,"GL_OES_EGL_image");
+    if(!has_dma_buf||!has_egl_image){fallback_reason(r,"extensions: dma_buf=%s, GL_OES_EGL_image=%s",has_dma_buf?"yes":"no",has_egl_image?"yes":"no");return -1;}
+    if(!r->create_image||!r->destroy_image||!r->image_target_texture){fallback_reason(r,"EGLImage functions: create=%s, destroy=%s, texture=%s",r->create_image?"yes":"no",r->destroy_image?"yes":"no",r->image_target_texture?"yes":"no");return -1;}
     glGenTextures(NBUF,r->imported_texture);
     for(unsigned i=0;i<NBUF;i++){
         EGLint image_attrs[]={EGL_WIDTH,(EGLint)(W/2),EGL_HEIGHT,(EGLint)H,EGL_LINUX_DRM_FOURCC_EXT,(EGLint)DRM_FORMAT_ABGR8888,EGL_DMA_BUF_PLANE0_FD_EXT,memory[i].fd,EGL_DMA_BUF_PLANE0_OFFSET_EXT,0,EGL_DMA_BUF_PLANE0_PITCH_EXT,(EGLint)STRIDE_BYTES,EGL_NONE};
         r->image[i]=r->create_image(r->d,EGL_NO_CONTEXT,EGL_LINUX_DMA_BUF_EXT,(EGLClientBuffer)0,image_attrs);
-        if(r->image[i]==EGL_NO_IMAGE_KHR){LOGE("zero-copy EGLImage[%u] failed: 0x%x",i,eglGetError());discard_dmabuf_import(r);return -1;}
+        if(r->image[i]==EGL_NO_IMAGE_KHR){EGLint error=eglGetError();fallback_reason(r,"EGLImage buffer %u: EGL 0x%x",i,error);discard_dmabuf_import(r);return -1;}
         glBindTexture(GL_TEXTURE_2D,r->imported_texture[i]);texture_params();r->image_target_texture(GL_TEXTURE_2D,(void *)r->image[i]);
-        GLenum error=glGetError();if(error!=GL_NO_ERROR){LOGE("zero-copy texture[%u] failed: 0x%x",i,error);discard_dmabuf_import(r);return -1;}
+        GLenum error=glGetError();if(error!=GL_NO_ERROR){fallback_reason(r,"EGLImage texture %u: GL 0x%x",i,error);discard_dmabuf_import(r);return -1;}
     }
-    r->upload_mode=UPLOAD_DMABUF_RGBA;LOGI("zero-copy enabled: ION DMA-BUF -> EGLImage ABGR8888");return 0;
+    r->fallback_reason[0]='\0';r->upload_mode=UPLOAD_DMABUF_RGBA;LOGI("zero-copy enabled: ION DMA-BUF -> EGLImage ABGR8888");return 0;
 }
 static int init_pbo(renderer_t *r){
     glGenTextures(1,&r->texture);glBindTexture(GL_TEXTURE_2D,r->texture);texture_params();glTexStorage2D(GL_TEXTURE_2D,1,GL_RGBA8,W/2,H);
@@ -202,19 +221,19 @@ static int init_pbo(renderer_t *r){
 }
 static int renderer_init(renderer_t *r,ANativeWindow *window,int recordable,frame_memory_t *memory){
     memset(r,0,sizeof(*r));r->d=eglGetDisplay(EGL_DEFAULT_DISPLAY);if(r->d==EGL_NO_DISPLAY||!eglInitialize(r->d,NULL,NULL))return -1;
-    EGLint attrs[]={EGL_RENDERABLE_TYPE,EGL_OPENGL_ES3_BIT,EGL_SURFACE_TYPE,EGL_WINDOW_BIT,EGL_RED_SIZE,8,EGL_GREEN_SIZE,8,EGL_BLUE_SIZE,8,EGL_RECORDABLE_ANDROID,recordable?EGL_TRUE:EGL_DONT_CARE,EGL_NONE};
+    EGLint attrs[]={EGL_RENDERABLE_TYPE,EGL_OPENGL_ES3_BIT,EGL_SURFACE_TYPE,EGL_WINDOW_BIT,EGL_RED_SIZE,8,EGL_GREEN_SIZE,8,EGL_BLUE_SIZE,8,EGL_ALPHA_SIZE,recordable?EGL_DONT_CARE:8,EGL_RECORDABLE_ANDROID,recordable?EGL_TRUE:EGL_DONT_CARE,EGL_NONE};
     EGLConfig cfg;EGLint count,fmt;if(!eglChooseConfig(r->d,attrs,&cfg,1,&count)||!count)return -1;eglGetConfigAttrib(r->d,cfg,EGL_NATIVE_VISUAL_ID,&fmt);if(!recordable)ANativeWindow_setBuffersGeometry(window,0,0,fmt);
     r->s=eglCreateWindowSurface(r->d,cfg,window,NULL);EGLint ca[]={EGL_CONTEXT_CLIENT_VERSION,3,EGL_NONE};r->c=eglCreateContext(r->d,cfg,EGL_NO_CONTEXT,ca);
     if(r->s==EGL_NO_SURFACE||r->c==EGL_NO_CONTEXT||!eglMakeCurrent(r->d,r->s,r->s,r->c))return -1;r->recordable=recordable;r->presentation_time=(void *)eglGetProcAddress("eglPresentationTimeANDROID");eglSwapInterval(r->d,recordable?0:1);eglQuerySurface(r->d,r->s,EGL_WIDTH,&r->w);eglQuerySurface(r->d,r->s,EGL_HEIGHT,&r->h);
     const char *vs="#version 300 es\nconst vec2 p[3]=vec2[3](vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));out vec2 uv;void main(){gl_Position=vec4(p[gl_VertexID],0.,1.);uv=(p[gl_VertexID]+1.)*.5;}";
-    const char *fs="#version 300 es\nprecision highp float;precision highp int;uniform sampler2D packedUyvy;in vec2 uv;out vec4 o;void main(){int x=clamp(int(uv.x*1280.),0,1279);int y=clamp(int((1.-uv.y)*800.),0,799);vec4 q=texelFetch(packedUyvy,ivec2(x/2,y),0);float yy=((x&1)==0?q.g:q.a)*255.;float u=q.r*255.-128.;float v=q.b*255.-128.;yy=1.164*(yy-16.);vec3 c=vec3(yy+1.596*v,yy-.392*u-.813*v,yy+2.017*u)/255.;o=vec4(clamp(c,0.,1.),1.);}";
+    const char *fs="#version 300 es\nprecision highp float;precision highp int;uniform sampler2D packedUyvy;uniform vec2 cropCenter;uniform float cropZoom;uniform float fisheyeStrength;uniform float outputAspect;uniform int outputShape;in vec2 uv;out vec4 o;void main(){if(outputShape==2){vec2 ellipse=(uv-.5)*2.;if(dot(ellipse,ellipse)>1.){o=vec4(0.);return;}}float sourceAspect=1.6;float z=max(cropZoom,1.);vec2 cropSize=vec2(1./z);if(outputAspect>sourceAspect)cropSize.y*=sourceAspect/outputAspect;else cropSize.x*=outputAspect/sourceAspect;vec2 halfSize=cropSize*.5;vec2 center=clamp(cropCenter,halfSize,vec2(1.)-halfSize);vec2 q=uv*2.-1.;vec2 undistorted=center+q*halfSize;vec2 lens=(undistorted-.5)*2.;float k=max(fisheyeStrength,0.)*.35;vec2 sampleUv=clamp(.5+(lens/(1.+k*dot(lens,lens)))*.5,vec2(0.),vec2(1.));int x=clamp(int(sampleUv.x*1280.),0,1279);int y=clamp(int((1.-sampleUv.y)*800.),0,799);vec4 p=texelFetch(packedUyvy,ivec2(x/2,y),0);float yy=((x&1)==0?p.g:p.a)*255.;float u=p.r*255.-128.;float v=p.b*255.-128.;yy=1.164*(yy-16.);vec3 c=vec3(yy+1.596*v,yy-.392*u-.813*v,yy+2.017*u)/255.;o=vec4(clamp(c,0.,1.),1.);}";
     GLuint v=shader(GL_VERTEX_SHADER,vs),f=shader(GL_FRAGMENT_SHADER,fs);if(!v||!f)return -1;r->program=glCreateProgram();glAttachShader(r->program,v);glAttachShader(r->program,f);glLinkProgram(r->program);glDeleteShader(v);glDeleteShader(f);GLint linked=0;glGetProgramiv(r->program,GL_LINK_STATUS,&linked);if(!linked)return -1;
-    r->sampler=glGetUniformLocation(r->program,"packedUyvy");
+    r->sampler=glGetUniformLocation(r->program,"packedUyvy");r->crop_center=glGetUniformLocation(r->program,"cropCenter");r->crop_zoom=glGetUniformLocation(r->program,"cropZoom");r->fisheye=glGetUniformLocation(r->program,"fisheyeStrength");r->output_aspect=glGetUniformLocation(r->program,"outputAspect");r->shape=glGetUniformLocation(r->program,"outputShape");
     if(try_dmabuf_import(r,memory)==0)return 0;
     LOGE("using PBO upload fallback");return init_pbo(r);
 }
 typedef struct { uint64_t memcpy_ns,draw_ns,swap_ns; } draw_metrics_t;
-static int draw(renderer_t *r,unsigned idx,const void *p,draw_metrics_t *metrics){
+static int draw(renderer_t *r,state_t *state,unsigned idx,const void *p,draw_metrics_t *metrics){
     memset(metrics,0,sizeof(*metrics));
     if(r->upload_mode==UPLOAD_DMABUF_RGBA){glBindTexture(GL_TEXTURE_2D,r->imported_texture[idx]);}
     else {glBindTexture(GL_TEXTURE_2D,r->texture);glBindBuffer(GL_PIXEL_UNPACK_BUFFER,r->pbo[idx]);
@@ -222,8 +241,8 @@ static int draw(renderer_t *r,unsigned idx,const void *p,draw_metrics_t *metrics
         glTexSubImage2D(GL_TEXTURE_2D,0,0,0,W/2,H,GL_RGBA,GL_UNSIGNED_BYTE,0);glBindBuffer(GL_PIXEL_UNPACK_BUFFER,0);
     }
     uint64_t draw_started=now_ns();
-    glUseProgram(r->program);glUniform1i(r->sampler,0);
-    int vw=r->w,vh=vw*(int)H/(int)W;if(vh>r->h){vh=r->h;vw=vh*(int)W/(int)H;}glViewport((r->w-vw)/2,(r->h-vh)/2,vw,vh);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT);glDrawArrays(GL_TRIANGLES,0,3);
+    glUseProgram(r->program);glUniform1i(r->sampler,0);glUniform2f(r->crop_center,atomic_load(&state->crop_x),atomic_load(&state->crop_y));glUniform1f(r->crop_zoom,atomic_load(&state->crop_zoom));glUniform1f(r->fisheye,atomic_load(&state->fisheye));glUniform1f(r->output_aspect,r->h>0?(float)r->w/(float)r->h:1.6f);glUniform1i(r->shape,atomic_load(&state->shape));
+    glViewport(0,0,r->w,r->h);glClearColor(0,0,0,0);glClear(GL_COLOR_BUFFER_BIT);glDrawArrays(GL_TRIANGLES,0,3);
     if(r->upload_mode==UPLOAD_DMABUF_RGBA){r->fence[idx]=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);if(!r->fence[idx])return -1;glFlush();}
     metrics->draw_ns=now_ns()-draw_started;
     if(r->recordable&&r->presentation_time)r->presentation_time(r->d,r->s,(EGLnsecsANDROID)now_ns());uint64_t swap_started=now_ns();EGLBoolean swapped=eglSwapBuffers(r->d,r->s);metrics->swap_ns=now_ns()-swap_started;return swapped?0:-1;
@@ -297,7 +316,7 @@ static void *stream_thread(void *arg){
             if(next_frame_ns&&frame_now<next_frame_ns){record_hold(state,acquired_ns,f.idx);a.release(cam,f.idx);continue;}
             if(!next_frame_ns||frame_now>next_frame_ns+frame_interval_ns)next_frame_ns=frame_now+frame_interval_ns;else next_frame_ns+=frame_interval_ns;
         }
-        void *pixels=memory[f.idx].address;if(pixels){draw_metrics_t timing;if(draw(&r,f.idx,pixels,&timing)){if(r.upload_mode==UPLOAD_DMABUF_RGBA){glFinish();if(r.fence[f.idx]){glDeleteSync(r.fence[f.idx]);r.fence[f.idx]=0;}}record_hold(state,acquired_ns,f.idx);a.release(cam,f.idx);if(!atomic_load(&state->stop))statusf(state,"Ошибка EGL; поток остановлен");break;}if(timing.memcpy_ns){metric_add(&state->memcpy_total_ns,&state->memcpy_max_ns,timing.memcpy_ns);atomic_fetch_add(&state->memcpy_count,1);}metric_add(&state->draw_total_ns,&state->draw_max_ns,timing.draw_ns);atomic_fetch_add(&state->draw_count,1);metric_add(&state->swap_total_ns,&state->swap_max_ns,timing.swap_ns);atomic_fetch_add(&state->swap_count,1);uint64_t n=atomic_fetch_add(&state->frames,1)+1,now=now_ns();if(previous_frame_ns)metric_max(&state->gap_max_ns,now-previous_frame_ns);previous_frame_ns=now;atomic_store(&state->last_ns,now);if(n==1){atomic_store(&state->first_ms,(now-begun)/1000000ull);statusf(state,"QCarCam input %u · поток активен · %s",state->input,r.upload_mode==UPLOAD_DMABUF_RGBA?"zero-copy":"PBO");}}else {atomic_fetch_add(&state->dropped,1);record_hold(state,acquired_ns,f.idx);a.release(cam,f.idx);continue;}if(r.upload_mode==UPLOAD_PBO){record_hold(state,acquired_ns,f.idx);a.release(cam,f.idx);}}
+        void *pixels=memory[f.idx].address;if(pixels){draw_metrics_t timing;if(draw(&r,state,f.idx,pixels,&timing)){if(r.upload_mode==UPLOAD_DMABUF_RGBA){glFinish();if(r.fence[f.idx]){glDeleteSync(r.fence[f.idx]);r.fence[f.idx]=0;}}record_hold(state,acquired_ns,f.idx);a.release(cam,f.idx);if(!atomic_load(&state->stop))statusf(state,"Ошибка EGL; поток остановлен");break;}if(timing.memcpy_ns){metric_add(&state->memcpy_total_ns,&state->memcpy_max_ns,timing.memcpy_ns);atomic_fetch_add(&state->memcpy_count,1);}metric_add(&state->draw_total_ns,&state->draw_max_ns,timing.draw_ns);atomic_fetch_add(&state->draw_count,1);metric_add(&state->swap_total_ns,&state->swap_max_ns,timing.swap_ns);atomic_fetch_add(&state->swap_count,1);uint64_t n=atomic_fetch_add(&state->frames,1)+1,now=now_ns();if(previous_frame_ns)metric_max(&state->gap_max_ns,now-previous_frame_ns);previous_frame_ns=now;atomic_store(&state->last_ns,now);if(n==1){atomic_store(&state->first_ms,(now-begun)/1000000ull);if(r.upload_mode==UPLOAD_DMABUF_RGBA)statusf(state,"QCarCam input %u · поток активен · zero-copy",state->input);else statusf(state,"QCarCam input %u · поток активен · PBO (%s)",state->input,r.fallback_reason[0]?r.fallback_reason:"причина неизвестна");}}else {atomic_fetch_add(&state->dropped,1);record_hold(state,acquired_ns,f.idx);a.release(cam,f.idx);continue;}if(r.upload_mode==UPLOAD_PBO){record_hold(state,acquired_ns,f.idx);a.release(cam,f.idx);}}
 done:atomic_store(&state->running,false);if(started){release_all_frames(&r,&a,cam,state,acquired_ns);a.stop(cam);}if(cam&&a.close)a.close(cam);renderer_free(&r);free_buffers(memory,&qb);if(acquired)release_api();if(state->window){ANativeWindow_release(state->window);state->window=NULL;}return NULL;
 }
 static void stop_state(state_t *state){atomic_store(&state->stop,true);pthread_mutex_lock(&state->mutex);int join=state->created;pthread_t t=state->thread;pthread_mutex_unlock(&state->mutex);if(join&&!pthread_equal(pthread_self(),t))pthread_join(t,NULL);pthread_mutex_lock(&state->mutex);state->created=0;pthread_mutex_unlock(&state->mutex);}
@@ -311,7 +330,11 @@ static jlongArray state_stats(JNIEnv *e,state_t *state){
 }
 
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_start(JNIEnv *e,jclass c,jobject surface,jint input){(void)c;return start_state(e,&s,surface,input,0,25);}
-JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStart(JNIEnv *e,jclass c,jobject surface,jint input,jint target_fps){(void)c;if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");if(target_fps<1)target_fps=1;if(target_fps>20)target_fps=20;return start_state(e,&s,surface,input,0,target_fps);}
+JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStart(JNIEnv *e,jclass c,jint slot,jobject surface,jint input,jint target_fps,jfloat crop_x,jfloat crop_y,jfloat crop_zoom,jfloat fisheye,jint shape){(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>1)return (*e)->NewStringUTF(e,"Некорректный HUD slot");if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");if(target_fps<1)target_fps=1;if(target_fps>20)target_fps=20;state_t *state=&hud_streams[slot];atomic_store(&state->crop_x,crop_x<0.f?0.f:(crop_x>1.f?1.f:crop_x));atomic_store(&state->crop_y,crop_y<0.f?0.f:(crop_y>1.f?1.f:crop_y));atomic_store(&state->crop_zoom,crop_zoom<1.f?1.f:(crop_zoom>3.f?3.f:crop_zoom));atomic_store(&state->fisheye,fisheye<0.f?0.f:(fisheye>1.f?1.f:fisheye));atomic_store(&state->shape,shape<0?0:(shape>2?2:shape));return start_state(e,state,surface,input,0,target_fps);}
+JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_hudConfigure(JNIEnv *e,jclass c,jint slot,jfloat crop_x,jfloat crop_y,jfloat crop_zoom,jfloat fisheye,jint shape){(void)e;(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>1)return;state_t *state=&hud_streams[slot];atomic_store(&state->crop_x,crop_x<0.f?0.f:(crop_x>1.f?1.f:crop_x));atomic_store(&state->crop_y,crop_y<0.f?0.f:(crop_y>1.f?1.f:crop_y));atomic_store(&state->crop_zoom,crop_zoom<1.f?1.f:(crop_zoom>3.f?3.f:crop_zoom));atomic_store(&state->fisheye,fisheye<0.f?0.f:(fisheye>1.f?1.f:fisheye));atomic_store(&state->shape,shape<0?0:(shape>2?2:shape));}
+JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStop(JNIEnv *e,jclass c,jint slot){(void)e;(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot>=0&&slot<2){stop_state(&hud_streams[slot]);statusf(&hud_streams[slot],"Остановлено");}}
+JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStatus(JNIEnv *e,jclass c,jint slot){(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>1)return (*e)->NewStringUTF(e,"Некорректный HUD slot");char x[512];pthread_mutex_lock(&hud_streams[slot].mutex);snprintf(x,sizeof(x),"%s",hud_streams[slot].status);pthread_mutex_unlock(&hud_streams[slot].mutex);return (*e)->NewStringUTF(e,x);}
+JNIEXPORT jlongArray JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStats(JNIEnv *e,jclass c,jint slot){(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>1){state_t empty={0};return state_stats(e,&empty);}return state_stats(e,&hud_streams[slot]);}
 JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_stop(JNIEnv *e,jclass c){(void)e;(void)c;stop_state(&s);statusf(&s,"Остановлено");}
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_status(JNIEnv *e,jclass c){(void)c;char x[512];pthread_mutex_lock(&s.mutex);snprintf(x,sizeof(x),"%s",s.status);pthread_mutex_unlock(&s.mutex);return (*e)->NewStringUTF(e,x);}
 JNIEXPORT jlongArray JNICALL Java_com_stasao_gcam_NativeQCarCam_stats(JNIEnv *e,jclass c){(void)c;return state_stats(e,&s);}

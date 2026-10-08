@@ -9,8 +9,10 @@ interface IQCarCamCapture {
     long[] stats(int inputId);
 
     /** One lightweight output reserved for the ANHUD turn-camera projection. */
-    String startHud(in Surface surface, int inputId, int targetFps);
-    void stopHud();
-    String hudStatus();
-    long[] hudStats();
+    String startHud(int slot, in Surface surface, int inputId, int targetFps,
+        float cropX, float cropY, float cropZoom, float fisheye, int shape);
+    void configureHud(int slot, float cropX, float cropY, float cropZoom, float fisheye, int shape);
+    void stopHud(int slot);
+    String hudStatus(int slot);
+    long[] hudStats(int slot);
 }

@@ -11,7 +11,28 @@ object NativeQCarCam {
     external fun probe(): String
 
     @JvmStatic external fun start(surface: Surface, inputId: Int): String
-    @JvmStatic external fun hudStart(surface: Surface, inputId: Int, targetFps: Int): String
+    @JvmStatic external fun hudStart(
+        slot: Int,
+        surface: Surface,
+        inputId: Int,
+        targetFps: Int,
+        cropX: Float,
+        cropY: Float,
+        cropZoom: Float,
+        fisheye: Float,
+        shape: Int
+    ): String
+    @JvmStatic external fun hudConfigure(
+        slot: Int,
+        cropX: Float,
+        cropY: Float,
+        cropZoom: Float,
+        fisheye: Float,
+        shape: Int
+    )
+    @JvmStatic external fun hudStop(slot: Int)
+    @JvmStatic external fun hudStatus(slot: Int): String
+    @JvmStatic external fun hudStats(slot: Int): LongArray
     @JvmStatic external fun stop()
     @JvmStatic external fun status(): String
 

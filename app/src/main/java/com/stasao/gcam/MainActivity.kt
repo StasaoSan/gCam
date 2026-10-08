@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Build
 import android.content.pm.PackageManager
+import android.provider.Settings
 import android.widget.MediaController
 import android.widget.VideoView
 import android.view.Surface
@@ -69,6 +70,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        GCamRuntimeController.startAfterManualLaunch(this)
         requestMediaPermissions()
         ContextCompat.registerReceiver(
             this,
@@ -132,8 +134,16 @@ class MainActivity : ComponentActivity() {
     var config by remember { mutableStateOf(RecorderSettings.load(context).let {
         it.copy(storageLimitGb = it.storageLimitGb.coerceIn(minArchiveGb, maxArchiveGb.coerceAtLeast(minArchiveGb)))
     }) }
+    var runtimeConfig by remember { mutableStateOf(GCamRuntimeSettings.load(context)) }
+    var overlayAllowed by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
     val enabled = !state.recording
     LaunchedEffect(state.recording) { if (!state.recording) RecorderRepository.update(state.copy(usedBytes = RecordingStore.usedBytes(context))) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            overlayAllowed = Settings.canDrawOverlays(context)
+            delay(1_000)
+        }
+    }
     val hours = config.storageLimitGb * 8192.0 / (config.bitrateMbps * config.cameraIds.size.coerceAtLeast(1) * 3600.0)
     LazyColumn(
         Modifier.fillMaxSize(),
@@ -180,6 +190,87 @@ class MainActivity : ComponentActivity() {
         item { SectionTitle("Размер интерфейса: ${(uiScale * 100).toInt()}%")
             Slider(uiScale, onUiScaleChange, valueRange = 1.3f..1.8f, steps = 9)
         }
+        item {
+            SectionTitle("Автозапуск и индикатор")
+            Spacer(Modifier.height(6.dp))
+            RuntimeSwitchRow(
+                title = "Автозапуск gCam",
+                subtitle = "Поднимать фоновую связь с ANHUD после загрузки системы",
+                checked = runtimeConfig.autostart
+            ) { checked ->
+                runtimeConfig = runtimeConfig.copy(
+                    autostart = checked,
+                    recordingAutostart = checked && runtimeConfig.recordingAutostart
+                )
+                GCamRuntimeSettings.save(context, runtimeConfig)
+            }
+            RuntimeSwitchRow(
+                title = "Автозапуск записи",
+                subtitle = "Сразу записывать выбранные выше камеры",
+                checked = runtimeConfig.recordingAutostart,
+                enabled = runtimeConfig.autostart
+            ) { checked ->
+                runtimeConfig = runtimeConfig.copy(recordingAutostart = checked)
+                GCamRuntimeSettings.save(context, runtimeConfig)
+            }
+            RuntimeSwitchRow(
+                title = "Точка состояния",
+                subtitle = if (overlayAllowed) "Показывать поверх других приложений" else "Нужно разрешение на показ поверх окон",
+                checked = runtimeConfig.statusOverlay
+            ) { checked ->
+                runtimeConfig = runtimeConfig.copy(statusOverlay = checked)
+                GCamRuntimeSettings.save(context, runtimeConfig)
+                if (checked && !Settings.canDrawOverlays(context)) {
+                    context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}")))
+                } else {
+                    GCamRuntimeController.applyOverlaySetting(context, checked)
+                }
+            }
+            Text("Позиция по горизонтали: ${(runtimeConfig.statusOverlayX * 100).toInt()}%", fontSize = 13.sp)
+            Slider(
+                value = runtimeConfig.statusOverlayX,
+                onValueChange = { value ->
+                    runtimeConfig = runtimeConfig.copy(statusOverlayX = value)
+                    GCamRuntimeSettings.save(context, runtimeConfig)
+                    if (runtimeConfig.statusOverlay) {
+                        GCamRuntimeController.updateOverlayPosition(
+                            context,
+                            runtimeConfig.statusOverlayX,
+                            runtimeConfig.statusOverlayY
+                        )
+                    }
+                },
+                valueRange = 0f..1f,
+                enabled = runtimeConfig.statusOverlay && overlayAllowed
+            )
+            Text("Позиция по вертикали: ${(runtimeConfig.statusOverlayY * 100).toInt()}%", fontSize = 13.sp)
+            Slider(
+                value = runtimeConfig.statusOverlayY,
+                onValueChange = { value ->
+                    runtimeConfig = runtimeConfig.copy(statusOverlayY = value)
+                    GCamRuntimeSettings.save(context, runtimeConfig)
+                    if (runtimeConfig.statusOverlay) {
+                        GCamRuntimeController.updateOverlayPosition(
+                            context,
+                            runtimeConfig.statusOverlayX,
+                            runtimeConfig.statusOverlayY
+                        )
+                    }
+                },
+                valueRange = 0f..1f,
+                enabled = runtimeConfig.statusOverlay && overlayAllowed
+            )
+            Text("● красный — нет связи с ANHUD или кадров", color = Color(0xFFF44336), fontSize = 12.sp)
+            Text("● оранжевый — связь установлена, видео получено", color = Color(0xFFFF9800), fontSize = 12.sp)
+            Text("● зелёный — видео получено и идёт запись", color = Color(0xFF4CAF50), fontSize = 12.sp)
+            TextButton(onClick = { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }) {
+                Text("Открыть специальные возможности")
+            }
+            Text(
+                "Спецвозможности — резервный автозапуск для головных устройств, где обычный запуск после загрузки не срабатывает.",
+                fontSize = 12.sp
+            )
+        }
         item { Button(onClick = {
             if (state.recording) DashcamService.stop(context) else {
                 preparing = true
@@ -194,6 +285,25 @@ class MainActivity : ComponentActivity() {
         }, enabled = state.recording || config.cameraIds.isNotEmpty(), modifier = Modifier.fillMaxWidth()) {
             Text(if (state.recording) "Остановить запись" else "Начать запись")
         } }
+    }
+}
+
+@Composable private fun RuntimeSwitchRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    enabled: Boolean = true,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f))
+            Text(subtitle, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Switch(checked = checked, enabled = enabled, onCheckedChange = onCheckedChange)
     }
 }
 

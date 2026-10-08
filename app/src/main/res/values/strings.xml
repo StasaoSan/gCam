@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">gCam</string>
+    <string name="accessibility_service_description">Резервный автозапуск gCam и видеорегистратора после старта головного устройства.</string>
 </resources>

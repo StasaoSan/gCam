@@ -206,6 +206,14 @@ class DashcamService : Service() {
             putExtra(EXTRA_MAX_GAP_MS, cameras.map(CameraRecordingState::maxGapMs).toDoubleArray())
             putExtra(EXTRA_TIMEOUTS, cameras.map(CameraRecordingState::timeouts).toLongArray())
         })
+        val recordingVideo = state.recording && cameras.any { it.recording && it.frames > 0 }
+        GCamHealthReporter.send(
+            this,
+            GCamHealthReporter.SOURCE_RECORDER,
+            recording = state.recording,
+            recordingVideo = recordingVideo,
+            error = cameras.firstNotNullOfOrNull(CameraRecordingState::error)
+        )
     }
 
     private fun createChannel() {
