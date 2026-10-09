@@ -16,6 +16,7 @@
 #include <time.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -67,13 +68,13 @@ typedef struct {
     atomic_ullong draw_total_ns, draw_max_ns, draw_count, swap_total_ns, swap_max_ns, swap_count;
     atomic_ullong hold_total_ns, hold_max_ns, hold_count, gap_max_ns;
     unsigned input; int recordable, target_fps;
-    _Atomic float crop_x, crop_y, crop_zoom, fisheye;
-    atomic_int shape;
+    _Atomic float crop_x, crop_y, crop_zoom, crop_width, crop_height, fisheye;
+    atomic_int shape, quarter_turns, custom_crop;
     char status[512];
 } state_t;
 static state_t s = {
     .mutex=PTHREAD_MUTEX_INITIALIZER,
-    .crop_x=0.5f, .crop_y=0.5f, .crop_zoom=1.0f, .fisheye=0.0f,
+    .crop_x=0.5f, .crop_y=0.5f, .crop_zoom=1.0f, .crop_width=1.0f, .crop_height=1.0f, .fisheye=0.0f,
     .status="Остановлено"
 };
 static state_t recorders[4];
@@ -137,7 +138,7 @@ typedef void (*f_image_target_texture)(GLenum target,void *image);
 typedef enum { UPLOAD_PBO=0, UPLOAD_DMABUF_RGBA=1 } upload_mode_t;
 typedef struct {
     EGLDisplay d; EGLSurface s; EGLContext c; GLuint program,texture;
-    GLint sampler,crop_center,crop_zoom,fisheye,output_aspect,shape; int w,h;
+    GLint sampler,crop_center,crop_zoom,crop_extent,fisheye,output_aspect,shape,quarter_turns,custom_crop; int w,h;
     GLuint pbo[NBUF],imported_texture[NBUF]; EGLImageKHR image[NBUF]; GLsync fence[NBUF];
     int pbo_upload,recordable; upload_mode_t upload_mode;
     PFNEGLCREATEIMAGEKHRPROC create_image; PFNEGLDESTROYIMAGEKHRPROC destroy_image;
@@ -226,9 +227,46 @@ static int renderer_init(renderer_t *r,ANativeWindow *window,int recordable,fram
     r->s=eglCreateWindowSurface(r->d,cfg,window,NULL);EGLint ca[]={EGL_CONTEXT_CLIENT_VERSION,3,EGL_NONE};r->c=eglCreateContext(r->d,cfg,EGL_NO_CONTEXT,ca);
     if(r->s==EGL_NO_SURFACE||r->c==EGL_NO_CONTEXT||!eglMakeCurrent(r->d,r->s,r->s,r->c))return -1;r->recordable=recordable;r->presentation_time=(void *)eglGetProcAddress("eglPresentationTimeANDROID");eglSwapInterval(r->d,recordable?0:1);eglQuerySurface(r->d,r->s,EGL_WIDTH,&r->w);eglQuerySurface(r->d,r->s,EGL_HEIGHT,&r->h);
     const char *vs="#version 300 es\nconst vec2 p[3]=vec2[3](vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));out vec2 uv;void main(){gl_Position=vec4(p[gl_VertexID],0.,1.);uv=(p[gl_VertexID]+1.)*.5;}";
-    const char *fs="#version 300 es\nprecision highp float;precision highp int;uniform sampler2D packedUyvy;uniform vec2 cropCenter;uniform float cropZoom;uniform float fisheyeStrength;uniform float outputAspect;uniform int outputShape;in vec2 uv;out vec4 o;void main(){if(outputShape==2){vec2 ellipse=(uv-.5)*2.;if(dot(ellipse,ellipse)>1.){o=vec4(0.);return;}}float sourceAspect=1.6;float z=max(cropZoom,1.);vec2 cropSize=vec2(1./z);if(outputAspect>sourceAspect)cropSize.y*=sourceAspect/outputAspect;else cropSize.x*=outputAspect/sourceAspect;vec2 halfSize=cropSize*.5;vec2 center=clamp(cropCenter,halfSize,vec2(1.)-halfSize);vec2 q=uv*2.-1.;vec2 undistorted=center+q*halfSize;vec2 lens=(undistorted-.5)*2.;float k=max(fisheyeStrength,0.)*.35;vec2 sampleUv=clamp(.5+(lens/(1.+k*dot(lens,lens)))*.5,vec2(0.),vec2(1.));int x=clamp(int(sampleUv.x*1280.),0,1279);int y=clamp(int((1.-sampleUv.y)*800.),0,799);vec4 p=texelFetch(packedUyvy,ivec2(x/2,y),0);float yy=((x&1)==0?p.g:p.a)*255.;float u=p.r*255.-128.;float v=p.b*255.-128.;yy=1.164*(yy-16.);vec3 c=vec3(yy+1.596*v,yy-.392*u-.813*v,yy+2.017*u)/255.;o=vec4(clamp(c,0.,1.),1.);}";
+    const char *fs=
+        "#version 300 es\n"
+        "precision highp float;precision highp int;\n"
+        "uniform sampler2D packedUyvy;uniform vec2 cropCenter,cropExtent;\n"
+        "uniform float cropZoom,fisheyeStrength,outputAspect;\n"
+        "uniform int outputShape,quarterTurns,customCrop;in vec2 uv;out vec4 o;\n"
+        "void main(){\n"
+        "  if(outputShape==2){vec2 circle=(uv-.5)*2.*vec2(max(outputAspect,1.),max(1./outputAspect,1.));\n"
+        "    if(dot(circle,circle)>1.){o=vec4(0.);return;}}\n"
+        "  vec2 local=uv;vec2 cropSize;float sourceAspect=1.6;\n"
+        "  if(customCrop!=0){\n"
+        "    cropSize=clamp(cropExtent,vec2(.05),vec2(1.));\n"
+        "    float selectedAspect=cropSize.x*sourceAspect/cropSize.y;\n"
+        "    float displayAspect=(quarterTurns==1||quarterTurns==3)?1./selectedAspect:selectedAspect;\n"
+        "    vec2 frame=vec2(1.);\n"
+        "    if(outputAspect>displayAspect)frame.x=displayAspect/outputAspect;\n"
+        "    else frame.y=outputAspect/displayAspect;\n"
+        "    local=(uv-.5)/frame+.5;\n"
+        "    if(any(lessThan(local,vec2(0.)))||any(greaterThan(local,vec2(1.)))){o=vec4(0.);return;}\n"
+        "    if(quarterTurns==1)local=vec2(1.-local.y,local.x);\n"
+        "    else if(quarterTurns==2)local=vec2(1.-local.x,1.-local.y);\n"
+        "    else if(quarterTurns==3)local=vec2(local.y,1.-local.x);\n"
+        "  }else{\n"
+        "    cropSize=vec2(1./max(cropZoom,1.));\n"
+        "    if(outputAspect>sourceAspect)cropSize.y*=sourceAspect/outputAspect;\n"
+        "    else cropSize.x*=outputAspect/sourceAspect;\n"
+        "  }\n"
+        "  vec2 halfSize=cropSize*.5;vec2 requestedCenter=customCrop!=0?vec2(cropCenter.x,1.-cropCenter.y):cropCenter;\n"
+        "  vec2 center=clamp(requestedCenter,halfSize,vec2(1.)-halfSize);\n"
+        "  vec2 undistorted=center+(local*2.-1.)*halfSize;\n"
+        "  vec2 lens=(undistorted-.5)*2.;float k=max(fisheyeStrength,0.)*.35;\n"
+        "  vec2 sampleUv=clamp(.5+(lens/(1.+k*dot(lens,lens)))*.5,vec2(0.),vec2(1.));\n"
+        "  int x=clamp(int(sampleUv.x*1280.),0,1279);int y=clamp(int((1.-sampleUv.y)*800.),0,799);\n"
+        "  vec4 p=texelFetch(packedUyvy,ivec2(x/2,y),0);\n"
+        "  float yy=((x&1)==0?p.g:p.a)*255.;float u=p.r*255.-128.;float v=p.b*255.-128.;\n"
+        "  yy=1.164*(yy-16.);vec3 c=vec3(yy+1.596*v,yy-.392*u-.813*v,yy+2.017*u)/255.;\n"
+        "  o=vec4(clamp(c,0.,1.),1.);\n"
+        "}";
     GLuint v=shader(GL_VERTEX_SHADER,vs),f=shader(GL_FRAGMENT_SHADER,fs);if(!v||!f)return -1;r->program=glCreateProgram();glAttachShader(r->program,v);glAttachShader(r->program,f);glLinkProgram(r->program);glDeleteShader(v);glDeleteShader(f);GLint linked=0;glGetProgramiv(r->program,GL_LINK_STATUS,&linked);if(!linked)return -1;
-    r->sampler=glGetUniformLocation(r->program,"packedUyvy");r->crop_center=glGetUniformLocation(r->program,"cropCenter");r->crop_zoom=glGetUniformLocation(r->program,"cropZoom");r->fisheye=glGetUniformLocation(r->program,"fisheyeStrength");r->output_aspect=glGetUniformLocation(r->program,"outputAspect");r->shape=glGetUniformLocation(r->program,"outputShape");
+    r->sampler=glGetUniformLocation(r->program,"packedUyvy");r->crop_center=glGetUniformLocation(r->program,"cropCenter");r->crop_zoom=glGetUniformLocation(r->program,"cropZoom");r->crop_extent=glGetUniformLocation(r->program,"cropExtent");r->fisheye=glGetUniformLocation(r->program,"fisheyeStrength");r->output_aspect=glGetUniformLocation(r->program,"outputAspect");r->shape=glGetUniformLocation(r->program,"outputShape");r->quarter_turns=glGetUniformLocation(r->program,"quarterTurns");r->custom_crop=glGetUniformLocation(r->program,"customCrop");
     if(try_dmabuf_import(r,memory)==0)return 0;
     LOGE("using PBO upload fallback");return init_pbo(r);
 }
@@ -241,7 +279,7 @@ static int draw(renderer_t *r,state_t *state,unsigned idx,const void *p,draw_met
         glTexSubImage2D(GL_TEXTURE_2D,0,0,0,W/2,H,GL_RGBA,GL_UNSIGNED_BYTE,0);glBindBuffer(GL_PIXEL_UNPACK_BUFFER,0);
     }
     uint64_t draw_started=now_ns();
-    glUseProgram(r->program);glUniform1i(r->sampler,0);glUniform2f(r->crop_center,atomic_load(&state->crop_x),atomic_load(&state->crop_y));glUniform1f(r->crop_zoom,atomic_load(&state->crop_zoom));glUniform1f(r->fisheye,atomic_load(&state->fisheye));glUniform1f(r->output_aspect,r->h>0?(float)r->w/(float)r->h:1.6f);glUniform1i(r->shape,atomic_load(&state->shape));
+    glUseProgram(r->program);glUniform1i(r->sampler,0);glUniform2f(r->crop_center,atomic_load(&state->crop_x),atomic_load(&state->crop_y));glUniform1f(r->crop_zoom,atomic_load(&state->crop_zoom));glUniform2f(r->crop_extent,atomic_load(&state->crop_width),atomic_load(&state->crop_height));glUniform1f(r->fisheye,atomic_load(&state->fisheye));glUniform1f(r->output_aspect,r->h>0?(float)r->w/(float)r->h:1.6f);glUniform1i(r->shape,atomic_load(&state->shape));glUniform1i(r->quarter_turns,atomic_load(&state->quarter_turns));glUniform1i(r->custom_crop,atomic_load(&state->custom_crop));
     glViewport(0,0,r->w,r->h);glClearColor(0,0,0,0);glClear(GL_COLOR_BUFFER_BIT);glDrawArrays(GL_TRIANGLES,0,3);
     if(r->upload_mode==UPLOAD_DMABUF_RGBA){r->fence[idx]=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);if(!r->fence[idx])return -1;glFlush();}
     metrics->draw_ns=now_ns()-draw_started;
@@ -330,8 +368,20 @@ static jlongArray state_stats(JNIEnv *e,state_t *state){
 }
 
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_start(JNIEnv *e,jclass c,jobject surface,jint input){(void)c;return start_state(e,&s,surface,input,0,25);}
-JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStart(JNIEnv *e,jclass c,jint slot,jobject surface,jint input,jint target_fps,jfloat crop_x,jfloat crop_y,jfloat crop_zoom,jfloat fisheye,jint shape){(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>1)return (*e)->NewStringUTF(e,"Некорректный HUD slot");if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");if(target_fps<1)target_fps=1;if(target_fps>20)target_fps=20;state_t *state=&hud_streams[slot];atomic_store(&state->crop_x,crop_x<0.f?0.f:(crop_x>1.f?1.f:crop_x));atomic_store(&state->crop_y,crop_y<0.f?0.f:(crop_y>1.f?1.f:crop_y));atomic_store(&state->crop_zoom,crop_zoom<1.f?1.f:(crop_zoom>3.f?3.f:crop_zoom));atomic_store(&state->fisheye,fisheye<0.f?0.f:(fisheye>1.f?1.f:fisheye));atomic_store(&state->shape,shape<0?0:(shape>2?2:shape));return start_state(e,state,surface,input,0,target_fps);}
-JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_hudConfigure(JNIEnv *e,jclass c,jint slot,jfloat crop_x,jfloat crop_y,jfloat crop_zoom,jfloat fisheye,jint shape){(void)e;(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>1)return;state_t *state=&hud_streams[slot];atomic_store(&state->crop_x,crop_x<0.f?0.f:(crop_x>1.f?1.f:crop_x));atomic_store(&state->crop_y,crop_y<0.f?0.f:(crop_y>1.f?1.f:crop_y));atomic_store(&state->crop_zoom,crop_zoom<1.f?1.f:(crop_zoom>3.f?3.f:crop_zoom));atomic_store(&state->fisheye,fisheye<0.f?0.f:(fisheye>1.f?1.f:fisheye));atomic_store(&state->shape,shape<0?0:(shape>2?2:shape));}
+JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStart(JNIEnv *e,jclass c,jint slot,jobject surface,jint input,jint target_fps,jfloat crop_x,jfloat crop_y,jfloat crop_zoom,jfloat fisheye,jint shape){(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>1)return (*e)->NewStringUTF(e,"Некорректный HUD slot");if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");if(target_fps<1)target_fps=1;if(target_fps>20)target_fps=20;state_t *state=&hud_streams[slot];atomic_store(&state->crop_x,crop_x<0.f?0.f:(crop_x>1.f?1.f:crop_x));atomic_store(&state->crop_y,crop_y<0.f?0.f:(crop_y>1.f?1.f:crop_y));atomic_store(&state->crop_zoom,crop_zoom<1.f?1.f:(crop_zoom>3.f?3.f:crop_zoom));atomic_store(&state->fisheye,fisheye<0.f?0.f:(fisheye>1.f?1.f:fisheye));atomic_store(&state->shape,shape<0?0:(shape>2?2:shape));atomic_store(&state->custom_crop,0);atomic_store(&state->quarter_turns,0);return start_state(e,state,surface,input,0,target_fps);}
+JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_hudConfigure(JNIEnv *e,jclass c,jint slot,jfloat crop_x,jfloat crop_y,jfloat crop_zoom,jfloat fisheye,jint shape){(void)e;(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>1)return;state_t *state=&hud_streams[slot];atomic_store(&state->crop_x,crop_x<0.f?0.f:(crop_x>1.f?1.f:crop_x));atomic_store(&state->crop_y,crop_y<0.f?0.f:(crop_y>1.f?1.f:crop_y));atomic_store(&state->crop_zoom,crop_zoom<1.f?1.f:(crop_zoom>3.f?3.f:crop_zoom));atomic_store(&state->fisheye,fisheye<0.f?0.f:(fisheye>1.f?1.f:fisheye));atomic_store(&state->shape,shape<0?0:(shape>2?2:shape));atomic_store(&state->custom_crop,0);atomic_store(&state->quarter_turns,0);}
+static void set_hud_crop_v2(state_t *state,jfloat x,jfloat y,jfloat width,jfloat height,jfloat fisheye,jint shape,jint turns){
+    float w=fminf(1.f,fmaxf(.05f,width)),h=fminf(1.f,fmaxf(.05f,height));
+    atomic_store(&state->crop_width,w);atomic_store(&state->crop_height,h);
+    atomic_store(&state->crop_x,fminf(1.f-w*.5f,fmaxf(w*.5f,x)));
+    atomic_store(&state->crop_y,fminf(1.f-h*.5f,fmaxf(h*.5f,y)));
+    atomic_store(&state->fisheye,fminf(1.f,fmaxf(0.f,fisheye)));
+    atomic_store(&state->shape,shape<0?0:(shape>2?2:shape));
+    atomic_store(&state->quarter_turns,turns<0?0:(turns>3?3:turns));
+    atomic_store(&state->custom_crop,1);
+}
+JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStartV2(JNIEnv *e,jclass c,jint slot,jobject surface,jint input,jint target_fps,jfloat x,jfloat y,jfloat width,jfloat height,jfloat fisheye,jint shape,jint turns){(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>1)return (*e)->NewStringUTF(e,"Некорректный HUD slot");if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");if(target_fps<1)target_fps=1;if(target_fps>20)target_fps=20;state_t *state=&hud_streams[slot];set_hud_crop_v2(state,x,y,width,height,fisheye,shape,turns);return start_state(e,state,surface,input,0,target_fps);}
+JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_hudConfigureV2(JNIEnv *e,jclass c,jint slot,jfloat x,jfloat y,jfloat width,jfloat height,jfloat fisheye,jint shape,jint turns){(void)e;(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>1)return;set_hud_crop_v2(&hud_streams[slot],x,y,width,height,fisheye,shape,turns);}
 JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStop(JNIEnv *e,jclass c,jint slot){(void)e;(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot>=0&&slot<2){stop_state(&hud_streams[slot]);statusf(&hud_streams[slot],"Остановлено");}}
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStatus(JNIEnv *e,jclass c,jint slot){(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>1)return (*e)->NewStringUTF(e,"Некорректный HUD slot");char x[512];pthread_mutex_lock(&hud_streams[slot].mutex);snprintf(x,sizeof(x),"%s",hud_streams[slot].status);pthread_mutex_unlock(&hud_streams[slot].mutex);return (*e)->NewStringUTF(e,x);}
 JNIEXPORT jlongArray JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStats(JNIEnv *e,jclass c,jint slot){(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>1){state_t empty={0};return state_stats(e,&empty);}return state_stats(e,&hud_streams[slot]);}

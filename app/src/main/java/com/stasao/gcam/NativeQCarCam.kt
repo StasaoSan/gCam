@@ -30,6 +30,15 @@ object NativeQCarCam {
         fisheye: Float,
         shape: Int
     )
+    @JvmStatic external fun hudStartV2(
+        slot: Int, surface: Surface, inputId: Int, targetFps: Int,
+        cropX: Float, cropY: Float, cropWidth: Float, cropHeight: Float,
+        fisheye: Float, shape: Int, quarterTurns: Int
+    ): String
+    @JvmStatic external fun hudConfigureV2(
+        slot: Int, cropX: Float, cropY: Float, cropWidth: Float, cropHeight: Float,
+        fisheye: Float, shape: Int, quarterTurns: Int
+    )
     @JvmStatic external fun hudStop(slot: Int)
     @JvmStatic external fun hudStatus(slot: Int): String
     @JvmStatic external fun hudStats(slot: Int): LongArray

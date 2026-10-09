@@ -15,4 +15,9 @@ interface IQCarCamCapture {
     void stopHud(int slot);
     String hudStatus(int slot);
     long[] hudStats(int slot);
+    /** Independent source crop and clockwise quarter-turns. Added after the legacy methods. */
+    String startHudV2(int slot, in Surface surface, int inputId, int targetFps,
+        float cropX, float cropY, float cropWidth, float cropHeight, float fisheye, int shape, int quarterTurns);
+    void configureHudV2(int slot, float cropX, float cropY, float cropWidth, float cropHeight,
+        float fisheye, int shape, int quarterTurns);
 }
