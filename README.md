@@ -329,7 +329,7 @@ export JAVA_HOME="/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
 
 Проверка кода запускается на `main`, pull request и при ручном запуске. Тег `v*` после успешных
 тестов собирает подписанный release APK и публикует GitHub Release с соответствующим разделом
-[`CHANGELOG.md`](CHANGELOG.md). Для тега `v4.91` файл будет называться `gCam_[v4.91].apk`.
+[`CHANGELOG.md`](CHANGELOG.md). Для тега `v4.93` файл будет называться `gCam_[v4.93].apk`.
 Временные артефакты Actions хранятся 1 день; файлы опубликованного Release остаются доступны.
 
 Репозиторий `StasaoSan/gCam` и его Releases должны быть публичными: приложение проверяет
@@ -359,13 +359,15 @@ Android принимает обновление только с прежней �
 
 Перед выпуском увеличьте `versionCode`, установите соответствующий тегу `versionName` в
 `app/build.gradle.kts` и добавьте раздел в changelog. Затем отправьте коммит в основную ветку и
-выпустите **новый** тег на этом коммите. Существующий `v4.9` указывает на APK версии `4.8` и
-не имеет раздела changelog; переписывать опубликованный тег не нужно. Следующий выпуск — `v4.91`:
+выпустите **новый** тег на этом коммите. Тег `v4.92` указывает на коммит с версией APK `4.91`,
+поэтому его сборка не прошла проверку; переписывать опубликованный тег не нужно. Следующий выпуск — `v4.93`:
 
 ```bash
-git tag v4.91
+git add app/build.gradle.kts CHANGELOG.md README.md
+git commit -m "[v4.93] align release version and changelog"
 git push origin main
-git push origin v4.91
+git tag v4.93
+git push origin v4.93
 ```
 
 Во вкладке «Обновление» gCam проверяет последний Release `StasaoSan/gCam`, показывает заметки,
