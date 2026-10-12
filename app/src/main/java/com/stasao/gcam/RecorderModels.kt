@@ -7,7 +7,10 @@ data class RecorderConfig(
     val fps: Int = 20,
     val bitrateMbps: Int = 3,
     val segmentMinutes: Int = 2,
-    val storageLimitGb: Int = 40
+    val storageLimitGb: Int = 40,
+    val stampTime: Boolean = false,
+    val stampGps: Boolean = false,
+    val stampSpeed: Boolean = false
 )
 
 data class CameraRecordingState(
@@ -34,7 +37,8 @@ data class RecordingFile(
     val inputId: Int,
     val sizeBytes: Long,
     val modifiedAt: Long,
-    val protected: Boolean
+    val protected: Boolean,
+    val durationMs: Long = 0
 )
 
 val recorderCameraNames = mapOf(0 to "Левая", 1 to "Правая", 2 to "Перед", 3 to "Зад")

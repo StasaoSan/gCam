@@ -39,6 +39,26 @@ class QCarCamCaptureService : Service() {
 
         override fun stats(inputId: Int): LongArray = NativeQCarCam.recorderStats(inputId)
 
+        override fun warmInput(inputId: Int, enabled: Boolean) {
+            if (inputId in 0..1) NativeQCarCam.warmInput(inputId, enabled)
+        }
+
+        override fun setRecorderOverlay(inputId: Int, text: String) {
+            if (inputId in 0..3) NativeQCarCam.recorderOverlay(inputId, text.take(80))
+        }
+
+        override fun runtimeStats(): LongArray {
+            val runtime = Runtime.getRuntime()
+            val memory = android.os.Debug.MemoryInfo().also(android.os.Debug::getMemoryInfo)
+            return longArrayOf(
+                android.os.Process.getElapsedCpuTime(),
+                android.os.Debug.getNativeHeapAllocatedSize(),
+                runtime.totalMemory() - runtime.freeMemory(),
+                memory.totalPss.toLong(),
+                memory.getMemoryStat("summary.graphics")?.toLongOrNull() ?: -1L
+            )
+        }
+
         override fun startHud(
             slot: Int,
             surface: Surface,
@@ -50,30 +70,22 @@ class QCarCamCaptureService : Service() {
             fisheye: Float,
             shape: Int
         ): String {
-            if (slot !in 0..1) return "Некорректный HUD slot"
-            hudRequested[slot] = true
-            hudConnected = true
-            hudErrors[slot] = null
-            val recorderRunning = NativeQCarCam.recorderStats(inputId).firstOrNull() == 1L
-            val result = if (recorderRunning) {
-                "QCarCam input $inputId занят видеорегистратором"
-            } else {
-                NativeQCarCam.hudStart(
-                    slot,
-                    surface,
-                    inputId,
-                    targetFps,
-                    cropX,
-                    cropY,
-                    cropZoom,
-                    fisheye,
-                    shape
-                )
+            if (slot !in 0..3) return "Некорректный HUD slot"
+            if (slot < 2) {
+                hudRequested[slot] = true
+                hudConnected = true
+                hudErrors[slot] = null
             }
-            hudErrors[slot] = result.takeIf {
-                it.contains("ошиб", true) || it.contains("занят", true) || it.contains("недоступ", true)
+            val result = NativeQCarCam.hudStart(
+                slot, surface, inputId, targetFps, cropX, cropY,
+                cropZoom, fisheye, shape
+            )
+            if (slot < 2) {
+                hudErrors[slot] = result.takeIf {
+                    it.contains("ошиб", true) || it.contains("занят", true) || it.contains("недоступ", true)
+                }
+                publishHudHealth()
             }
-            publishHudHealth()
             return result
         }
 
@@ -93,23 +105,22 @@ class QCarCamCaptureService : Service() {
             cropX: Float, cropY: Float, cropWidth: Float, cropHeight: Float,
             fisheye: Float, shape: Int, quarterTurns: Int
         ): String {
-            if (slot !in 0..1) return "Некорректный HUD slot"
-            hudRequested[slot] = true
-            hudConnected = true
-            hudErrors[slot] = null
-            val recorderRunning = NativeQCarCam.recorderStats(inputId).firstOrNull() == 1L
-            val result = if (recorderRunning) {
-                "QCarCam input $inputId занят видеорегистратором"
-            } else {
-                NativeQCarCam.hudStartV2(
-                    slot, surface, inputId, targetFps, cropX, cropY,
-                    cropWidth, cropHeight, fisheye, shape, quarterTurns
-                )
+            if (slot !in 0..3) return "Некорректный HUD slot"
+            if (slot < 2) {
+                hudRequested[slot] = true
+                hudConnected = true
+                hudErrors[slot] = null
             }
-            hudErrors[slot] = result.takeIf {
-                it.contains("ошиб", true) || it.contains("занят", true) || it.contains("недоступ", true)
+            val result = NativeQCarCam.hudStartV2(
+                slot, surface, inputId, targetFps, cropX, cropY,
+                cropWidth, cropHeight, fisheye, shape, quarterTurns
+            )
+            if (slot < 2) {
+                hudErrors[slot] = result.takeIf {
+                    it.contains("ошиб", true) || it.contains("занят", true) || it.contains("недоступ", true)
+                }
+                publishHudHealth()
             }
-            publishHudHealth()
             return result
         }
 
@@ -123,11 +134,13 @@ class QCarCamCaptureService : Service() {
         }
 
         override fun stopHud(slot: Int) {
-            if (slot !in 0..1) return
+            if (slot !in 0..3) return
             NativeQCarCam.hudStop(slot)
-            hudRequested[slot] = false
-            hudErrors[slot] = null
-            publishHudHealth()
+            if (slot < 2) {
+                hudRequested[slot] = false
+                hudErrors[slot] = null
+                publishHudHealth()
+            }
         }
 
         override fun hudStatus(slot: Int): String = NativeQCarCam.hudStatus(slot)
@@ -160,6 +173,8 @@ class QCarCamCaptureService : Service() {
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
+        NativeQCarCam.warmInput(0, false)
+        NativeQCarCam.warmInput(1, false)
         hudRequested.fill(false)
         hudErrors.fill(null)
         hudConnected = false

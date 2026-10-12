@@ -20,4 +20,10 @@ interface IQCarCamCapture {
         float cropX, float cropY, float cropWidth, float cropHeight, float fisheye, int shape, int quarterTurns);
     void configureHudV2(int slot, float cropX, float cropY, float cropWidth, float cropHeight,
         float fisheye, int shape, int quarterTurns);
+    /** CPU milliseconds, native heap bytes, Java heap bytes for the isolated QCarCam process. */
+    long[] runtimeStats();
+    /** Keep QCarCam open while a side camera is hidden, without GPU rendering. */
+    void warmInput(int inputId, boolean enabled);
+    /** Small ASCII label drawn by GLES only into the encoder Surface. */
+    void setRecorderOverlay(int inputId, String text);
 }

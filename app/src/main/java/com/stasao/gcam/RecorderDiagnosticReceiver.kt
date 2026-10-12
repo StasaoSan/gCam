@@ -9,7 +9,7 @@ import android.util.Log
 class RecorderDiagnosticReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.getStringExtra(EXTRA_COMMAND)?.lowercase()) {
-            "start" -> {
+            "start", "configure" -> {
                 val old = RecorderSettings.load(context)
                 val cameras = intent.getStringExtra(EXTRA_CAMERAS)
                     ?.split(',')
@@ -28,8 +28,9 @@ class RecorderDiagnosticReceiver : BroadcastReceiver() {
                     segmentMinutes = intent.getIntExtra(EXTRA_SEGMENT_MINUTES, old.segmentMinutes).coerceIn(1, 5)
                 )
                 RecorderSettings.save(context, config)
-                Log.i(TAG, "ADB start: $config")
-                DashcamService.start(context)
+                val command = intent.getStringExtra(EXTRA_COMMAND)?.lowercase()
+                Log.i(TAG, "ADB $command: $config")
+                if (command == "start") DashcamService.start(context)
             }
             "stop" -> {
                 Log.i(TAG, "ADB stop")

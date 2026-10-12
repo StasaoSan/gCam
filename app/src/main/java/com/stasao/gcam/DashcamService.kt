@@ -5,13 +5,21 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.app.ActivityManager
+import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.os.IBinder
+import android.os.Process
+import android.os.Debug
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -21,17 +29,21 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
+import java.util.Locale
 
 class DashcamService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val encoders = linkedMapOf<Int, CameraEncoder>()
     private val errors = ConcurrentHashMap<Int, String>()
     private var statsJob: Job? = null
+    private var maintenanceJob: Job? = null
     private var config = RecorderConfig()
+    private var stampSource: RecorderStampSource? = null
     private var capture: IQCarCamCapture? = null
     private var captureBound = false
     private var starting = false
     private var currentState = RecorderState()
+    private var recordingSessionId = 0L
     private val captureConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             capture = IQCarCamCapture.Stub.asInterface(service)
@@ -43,6 +55,7 @@ class DashcamService : Service() {
             capture = null
             captureBound = false
             errors[-1] = "Сервис камер отключился"
+            RecorderDiagnostics.record(this@DashcamService, "capture_disconnected")
         }
     }
 
@@ -55,28 +68,52 @@ class DashcamService : Service() {
         when (intent?.action) {
             ACTION_STOP -> stopRecording()
             ACTION_QUERY -> publish(currentState)
-            else -> startRecording()
+            else -> startRecording(intent)
         }
-        return if (intent?.action == ACTION_QUERY) START_NOT_STICKY else START_STICKY
+        return if (intent?.action == ACTION_STOP || intent?.action == ACTION_QUERY) {
+            START_NOT_STICKY
+        } else {
+            START_STICKY
+        }
     }
 
-    private fun startRecording() {
+    private fun startRecording(intent: Intent?) {
         if (starting || encoders.isNotEmpty()) return
         starting = true
-        config = RecorderSettings.load(this)
+        recordingSessionId = SystemClock.elapsedRealtime()
+        config = intent?.takeIf { it.hasExtra(EXTRA_SELECTED_CAMERAS) }?.let { request ->
+            val saved = RecorderSettings.load(this)
+            val width = request.getIntExtra(EXTRA_WIDTH, saved.width).takeIf { it in setOf(640, 960, 1280) } ?: saved.width
+            saved.copy(
+                cameraIds = (request.getIntArrayExtra(EXTRA_SELECTED_CAMERAS) ?: intArrayOf())
+                    .filter { it in 0..3 }.toSet(),
+                width = width,
+                height = when (width) { 640 -> 400; 1280 -> 800; else -> 600 },
+                fps = request.getIntExtra(EXTRA_FPS_SETTING, saved.fps).coerceIn(15, 25),
+                bitrateMbps = request.getIntExtra(EXTRA_BITRATE, saved.bitrateMbps).coerceIn(2, 6),
+                segmentMinutes = request.getIntExtra(EXTRA_SEGMENT_MINUTES, saved.segmentMinutes).coerceIn(1, 5),
+                storageLimitGb = request.getIntExtra(EXTRA_STORAGE_LIMIT_GB, saved.storageLimitGb).coerceIn(1, 512),
+                stampTime = request.getBooleanExtra(EXTRA_STAMP_TIME, saved.stampTime),
+                stampGps = request.getBooleanExtra(EXTRA_STAMP_GPS, saved.stampGps),
+                stampSpeed = request.getBooleanExtra(EXTRA_STAMP_SPEED, saved.stampSpeed)
+            )
+        } ?: RecorderSettings.load(this)
+        RecorderDiagnostics.record(this, "recording_start cameras=${config.cameraIds.sorted()} size=${config.width}x${config.height} fps=${config.fps} bitrateMbps=${config.bitrateMbps} segmentMinutes=${config.segmentMinutes} limitGb=${config.storageLimitGb}")
         RecordingStore.migrateLegacy(this)
         RecordingStore.removeInterrupted(this)
         RecordingStore.enforceLimit(this, config)
         if (config.cameraIds.isEmpty()) {
+            RecorderDiagnostics.record(this, "recording_rejected reason=no_cameras")
             publish(RecorderState(status = "Выберите хотя бы одну камеру"))
             starting = false
             stopSelf()
             return
         }
-        startForeground(NOTIFICATION_ID, notification("Запуск камер…"))
+        startForeground(NOTIFICATION_ID, notification("Запуск камер…"), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         errors.clear()
         val intent = Intent(this, QCarCamCaptureService::class.java)
         if (!bindService(intent, captureConnection, BIND_AUTO_CREATE)) {
+            RecorderDiagnostics.record(this, "recording_error reason=bind_failed")
             starting = false
             publish(RecorderState(status = "Не удалось запустить сервис камер"))
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -86,15 +123,33 @@ class DashcamService : Service() {
 
     private fun startEncoders() {
         val remote = capture ?: return
+        val locationRequested = config.stampGps || config.stampSpeed
+        val locationReady = locationRequested &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED &&
+            runCatching {
+                startForeground(
+                    NOTIFICATION_ID, notification("Запуск камер…"),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+                )
+                true
+            }.onFailure {
+                RecorderDiagnostics.record(this, "location_stamp_unavailable type=${it.javaClass.simpleName}")
+            }.getOrDefault(false)
+        stampSource = RecorderStampSource(this, config).also { if (locationReady) it.start() }
         config.cameraIds.sorted().forEach { id ->
             runCatching {
-                CameraEncoder(this, id, config) { message -> errors[id] = message }.also {
+                remote.setRecorderOverlay(id, stampSource?.currentText().orEmpty())
+                CameraEncoder(this, id, config, recordingSessionId) { message -> errors[id] = message }.also {
                     it.start(remote); encoders[id] = it
                 }
-            }.onFailure { errors[id] = it.message ?: it.javaClass.simpleName }
+            }.onFailure {
+                errors[id] = it.message ?: it.javaClass.simpleName
+                RecorderDiagnostics.record(this, "encoder_start_error input=$id type=${it.javaClass.simpleName} message=${it.message}")
+            }
         }
         starting = false
         if (encoders.isEmpty()) {
+            stampSource?.stop(); stampSource = null
             val cameras = config.cameraIds.associateWith { id ->
                 CameraRecordingState(id, error = errors[id] ?: "Не удалось запустить")
             }
@@ -109,7 +164,17 @@ class DashcamService : Service() {
             val previous = mutableMapOf<Int, Pair<Long, Long>>()
             var usedBytes = RecordingStore.usedBytes(this@DashcamService)
             var tick = 0
+            var previousSampleElapsed = SystemClock.elapsedRealtime()
+            var previousRecorderCpu = Process.getElapsedCpuTime()
+            var previousCaptureCpu = runCatching { remote.runtimeStats().getOrElse(0) { 0 } }.getOrDefault(0)
+            var consecutiveLowMemorySamples = 0
+            var previousStamp: String? = null
             while (isActive && encoders.isNotEmpty()) {
+                val stamp = stampSource?.currentText().orEmpty()
+                if (stamp != previousStamp) {
+                    config.cameraIds.forEach { id -> runCatching { remote.setRecorderOverlay(id, stamp) } }
+                    previousStamp = stamp
+                }
                 val now = System.nanoTime()
                 val cameras = config.cameraIds.associateWith { id ->
                     val stats = runCatching { remote.stats(id) }.getOrDefault(longArrayOf())
@@ -124,7 +189,11 @@ class DashcamService : Service() {
                     if (tick > 0 && tick % PERF_LOG_INTERVAL_SECONDS == 0) {
                         Log.i(PERF_TAG, buildString {
                             append("input=$id mode=")
-                            append(if (stats.getOrElse(16) { 0 } != 0L) "zero-copy" else "PBO")
+                            append(when (stats.getOrElse(19) { if (stats.getOrElse(16) { 0 } != 0L) 1L else 0L }) {
+                                1L -> "zero-copy"
+                                2L -> "direct"
+                                else -> "PBO"
+                            })
                             append(" fps=").append("%.2f".format(fps))
                             append(" frames=").append(frames)
                             append(" timeouts=").append(stats.getOrElse(2) { 0 })
@@ -132,6 +201,8 @@ class DashcamService : Service() {
                             append(" getMaxUs=").append(stats.getOrElse(6) { 0 })
                             append(" memcpyAvgUs=").append(stats.getOrElse(7) { 0 })
                             append(" memcpyMaxUs=").append(stats.getOrElse(8) { 0 })
+                            append(" uploadAvgUs=").append(stats.getOrElse(17) { 0 })
+                            append(" uploadMaxUs=").append(stats.getOrElse(18) { 0 })
                             append(" gpuSubmitAvgUs=").append(stats.getOrElse(9) { 0 })
                             append(" gpuSubmitMaxUs=").append(stats.getOrElse(10) { 0 })
                             append(" swapAvgUs=").append(stats.getOrElse(11) { 0 })
@@ -155,7 +226,77 @@ class DashcamService : Service() {
                 val active = cameras.values.count(CameraRecordingState::recording)
                 val status = if (cameras.values.none { it.error != null }) "Запись: $active/${config.cameraIds.size} камер"
                     else "Запись с ошибками: $active/${config.cameraIds.size}"
+                val deadEncoder = encoders.values.firstOrNull { !it.drainAlive && it.lastOutputElapsedMs > 0 }
+                if (deadEncoder != null) {
+                    val reason = errors[deadEncoder.inputId] ?: "Кодер камеры ${deadEncoder.inputId} остановился"
+                    RecorderDiagnostics.record(this@DashcamService,
+                        "recording_auto_stop reason=encoder_stopped input=${deadEncoder.inputId} error=$reason")
+                    scope.launch(Dispatchers.Main) { stopRecording("Запись остановлена: $reason") }
+                    break
+                }
                 if (tick++ % 10 == 0) usedBytes = RecordingStore.usedBytes(this@DashcamService)
+                if (tick % 60 == 0 && maintenanceJob?.isActive != true) {
+                    maintenanceJob = scope.launch(Dispatchers.IO) {
+                        runCatching { RecordingStore.enforceLimit(this@DashcamService, config) }
+                            .onFailure { RecorderDiagnostics.record(this@DashcamService,
+                                "archive_maintenance_error type=${it.javaClass.simpleName} message=${it.message}") }
+                    }
+                }
+                if (tick % DIAGNOSTIC_INTERVAL_SECONDS == 0) {
+                    val elapsed = SystemClock.elapsedRealtime()
+                    val windowMs = (elapsed - previousSampleElapsed).coerceAtLeast(1)
+                    val recorderCpu = Process.getElapsedCpuTime()
+                    val captureRuntime = runCatching { remote.runtimeStats() }.getOrDefault(longArrayOf())
+                    val captureCpu = captureRuntime.getOrElse(0) { previousCaptureCpu }
+                    val recorderHeap = Runtime.getRuntime().let { it.totalMemory() - it.freeMemory() }
+                    val processMemory = Debug.MemoryInfo().also(Debug::getMemoryInfo)
+                    val systemMemory = ActivityManager.MemoryInfo().also {
+                        getSystemService(ActivityManager::class.java).getMemoryInfo(it)
+                    }
+                    RecorderDiagnostics.record(this@DashcamService, buildString {
+                        append("sample windowMs=$windowMs recorderCpuPct=")
+                        append((recorderCpu - previousRecorderCpu).coerceAtLeast(0) * 100 / windowMs)
+                        append(" qcarcamCpuPct=")
+                        append((captureCpu - previousCaptureCpu).coerceAtLeast(0) * 100 / windowMs)
+                        append(" recorderNativeBytes=").append(Debug.getNativeHeapAllocatedSize())
+                        append(" recorderJavaBytes=").append(recorderHeap)
+                        append(" qcarcamNativeBytes=").append(captureRuntime.getOrElse(1) { -1 })
+                        append(" qcarcamJavaBytes=").append(captureRuntime.getOrElse(2) { -1 })
+                        append(" recorderPssKb=").append(processMemory.totalPss)
+                        append(" qcarcamPssKb=").append(captureRuntime.getOrElse(3) { -1 })
+                        append(" recorderGraphicsKb=").append(processMemory.getMemoryStat("summary.graphics") ?: "n/a")
+                        append(" qcarcamGraphicsKb=").append(captureRuntime.getOrElse(4) { -1 })
+                        append(" systemAvailableBytes=").append(systemMemory.availMem)
+                        append(" systemLowMemory=").append(systemMemory.lowMemory)
+                        append(" freeStorageBytes=").append(filesDir.usableSpace)
+                        append(" archiveBytes=").append(usedBytes)
+                        config.cameraIds.sorted().forEach { id ->
+                            val c = cameras[id]
+                            val encoder = encoders[id]
+                            append(" | input=$id fps=").append("%.1f".format(Locale.US, c?.fps ?: 0.0))
+                            append(" qFrames=").append(c?.frames ?: 0)
+                            append(" timeouts=").append(c?.timeouts ?: 0)
+                            append(" maxGapMs=").append(c?.maxGapMs?.toInt() ?: 0)
+                            append(" outFrames=").append(encoder?.outputFrames ?: 0)
+                            append(" outBytes=").append(encoder?.outputBytes ?: 0)
+                            append(" outAgeMs=").append(encoder?.lastOutputElapsedMs?.let { elapsed - it } ?: -1)
+                            append(" segments=").append(encoder?.completedSegments ?: 0)
+                            append(" drainAlive=").append(encoder?.drainAlive ?: false)
+                            append(" error=").append(c?.error?.replace(' ', '_') ?: "none")
+                        }
+                    })
+                    previousSampleElapsed = elapsed
+                    previousRecorderCpu = recorderCpu
+                    previousCaptureCpu = captureCpu
+                    consecutiveLowMemorySamples = if (systemMemory.lowMemory || systemMemory.availMem < MIN_AVAILABLE_RAM_BYTES)
+                        consecutiveLowMemorySamples + 1 else 0
+                    if (consecutiveLowMemorySamples >= 2) {
+                        RecorderDiagnostics.record(this@DashcamService,
+                            "recording_auto_stop reason=low_memory availableBytes=${systemMemory.availMem}")
+                        scope.launch(Dispatchers.Main) { stopRecording("Запись остановлена: мало свободной ОЗУ") }
+                        break
+                    }
+                }
                 publish(RecorderState(true, cameras, usedBytes, status))
                 getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(status))
                 delay(1_000)
@@ -163,13 +304,18 @@ class DashcamService : Service() {
         }
     }
 
-    private fun stopRecording() {
+    private fun stopRecording(reason: String? = null) {
+        RecorderDiagnostics.record(this, "recording_stop requested cameras=${encoders.keys.sorted()}")
         statsJob?.cancel(); statsJob = null
+        stampSource?.stop(); stampSource = null
+        maintenanceJob?.cancel(); maintenanceJob = null
         encoders.values.toList().forEach { runCatching { it.stop() } }
         encoders.clear()
+        RecorderDiagnostics.record(this, "recording_stopped")
         starting = false
         unbindCapture()
-        publish(RecorderState(usedBytes = RecordingStore.usedBytes(this)))
+        publish(RecorderState(usedBytes = RecordingStore.usedBytes(this),
+            status = reason ?: "Регистратор остановлен"))
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -178,6 +324,11 @@ class DashcamService : Service() {
         if (encoders.isNotEmpty()) stopRecording()
         scope.cancel()
         super.onDestroy()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (encoders.isNotEmpty()) RecorderDiagnostics.record(this, "trim_memory level=$level")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -242,6 +393,17 @@ class DashcamService : Service() {
         private const val NOTIFICATION_ID = 360
         private const val PERF_TAG = "GCAM_PERF"
         private const val PERF_LOG_INTERVAL_SECONDS = 5
+        private const val DIAGNOSTIC_INTERVAL_SECONDS = 15
+        private const val MIN_AVAILABLE_RAM_BYTES = 512L * 1024 * 1024
+        private const val EXTRA_SELECTED_CAMERAS = "selected_cameras"
+        private const val EXTRA_WIDTH = "recording_width"
+        private const val EXTRA_FPS_SETTING = "recording_fps"
+        private const val EXTRA_BITRATE = "bitrate_mbps"
+        private const val EXTRA_SEGMENT_MINUTES = "segment_minutes"
+        private const val EXTRA_STORAGE_LIMIT_GB = "storage_limit_gb"
+        private const val EXTRA_STAMP_TIME = "stamp_time"
+        private const val EXTRA_STAMP_GPS = "stamp_gps"
+        private const val EXTRA_STAMP_SPEED = "stamp_speed"
         const val ACTION_START = "com.stasao.gcam.START_RECORDING"
         const val ACTION_STOP = "com.stasao.gcam.STOP_RECORDING"
         const val ACTION_QUERY = "com.stasao.gcam.QUERY_RECORDING"
@@ -259,8 +421,20 @@ class DashcamService : Service() {
         private const val EXTRA_MAX_GAP_MS = "max_gap_ms"
         private const val EXTRA_TIMEOUTS = "timeouts"
 
-        fun start(context: Context) = context.startForegroundService(
-            Intent(context, DashcamService::class.java).setAction(ACTION_START)
+        fun start(context: Context, selected: RecorderConfig? = null) = context.startForegroundService(
+            Intent(context, DashcamService::class.java).setAction(ACTION_START).apply {
+                selected?.let { config ->
+                    putExtra(EXTRA_SELECTED_CAMERAS, config.cameraIds.sorted().toIntArray())
+                    putExtra(EXTRA_WIDTH, config.width)
+                    putExtra(EXTRA_FPS_SETTING, config.fps)
+                    putExtra(EXTRA_BITRATE, config.bitrateMbps)
+                    putExtra(EXTRA_SEGMENT_MINUTES, config.segmentMinutes)
+                    putExtra(EXTRA_STORAGE_LIMIT_GB, config.storageLimitGb)
+                    putExtra(EXTRA_STAMP_TIME, config.stampTime)
+                    putExtra(EXTRA_STAMP_GPS, config.stampGps)
+                    putExtra(EXTRA_STAMP_SPEED, config.stampSpeed)
+                }
+            }
         )
         fun stop(context: Context) = context.startService(
             Intent(context, DashcamService::class.java).setAction(ACTION_STOP)

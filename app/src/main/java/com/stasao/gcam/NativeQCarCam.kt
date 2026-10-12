@@ -48,7 +48,8 @@ object NativeQCarCam {
     /**
      * running, frames, dropped/timeouts, firstFrameMs, lastFrameMonotonicNs,
      * getFrame avg/max us, memcpy avg/max us, GPU submit avg/max us,
-     * eglSwapBuffers avg/max us, ION hold avg/max us, max frame gap us, zeroCopy.
+     * eglSwapBuffers avg/max us, ION hold avg/max us, max frame gap us, zeroCopy,
+     * upload avg/max us, upload mode (0=PBO, 1=DMA-BUF, 2=direct upload).
      */
     @JvmStatic external fun stats(): LongArray
 
@@ -57,4 +58,6 @@ object NativeQCarCam {
     @JvmStatic external fun recorderStatus(inputId: Int): String
     /** Same 17 counters as [stats]. */
     @JvmStatic external fun recorderStats(inputId: Int): LongArray
+    @JvmStatic external fun warmInput(inputId: Int, enabled: Boolean)
+    @JvmStatic external fun recorderOverlay(inputId: Int, text: String)
 }

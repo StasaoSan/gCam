@@ -6,6 +6,7 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.Surface
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -16,12 +17,22 @@ class CameraEncoder(
     private val context: Context,
     val inputId: Int,
     private val config: RecorderConfig,
+    private val sessionId: Long,
     private val onError: (String) -> Unit
 ) {
     private val running = AtomicBoolean(false)
     private lateinit var codec: MediaCodec
     private lateinit var inputSurface: Surface
     private var drainThread: Thread? = null
+    @Volatile var outputFrames: Long = 0
+        private set
+    @Volatile var outputBytes: Long = 0
+        private set
+    @Volatile var lastOutputElapsedMs: Long = 0
+        private set
+    @Volatile var completedSegments: Int = 0
+        private set
+    val drainAlive: Boolean get() = drainThread?.isAlive == true
 
     private lateinit var capture: IQCarCamCapture
 
@@ -45,6 +56,7 @@ class CameraEncoder(
             codec.start()
             val nativeStatus = capture.start(inputSurface, inputId, config.fps)
             check(nativeStatus.contains("принят", ignoreCase = true)) { nativeStatus }
+            lastOutputElapsedMs = SystemClock.elapsedRealtime()
             drainThread = Thread(::drain, "gcam-encoder-$inputId").also { it.start() }
         } catch (t: Throwable) {
             running.set(false)
@@ -64,6 +76,7 @@ class CameraEncoder(
 
     private fun drain() {
         val info = MediaCodec.BufferInfo()
+        val writeInfo = MediaCodec.BufferInfo()
         var outputFormat: MediaFormat? = null
         var muxer: MediaMuxer? = null
         var track = -1
@@ -82,10 +95,15 @@ class CameraEncoder(
                 runCatching { active.stop() }
                 runCatching { active.release() }
                 target?.let { segment ->
-                    if (segmentHasSamples) RecordingStore.finishSegment(context, segment)
-                    else RecordingStore.abortSegment(context, segment)
+                    if (segmentHasSamples) {
+                        RecordingStore.finishSegment(context, segment)
+                        completedSegments++
+                        RecorderDiagnostics.record(context, "segment_closed input=$inputId segments=$completedSegments outputFrames=$outputFrames outputBytes=$outputBytes")
+                    } else {
+                        RecordingStore.abortSegment(context, segment)
+                        RecorderDiagnostics.record(context, "segment_empty input=$inputId")
+                    }
                 }
-                RecordingStore.enforceLimit(context, config)
             }
             target = null
             segmentHasSamples = false
@@ -96,7 +114,9 @@ class CameraEncoder(
 
         fun openSegment(format: MediaFormat) {
             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-            val segment = RecordingStore.createSegment(context, inputId, "cam${inputId}_$stamp.mp4")
+            val name = "cam${inputId}_${stamp}_s${sessionId}.mp4"
+            val segment = RecordingStore.createSegment(context, inputId, name)
+            RecorderDiagnostics.record(context, "segment_open input=$inputId name=$name")
             target = segment
             try {
                 muxer = MediaMuxer(segment.descriptor.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4).also {
@@ -138,20 +158,25 @@ class CameraEncoder(
                             }
                             buffer.position(info.offset)
                             buffer.limit(info.offset + info.size)
-                            val writeInfo = MediaCodec.BufferInfo().apply {
-                                set(info.offset, info.size, info.presentationTimeUs - segmentFirstPts, info.flags)
-                            }
+                            writeInfo.set(info.offset, info.size, info.presentationTimeUs - segmentFirstPts, info.flags)
                             muxer?.writeSampleData(track, buffer, writeInfo)
                             segmentHasSamples = true
+                            outputFrames++
+                            outputBytes += info.size
+                            lastOutputElapsedMs = SystemClock.elapsedRealtime()
                         }
                         codec.releaseOutputBuffer(index, false)
                     }
                 }
             }
         } catch (t: Throwable) {
+            RecorderDiagnostics.record(context, "encoder_error input=$inputId type=${t.javaClass.simpleName} message=${t.message}")
             onError("${recorderCameraNames[inputId]}: ${t.message ?: t.javaClass.simpleName}")
         } finally {
-            closeSegment()
+            runCatching { closeSegment() }.onFailure {
+                RecorderDiagnostics.record(context, "segment_close_error input=$inputId type=${it.javaClass.simpleName} message=${it.message}")
+                onError("${recorderCameraNames[inputId]}: ${it.message ?: it.javaClass.simpleName}")
+            }
         }
     }
 

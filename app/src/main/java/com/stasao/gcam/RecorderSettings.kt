@@ -19,7 +19,10 @@ object RecorderSettings {
             fps = p.getInt("recording_fps", 20).takeIf { it in setOf(15, 20, 25) } ?: 20,
             bitrateMbps = p.getInt("bitrate_mbps", 3).takeIf { it in setOf(2, 3, 4, 6) } ?: 3,
             segmentMinutes = p.getInt("segment_minutes", 2).coerceIn(1, 5),
-            storageLimitGb = p.getInt("storage_limit_gb", 40).coerceIn(1, 512)
+            storageLimitGb = p.getInt("storage_limit_gb", 40).coerceIn(1, 512),
+            stampTime = p.getBoolean("stamp_time", false),
+            stampGps = p.getBoolean("stamp_gps", false),
+            stampSpeed = p.getBoolean("stamp_speed", false)
         )
     }
 
@@ -31,7 +34,10 @@ object RecorderSettings {
             putInt("bitrate_mbps", config.bitrateMbps)
             putInt("segment_minutes", config.segmentMinutes)
             putInt("storage_limit_gb", config.storageLimitGb)
-        }.apply()
+            putBoolean("stamp_time", config.stampTime)
+            putBoolean("stamp_gps", config.stampGps)
+            putBoolean("stamp_speed", config.stampSpeed)
+        }.commit()
     }
 
     fun loadUiScale(context: Context): Float {

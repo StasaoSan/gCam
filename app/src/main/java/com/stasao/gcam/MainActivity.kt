@@ -11,7 +11,6 @@ import android.os.Bundle
 import android.os.Build
 import android.content.pm.PackageManager
 import android.provider.Settings
-import android.widget.MediaController
 import android.widget.VideoView
 import android.view.Surface
 import android.view.TextureView
@@ -39,9 +38,11 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.stasao.gcam.ui.theme.GCamTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
@@ -89,13 +90,27 @@ class MainActivity : ComponentActivity() {
     private fun requestMediaPermissions() {
         if (permissionsRequested) return
         permissionsRequested = true
-        val wanted = if (Build.VERSION.SDK_INT >= 33) {
+        val media = if (Build.VERSION.SDK_INT >= 33) {
             arrayOf(Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.POST_NOTIFICATIONS)
         } else {
             arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
         }
+        val saved = RecorderSettings.load(this)
+        val wanted = if (saved.stampGps || saved.stampSpeed) media + arrayOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ) else media
         val missing = wanted.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isNotEmpty()) permissionLauncher.launch(missing.toTypedArray())
+    }
+
+    internal fun requestLocationPermission() {
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            permissionLauncher.launch(arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            ))
+        }
     }
 }
 
@@ -218,6 +233,7 @@ class MainActivity : ComponentActivity() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var preparing by remember { mutableStateOf(false) }
+    var previewClosed by remember { mutableStateOf<CompletableDeferred<Unit>?>(null) }
     val storage = remember(state.usedBytes) { RecordingStore.storageStats(context) }
     val maxArchiveGb = remember(storage) { RecordingStore.maxArchiveGb(context) }
     val minArchiveGb = if (maxArchiveGb >= 5) 5 else 1
@@ -226,11 +242,13 @@ class MainActivity : ComponentActivity() {
     }) }
     var runtimeConfig by remember { mutableStateOf(GCamRuntimeSettings.load(context)) }
     var overlayAllowed by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
+    var locationAllowed by remember { mutableStateOf(context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) }
     val enabled = !state.recording
     LaunchedEffect(state.recording) { if (!state.recording) RecorderRepository.update(state.copy(usedBytes = RecordingStore.usedBytes(context))) }
     LaunchedEffect(Unit) {
         while (true) {
             overlayAllowed = Settings.canDrawOverlays(context)
+            locationAllowed = context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
             delay(1_000)
         }
     }
@@ -241,7 +259,7 @@ class MainActivity : ComponentActivity() {
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         item {
-            if (!state.recording && !preparing) MultiCameraGrid()
+            if (!state.recording && !preparing) MultiCameraGrid { previewClosed?.complete(Unit) }
             else Surface(color = Color(0xFF1B5E20), shape = MaterialTheme.shapes.medium) {
                 Text(if (preparing) "Останавливаю превью и запускаю запись…" else state.status,
                     color = Color.White, modifier = Modifier.fillMaxWidth().padding(14.dp))
@@ -274,8 +292,28 @@ class MainActivity : ComponentActivity() {
             Slider(config.storageLimitGb.toFloat(), { config = config.copy(storageLimitGb = it.toInt()) },
                 valueRange = minArchiveGb.toFloat()..maxArchiveGb.coerceAtLeast(minArchiveGb).toFloat(), enabled = enabled)
             Text("Память устройства: занято ${formatBytes(storage.totalBytes - storage.freeBytes)} из ${formatBytes(storage.totalBytes)} · свободно ${formatBytes(storage.freeBytes)}", fontSize = 13.sp)
-            Text("Записи gCam: ${formatBytes(storage.recordingBytes)} · резерв 5 ГБ сохраняется автоматически", fontSize = 13.sp)
+            Text("Записи gCam: ${formatBytes(storage.recordingBytes)} · максимум = свободно + записи − резерв 2 ГБ", fontSize = 13.sp)
             Text("Ориентировочно ${"%.1f".format(Locale.US, hours)} ч записи", fontSize = 13.sp)
+        }
+        item {
+            SectionTitle("Метки на видео")
+            RuntimeSwitchRow("Дата и время", "Поверх кадра, без перекодирования на CPU", config.stampTime, enabled) {
+                config = config.copy(stampTime = it)
+                RecorderSettings.save(context, config)
+            }
+            RuntimeSwitchRow("GPS-координаты", "Показываются только при свежем определении местоположения", config.stampGps, enabled) {
+                config = config.copy(stampGps = it)
+                RecorderSettings.save(context, config)
+                if (it) (context as? MainActivity)?.requestLocationPermission()
+            }
+            RuntimeSwitchRow("Скорость GPS", "Не скорость автомобиля по CAN; зависит от GPS", config.stampSpeed, enabled) {
+                config = config.copy(stampSpeed = it)
+                RecorderSettings.save(context, config)
+                if (it) (context as? MainActivity)?.requestLocationPermission()
+            }
+            if ((config.stampGps || config.stampSpeed) && !locationAllowed) {
+                Text("Нет разрешения на точное местоположение: на видео будет GPS -- / -- KM/H", fontSize = 12.sp)
+            }
         }
         item { SectionTitle("Размер интерфейса: ${(uiScale * 100).toInt()}%")
             Slider(uiScale, onUiScaleChange, valueRange = 1.3f..1.8f, steps = 9)
@@ -363,18 +401,37 @@ class MainActivity : ComponentActivity() {
         }
         item { Button(onClick = {
             if (state.recording) DashcamService.stop(context) else {
+                val closed = CompletableDeferred<Unit>()
+                previewClosed = closed
                 preparing = true
                 RecorderRepository.update(RecorderState(recording = true, status = "Подготовка записи…"))
                 scope.launch {
-                    delay(800)
-                    RecorderSettings.save(context, config)
-                    DashcamService.start(context)
+                    if (withTimeoutOrNull(5_000) { closed.await() } == null) {
+                        RecorderRepository.update(RecorderState(status = "Не удалось закрыть превью камер"))
+                        previewClosed = null
+                        preparing = false
+                        return@launch
+                    }
+                    runCatching {
+                        RecorderSettings.save(context, config)
+                        DashcamService.start(context, config)
+                    }.onFailure {
+                        RecorderRepository.update(RecorderState(status = "Не удалось запустить запись: ${it.message}"))
+                    }
+                    previewClosed = null
                     preparing = false
                 }
             }
         }, enabled = state.recording || config.cameraIds.isNotEmpty(), modifier = Modifier.fillMaxWidth()) {
             Text(if (state.recording) "Остановить запись" else "Начать запись")
         } }
+        item {
+            OutlinedButton(
+                onClick = { runCatching { RecorderDiagnostics.share(context) } },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Поделиться диагностикой записи") }
+            Text("Журнал сохраняется после перезагрузки и автоматически ограничен 2 МБ. Для разбора зависания отправьте его после поездки.", fontSize = 12.sp)
+        }
     }
 }
 
@@ -397,10 +454,11 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@Composable private fun MultiCameraGrid() {
+@Composable private fun MultiCameraGrid(onClosed: () -> Unit) {
     val context = LocalContext.current
     val controller = remember { MultiCameraPreviewController(context) }
-    DisposableEffect(controller) { onDispose { controller.close() } }
+    val currentOnClosed by rememberUpdatedState(onClosed)
+    DisposableEffect(controller) { onDispose { controller.close(); currentOnClosed() } }
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         cameraInputs.chunked(2).forEach { row ->
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -478,47 +536,145 @@ class MainActivity : ComponentActivity() {
 @Composable private fun RecordingsScreen() {
     val context = LocalContext.current
     var revision by remember { mutableIntStateOf(0) }
-    var playing by remember { mutableStateOf<RecordingFile?>(null) }
-    val recordings = remember(revision) { RecordingStore.list(context) }
-    LaunchedEffect(Unit) {
-        kotlinx.coroutines.withContext(Dispatchers.IO) { RecordingStore.migrateLegacy(context) }
-        revision++
+    var playing by remember { mutableStateOf<RecordingTimeline?>(null) }
+    var expanded by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var recordings by remember { mutableStateOf<List<RecordingFile>>(emptyList()) }
+    val timelines = remember(recordings) { RecordingTimelines.group(recordings) }
+    LaunchedEffect(revision) {
+        recordings = kotlinx.coroutines.withContext(Dispatchers.IO) {
+            if (revision == 0) RecordingStore.migrateLegacy(context)
+            RecordingStore.listWithDurations(context)
+        }
     }
     LazyColumn(
         Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 12.dp, top = 12.dp, end = 12.dp, bottom = 120.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        item { Text("Movies/gCam · ${recordings.size} файлов · ${formatBytes(recordings.sumOf { it.sizeBytes })}", style = MaterialTheme.typography.titleMedium) }
-        if (recordings.isEmpty()) item { Text("Записей пока нет") }
-        items(recordings, key = RecordingFile::uri) { r -> Card { Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) { Text("${recorderCameraNames[r.inputId] ?: "Камера ${r.inputId}"}${if (r.protected) " · защищено" else ""}"); Text("${DateFormat.getDateTimeInstance().format(Date(r.modifiedAt))} · ${formatBytes(r.sizeBytes)}", fontSize = 12.sp) }
-            TextButton(onClick = { playing = r }) { Text("Смотреть") }
-            TextButton(onClick = { RecordingStore.setProtected(context, r, !r.protected); revision++ }) { Text(if (r.protected) "Снять защиту" else "Защитить") }
-            TextButton(onClick = { RecordingStore.delete(context, r); revision++ }) { Text("Удалить") }
-        } } }
+        item { Text("Movies/gCam · ${timelines.size} записей / ${recordings.size} файлов · ${formatBytes(recordings.sumOf { it.sizeBytes })}", style = MaterialTheme.typography.titleMedium) }
+        if (timelines.isEmpty()) item { Text("Записей пока нет") }
+        items(timelines, key = { it.parts.first().uri }) { timeline ->
+            val key = timeline.parts.first().uri
+            Card {
+                Column(Modifier.fillMaxWidth().padding(10.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(recorderCameraNames[timeline.inputId] ?: "Камера ${timeline.inputId}")
+                            Text("${DateFormat.getDateTimeInstance().format(Date(timeline.startedAt))} · ${formatDuration(timeline.durationMs)} · ${timeline.parts.size} фрагм. · ${formatBytes(timeline.sizeBytes)}", fontSize = 12.sp)
+                        }
+                        TextButton(onClick = { playing = timeline }) { Text("Смотреть") }
+                    }
+                    TextButton(onClick = { expanded = if (key in expanded) expanded - key else expanded + key }) {
+                        Text(if (key in expanded) "Скрыть файлы" else "Показать файлы")
+                    }
+                    if (key in expanded) timeline.parts.forEach { r ->
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("${DateFormat.getTimeInstance().format(Date(r.modifiedAt))} · ${formatDuration(r.durationMs)}${if (r.protected) " · защищено" else ""}", modifier = Modifier.weight(1f), fontSize = 12.sp)
+                            TextButton(onClick = { RecordingStore.setProtected(context, r, !r.protected); revision++ }) { Text(if (r.protected) "Снять защиту" else "Защитить") }
+                            TextButton(onClick = { RecordingStore.delete(context, r); revision++ }) { Text("Удалить") }
+                        }
+                    }
+                }
+            }
+        }
     }
     playing?.let { VideoPlayer(it) { playing = null } }
 }
 
-@Composable private fun VideoPlayer(recording: RecordingFile, onDismiss: () -> Unit) {
+@Composable private fun VideoPlayer(timeline: RecordingTimeline, onDismiss: () -> Unit) {
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         val context = LocalContext.current
-        val video = remember(recording.uri) { VideoView(context) }
-        DisposableEffect(video) { onDispose { video.stopPlayback() } }
-        Box(Modifier.fillMaxSize().background(Color.Black)) {
-            AndroidView(factory = {
-                video.apply {
-                    val controls = MediaController(context)
-                    controls.setAnchorView(this)
-                    setMediaController(controls)
-                    setVideoURI(Uri.parse(recording.uri))
-                    setOnPreparedListener { player -> player.isLooping = false; start() }
+        val video = remember(timeline.parts.first().uri) { VideoView(context) }
+        var partIndex by remember(timeline) { mutableIntStateOf(0) }
+        var positionMs by remember(timeline) { mutableLongStateOf(0L) }
+        var seeking by remember(timeline) { mutableStateOf(false) }
+        var seekPreview by remember(timeline) { mutableLongStateOf(0L) }
+        var playing by remember(timeline) { mutableStateOf(true) }
+        var prepared by remember(timeline) { mutableStateOf(false) }
+        var error by remember(timeline) { mutableStateOf<String?>(null) }
+        val totalMs = timeline.durationMs.coerceAtLeast(1L)
+
+        fun partOffset(index: Int): Long = timeline.parts.take(index).sumOf { it.durationMs }
+        fun loadPart(index: Int, offsetMs: Long = 0L) {
+            partIndex = index
+            prepared = false
+            error = null
+            video.setOnPreparedListener {
+                prepared = true
+                if (offsetMs > 0) video.seekTo(offsetMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+                if (playing) video.start()
+            }
+            video.setVideoURI(Uri.parse(timeline.parts[index].uri))
+        }
+        fun seekTo(absoluteMs: Long) {
+            val target = absoluteMs.coerceIn(0, totalMs - 1)
+            var remaining = target
+            var index = 0
+            while (index < timeline.parts.lastIndex && remaining >= timeline.parts[index].durationMs) {
+                remaining -= timeline.parts[index].durationMs
+                index++
+            }
+            positionMs = target
+            if (index == partIndex && prepared) {
+                video.seekTo(remaining.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+                if (playing && !video.isPlaying) video.start()
+            } else loadPart(index, remaining)
+        }
+        DisposableEffect(video, timeline) {
+            video.setOnCompletionListener {
+                if (partIndex < timeline.parts.lastIndex) loadPart(partIndex + 1)
+                else { playing = false; positionMs = timeline.durationMs }
+            }
+            video.setOnErrorListener { _, what, extra ->
+                error = "Ошибка воспроизведения ($what/$extra)"
+                playing = false
+                true
+            }
+            loadPart(0)
+            onDispose { video.stopPlayback() }
+        }
+        LaunchedEffect(video, timeline) {
+            while (true) {
+                if (prepared && video.isPlaying && !seeking) {
+                    positionMs = (partOffset(partIndex) + video.currentPosition).coerceAtMost(timeline.durationMs)
                 }
-            }, modifier = Modifier.fillMaxSize())
-            Button(onClick = onDismiss, modifier = Modifier.align(Alignment.TopEnd).padding(16.dp)) { Text("Закрыть") }
+                delay(250)
+            }
+        }
+        Column(Modifier.fillMaxSize().background(Color.Black)) {
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                AndroidView(factory = { video }, modifier = Modifier.fillMaxSize())
+                Button(onClick = onDismiss, modifier = Modifier.align(Alignment.TopEnd).padding(16.dp)) { Text("Закрыть") }
+            }
+            Column(Modifier.fillMaxWidth().background(Color(0xFF202020)).padding(12.dp)) {
+                Text("${partIndex + 1}/${timeline.parts.size} · ${formatDuration(if (seeking) seekPreview else positionMs)} / ${formatDuration(timeline.durationMs)}", color = Color.White)
+                Slider(
+                    value = (if (seeking) seekPreview else positionMs).coerceIn(0, totalMs).toFloat(),
+                    onValueChange = { seeking = true; seekPreview = it.toLong() },
+                    onValueChangeFinished = { seeking = false; seekTo(seekPreview) },
+                    valueRange = 0f..totalMs.toFloat(),
+                    enabled = timeline.durationMs > 0
+                )
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = {
+                        if (playing) { playing = false; video.pause() }
+                        else {
+                            playing = true
+                            if (positionMs >= timeline.durationMs) seekTo(0)
+                            else if (prepared) video.start()
+                        }
+                    }) { Text(if (playing) "Пауза" else "Пуск") }
+                    error?.let { Text(it, color = Color(0xFFFF8A80), fontSize = 12.sp) }
+                }
+            }
         }
     }
+}
+
+private fun formatDuration(milliseconds: Long): String {
+    val seconds = milliseconds.coerceAtLeast(0) / 1_000
+    return if (seconds >= 3_600) "%d:%02d:%02d".format(Locale.US, seconds / 3_600, seconds / 60 % 60, seconds % 60)
+    else "%d:%02d".format(Locale.US, seconds / 60, seconds % 60)
 }
 
 private fun formatBytes(bytes: Long): String = when {

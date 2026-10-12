@@ -36,7 +36,7 @@ else
 fi
 
 adb_cmd() { adb "${adb_args[@]}" "$@"; }
-component="$package_name/.RecorderDiagnosticReceiver"
+component="$package_name/com.stasao.gcam.RecorderDiagnosticReceiver"
 action="$package_name.DIAGNOSTIC"
 output_dir="$(pwd)/build/zero-copy-acceptance-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$output_dir"
@@ -45,12 +45,37 @@ adb_cmd shell pm path "$package_name" >/dev/null || {
   echo "Package $package_name is not installed" >&2
   exit 1
 }
+original_settings="$(adb_cmd shell run-as "$package_name" cat shared_prefs/dashcam_settings.xml | tr -d '\r')" || {
+  echo "Cannot read recorder settings; refusing to change them" >&2
+  exit 1
+}
+read_setting() {
+  sed -n "s/.*name=\"$1\" value=\"\([0-9]*\)\".*/\1/p" <<< "$original_settings"
+}
+original_cameras=""
+for input in 0 1 2 3; do
+  if grep -q "name=\"camera_$input\" value=\"true\"" <<< "$original_settings"; then
+    original_cameras="${original_cameras:+$original_cameras,}$input"
+  fi
+done
+original_width="$(read_setting recording_width)"
+original_fps="$(read_setting recording_fps)"
+original_bitrate="$(read_setting bitrate_mbps)"
+original_segment="$(read_setting segment_minutes)"
+if [[ -z "$original_cameras" || -z "$original_width" || -z "$original_fps" || -z "$original_bitrate" || -z "$original_segment" ]]; then
+  echo "Recorder settings are incomplete; refusing to change them" >&2
+  exit 1
+fi
 
 adb_cmd logcat -c
 adb_cmd shell find /sdcard/Movies/gCam -type f -name '*.mp4' 2>/dev/null | tr -d '\r' | sort > "$output_dir/files-before.txt" || true
 
 stop_recorder() {
   adb_cmd shell am broadcast -n "$component" -a "$action" --es command stop >/dev/null || true
+  adb_cmd shell am broadcast -n "$component" -a "$action" \
+    --es command configure --es cameras "$original_cameras" \
+    --ei width "$original_width" --ei fps "$original_fps" \
+    --ei bitrate "$original_bitrate" --ei segmentMinutes "$original_segment" >/dev/null || true
 }
 trap stop_recorder EXIT INT TERM
 

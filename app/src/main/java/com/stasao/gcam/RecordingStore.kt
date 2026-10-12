@@ -4,6 +4,7 @@ import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
+import android.media.MediaMetadataRetriever
 import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.os.StatFs
@@ -16,7 +17,7 @@ data class StorageStats(val totalBytes: Long, val freeBytes: Long, val recording
 object RecordingStore {
     private const val ROOT = "gCam"
     private const val PROTECTED = "protected"
-    const val RESERVED_FREE_BYTES = 5L * 1024 * 1024 * 1024
+    const val RESERVED_FREE_BYTES = 2L * 1024 * 1024 * 1024
     private const val GB = 1024L * 1024L * 1024L
     private val collection: Uri get() = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
     private val rootPath = "${Environment.DIRECTORY_MOVIES}/$ROOT/"
@@ -57,6 +58,7 @@ object RecordingStore {
             MediaStore.MediaColumns._ID,
             MediaStore.MediaColumns.DISPLAY_NAME,
             MediaStore.MediaColumns.SIZE,
+            MediaStore.Video.Media.DURATION,
             MediaStore.MediaColumns.DATE_MODIFIED,
             MediaStore.MediaColumns.RELATIVE_PATH
         )
@@ -70,6 +72,7 @@ object RecordingStore {
                 val idIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
                 val nameIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
                 val sizeIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
+                val durationIndex = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
                 val modifiedIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_MODIFIED)
                 val pathIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH)
                 while (cursor.moveToNext()) {
@@ -81,7 +84,8 @@ object RecordingStore {
                         Regex("cam(\\d)").find(name)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: -1,
                         cursor.getLong(sizeIndex),
                         cursor.getLong(modifiedIndex) * 1000,
-                        path.contains("/$PROTECTED/")
+                        path.contains("/$PROTECTED/"),
+                        cursor.getLong(durationIndex).coerceAtLeast(0)
                     ))
                 }
             }
@@ -89,6 +93,19 @@ object RecordingStore {
     }
 
     fun usedBytes(context: Context): Long = list(context).sumOf(RecordingFile::sizeBytes)
+
+    /** For the player only; metadata fallback may open MP4 files and must run off the UI thread. */
+    fun listWithDurations(context: Context): List<RecordingFile> = list(context).map { file ->
+        if (file.durationMs > 0) file else {
+            val duration = runCatching {
+                MediaMetadataRetriever().use { retriever ->
+                    retriever.setDataSource(context, Uri.parse(file.uri))
+                    retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                }
+            }.getOrDefault(0L)
+            file.copy(durationMs = duration.coerceAtLeast(0))
+        }
+    }
 
     fun storageStats(context: Context): StorageStats {
         val stat = StatFs(Environment.getExternalStorageDirectory().absolutePath)
