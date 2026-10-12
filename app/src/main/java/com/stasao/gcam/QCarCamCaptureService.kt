@@ -7,6 +7,8 @@ import android.content.Intent
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.Binder
+import android.os.Parcel
 import android.view.Surface
 import androidx.core.app.NotificationCompat
 
@@ -30,6 +32,13 @@ class QCarCamCaptureService : Service() {
     }
 
     private val binder = object : IQCarCamCapture.Stub() {
+        override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+            if (code in IBinder.FIRST_CALL_TRANSACTION..IBinder.LAST_CALL_TRANSACTION) {
+                CaptureClientTrust.enforceCaller(this@QCarCamCaptureService, Binder.getCallingUidOrThrow(), code)
+            }
+            return super.onTransact(code, data, reply, flags)
+        }
+
         override fun start(surface: Surface, inputId: Int, targetFps: Int): String =
             NativeQCarCam.recorderStart(surface, inputId, targetFps)
 

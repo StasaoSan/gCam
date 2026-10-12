@@ -2,9 +2,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <permission
-        android:name="${applicationId}.permission.QCARCAM_CAPTURE"
-        android:protectionLevel="signature" />
+    <queries>
+        <package android:name="com.g992.anhud" />
+    </queries>
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
@@ -51,7 +51,6 @@
             android:name=".QCarCamCaptureService"
             android:exported="true"
             android:foregroundServiceType="dataSync"
-            android:permission="${applicationId}.permission.QCARCAM_CAPTURE"
             android:process=":qcarcam" />
         <service
             android:name=".GCamStatusOverlayService"

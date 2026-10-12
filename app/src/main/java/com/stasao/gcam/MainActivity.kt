@@ -241,6 +241,8 @@ class MainActivity : ComponentActivity() {
         it.copy(storageLimitGb = it.storageLimitGb.coerceIn(minArchiveGb, maxArchiveGb.coerceAtLeast(minArchiveGb)))
     }) }
     var runtimeConfig by remember { mutableStateOf(GCamRuntimeSettings.load(context)) }
+    var anhudAccess by remember { mutableStateOf(CaptureClientTrust.status(context)) }
+    var anhudAccessMessage by remember { mutableStateOf<String?>(null) }
     var overlayAllowed by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
     var locationAllowed by remember { mutableStateOf(context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) }
     val enabled = !state.recording
@@ -249,6 +251,7 @@ class MainActivity : ComponentActivity() {
         while (true) {
             overlayAllowed = Settings.canDrawOverlays(context)
             locationAllowed = context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            anhudAccess = CaptureClientTrust.status(context)
             delay(1_000)
         }
     }
@@ -398,6 +401,38 @@ class MainActivity : ComponentActivity() {
                 "Спецвозможности — резервный автозапуск для головных устройств, где обычный запуск после загрузки не срабатывает.",
                 fontSize = 12.sp
             )
+        }
+        item {
+            SectionTitle("Доступ ANHUD к камерам")
+            Text(
+                when {
+                    !anhudAccess.installed -> "ANHUD не установлен. После установки откройте эту страницу снова."
+                    anhudAccess.sameSigner -> "Доступ разрешён автоматически: ANHUD подписан тем же ключом, что и gCam."
+                    anhudAccess.approved -> "Доступ разрешён для установленной версии ANHUD."
+                    anhudAccess.signerChanged -> "Подпись ANHUD изменилась. Подтвердите доступ заново."
+                    else -> "ANHUD подписан другим ключом. Подтвердите доступ к боковым камерам."
+                },
+                fontSize = 13.sp
+            )
+            if (anhudAccess.installed && !anhudAccess.sameSigner) {
+                OutlinedButton(onClick = {
+                    anhudAccessMessage = runCatching {
+                        if (anhudAccess.approved) {
+                            CaptureClientTrust.revoke(context)
+                            "Доступ ANHUD отозван"
+                        } else if (CaptureClientTrust.approve(context)) {
+                            "Доступ ANHUD разрешён"
+                        } else {
+                            "ANHUD больше не установлен"
+                        }
+                    }.getOrElse { "Не удалось изменить доступ: ${it.message}" }
+                    anhudAccess = CaptureClientTrust.status(context)
+                }) {
+                    Text(if (anhudAccess.approved) "Отозвать доступ" else "Разрешить ANHUD")
+                }
+            }
+            anhudAccessMessage?.let { Text(it, fontSize = 12.sp) }
+            Text("Разрешение привязано к подписи установленного ANHUD, а не к паролю или ключу внутри него.", fontSize = 12.sp)
         }
         item { Button(onClick = {
             if (state.recording) DashcamService.stop(context) else {
