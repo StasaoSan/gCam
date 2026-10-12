@@ -6,6 +6,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing tag to build and publish (leave empty to verify only)
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -17,6 +22,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -44,7 +51,7 @@ jobs:
 
   release:
     name: Sign and publish release APK
-    if: ${{ github.ref_type == 'tag' }}
+    if: ${{ github.ref_type == 'tag' || inputs.release_tag != '' }}
     needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -52,12 +59,14 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - name: Validate version and changelog
         id: release
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${RELEASE_TAG:-$GITHUB_REF_NAME}"
           version="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts)"
           if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+){1,3}$ || "$tag" != "v${version}" ]]; then
             echo "Tag $tag must match app version v${version}" >&2
@@ -75,6 +84,8 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "apk=gCam_[${tag}].apk" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
 
       - uses: actions/setup-java@v4
         with:
@@ -135,13 +146,17 @@ jobs:
           APK_NAME: ${{ steps.release.outputs.apk }}
         run: |
           set -euo pipefail
+          test -f "dist/${APK_NAME}"
+          # gh treats square brackets in an exact filename as a glob character class.
+          # Let gh expand a pattern that matches the one signed APK instead.
+          apk_pattern='dist/gCam_*.apk'
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            gh release upload "$TAG_NAME" "dist/${APK_NAME}" dist/SHA256SUMS.txt \
+            gh release upload "$TAG_NAME" "$apk_pattern" dist/SHA256SUMS.txt \
               --clobber
             gh release edit "$TAG_NAME" \
               --title "gCam ${TAG_NAME}" --notes-file dist/RELEASE_NOTES.md --draft=false
           else
-            gh release create "$TAG_NAME" "dist/${APK_NAME}" dist/SHA256SUMS.txt \
+            gh release create "$TAG_NAME" "$apk_pattern" dist/SHA256SUMS.txt \
               --verify-tag \
               --title "gCam ${TAG_NAME}" --notes-file dist/RELEASE_NOTES.md
           fi
