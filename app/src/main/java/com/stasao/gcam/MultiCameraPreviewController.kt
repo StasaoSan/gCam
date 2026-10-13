@@ -11,17 +11,21 @@ import java.util.concurrent.ConcurrentHashMap
 class MultiCameraPreviewController(context: Context) {
     private val appContext = context.applicationContext
     private val surfaces = ConcurrentHashMap<Int, Surface>()
-    @Volatile private var capture: IQCarCamCapture? = null
+    private var capture: IQCarCamCapture? = null
+    private var closed = false
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            capture = IQCarCamCapture.Stub.asInterface(service)
-            surfaces.forEach { (id, surface) ->
-                if (surface.isValid) runCatching { capture?.start(surface, id, 25) }
+            synchronized(this@MultiCameraPreviewController) {
+                if (closed) return
+                capture = IQCarCamCapture.Stub.asInterface(service)
+                surfaces.forEach { (id, surface) ->
+                    if (surface.isValid) runCatching { capture?.start(surface, id, 25) }
+                }
             }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
-            capture = null
+            synchronized(this@MultiCameraPreviewController) { capture = null }
         }
     }
 
@@ -31,27 +35,33 @@ class MultiCameraPreviewController(context: Context) {
         )
     }
 
-    fun start(surface: Surface, inputId: Int): String {
+    @Synchronized fun start(surface: Surface, inputId: Int): String {
+        if (closed) {
+            surface.release()
+            return "Превью закрыто"
+        }
         surfaces.put(inputId, surface)?.takeIf { it !== surface }?.release()
         val remote = capture ?: return "Подключение к QCarCam…"
         return runCatching { remote.start(surface, inputId, 25) }
             .getOrElse { it.message ?: "Ошибка подключения" }
     }
 
-    fun status(inputId: Int): String = runCatching {
+    @Synchronized fun status(inputId: Int): String = runCatching {
         capture?.status(inputId) ?: "Подключение к QCarCam…"
     }.getOrElse { it.message ?: "Ошибка подключения" }
 
-    fun stats(inputId: Int): LongArray = runCatching {
+    @Synchronized fun stats(inputId: Int): LongArray = runCatching {
         capture?.stats(inputId) ?: longArrayOf()
     }.getOrDefault(longArrayOf())
 
-    fun stop(inputId: Int) {
+    @Synchronized fun stop(inputId: Int) {
         runCatching { capture?.stop(inputId) }
         surfaces.remove(inputId)?.release()
     }
 
-    fun close() {
+    @Synchronized fun close() {
+        if (closed) return
+        closed = true
         surfaces.keys.toList().forEach(::stop)
         runCatching { appContext.unbindService(connection) }
         capture = null

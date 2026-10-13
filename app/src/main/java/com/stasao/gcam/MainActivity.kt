@@ -38,11 +38,10 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.stasao.gcam.ui.theme.GCamTheme
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withContext
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
@@ -233,7 +232,7 @@ class MainActivity : ComponentActivity() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var preparing by remember { mutableStateOf(false) }
-    var previewClosed by remember { mutableStateOf<CompletableDeferred<Unit>?>(null) }
+    var previewController by remember { mutableStateOf<MultiCameraPreviewController?>(null) }
     val storage = remember(state.usedBytes) { RecordingStore.storageStats(context) }
     val maxArchiveGb = remember(storage) { RecordingStore.maxArchiveGb(context) }
     val minArchiveGb = if (maxArchiveGb >= 5) 5 else 1
@@ -262,7 +261,10 @@ class MainActivity : ComponentActivity() {
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         item {
-            if (!state.recording && !preparing) MultiCameraGrid { previewClosed?.complete(Unit) }
+            if (!state.recording && !preparing) MultiCameraGrid(
+                onMounted = { previewController = it },
+                onClosed = { closed -> if (previewController === closed) previewController = null }
+            )
             else Surface(color = Color(0xFF1B5E20), shape = MaterialTheme.shapes.medium) {
                 Text(if (preparing) "Останавливаю превью и запускаю запись…" else state.status,
                     color = Color.White, modifier = Modifier.fillMaxWidth().padding(14.dp))
@@ -436,28 +438,24 @@ class MainActivity : ComponentActivity() {
         }
         item { Button(onClick = {
             if (state.recording) DashcamService.stop(context) else {
-                val closed = CompletableDeferred<Unit>()
-                previewClosed = closed
+                val controllerToClose = previewController
+                RecorderDiagnostics.record(context, "record_button_start previewActive=${controllerToClose != null} cameras=${config.cameraIds.sorted()}")
                 preparing = true
                 RecorderRepository.update(RecorderState(recording = true, status = "Подготовка записи…"))
                 scope.launch {
-                    if (withTimeoutOrNull(5_000) { closed.await() } == null) {
-                        RecorderRepository.update(RecorderState(status = "Не удалось закрыть превью камер"))
-                        previewClosed = null
-                        preparing = false
-                        return@launch
-                    }
                     runCatching {
+                        withContext(Dispatchers.IO) { controllerToClose?.close() }
+                        RecorderDiagnostics.record(context, "preview_closed start_service=true")
                         RecorderSettings.save(context, config)
                         DashcamService.start(context, config)
                     }.onFailure {
+                        RecorderDiagnostics.record(context, "record_button_error type=${it.javaClass.simpleName} message=${it.message}")
                         RecorderRepository.update(RecorderState(status = "Не удалось запустить запись: ${it.message}"))
                     }
-                    previewClosed = null
                     preparing = false
                 }
             }
-        }, enabled = state.recording || config.cameraIds.isNotEmpty(), modifier = Modifier.fillMaxWidth()) {
+        }, enabled = !preparing && (state.recording || config.cameraIds.isNotEmpty()), modifier = Modifier.fillMaxWidth()) {
             Text(if (state.recording) "Остановить запись" else "Начать запись")
         } }
         item {
@@ -489,11 +487,18 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@Composable private fun MultiCameraGrid(onClosed: () -> Unit) {
+@Composable private fun MultiCameraGrid(
+    onMounted: (MultiCameraPreviewController) -> Unit,
+    onClosed: (MultiCameraPreviewController) -> Unit
+) {
     val context = LocalContext.current
     val controller = remember { MultiCameraPreviewController(context) }
+    val currentOnMounted by rememberUpdatedState(onMounted)
     val currentOnClosed by rememberUpdatedState(onClosed)
-    DisposableEffect(controller) { onDispose { controller.close(); currentOnClosed() } }
+    DisposableEffect(controller) {
+        currentOnMounted(controller)
+        onDispose { controller.close(); currentOnClosed(controller) }
+    }
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         cameraInputs.chunked(2).forEach { row ->
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
