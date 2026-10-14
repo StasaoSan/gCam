@@ -7,22 +7,27 @@ object RecorderSettings {
 
     fun load(context: Context): RecorderConfig {
         val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val defaults = RecorderConfig()
+        val hasSavedCameraSelection = (0..3).any { p.contains("camera_$it") }
         val cameras = (0..3).filterTo(mutableSetOf()) { id ->
-            p.getBoolean("camera_$id", id == 2 || id == 3)
+            p.getBoolean("camera_$id", if (hasSavedCameraSelection) id == 2 || id == 3 else id in defaults.cameraIds)
         }
-        val width = p.getInt("recording_width", 960).takeIf { it in setOf(640, 960, 1280) } ?: 960
+        val width = p.getInt("recording_width", defaults.width)
+            .takeIf { it in setOf(640, 960, 1280) } ?: defaults.width
         val height = when (width) { 640 -> 400; 1280 -> 800; else -> 600 }
         return RecorderConfig(
             cameraIds = cameras,
             width = width,
             height = height,
-            fps = p.getInt("recording_fps", 20).takeIf { it in setOf(15, 20, 25) } ?: 20,
-            bitrateMbps = p.getInt("bitrate_mbps", 3).takeIf { it in setOf(2, 3, 4, 6) } ?: 3,
-            segmentMinutes = p.getInt("segment_minutes", 2).coerceIn(1, 5),
-            storageLimitGb = p.getInt("storage_limit_gb", 40).coerceIn(1, 512),
-            stampTime = p.getBoolean("stamp_time", false),
-            stampGps = p.getBoolean("stamp_gps", false),
-            stampSpeed = p.getBoolean("stamp_speed", false)
+            fps = p.getInt("recording_fps", defaults.fps)
+                .takeIf { it in setOf(15, 20, 25) } ?: defaults.fps,
+            bitrateMbps = p.getInt("bitrate_mbps", defaults.bitrateMbps)
+                .takeIf { it in setOf(2, 3, 4, 6) } ?: defaults.bitrateMbps,
+            segmentMinutes = p.getInt("segment_minutes", defaults.segmentMinutes).coerceIn(1, 5),
+            storageLimitGb = p.getInt("storage_limit_gb", defaults.storageLimitGb).coerceIn(1, 512),
+            stampTime = p.getBoolean("stamp_time", defaults.stampTime),
+            stampGps = p.getBoolean("stamp_gps", defaults.stampGps),
+            stampSpeed = p.getBoolean("stamp_speed", defaults.stampSpeed)
         )
     }
 

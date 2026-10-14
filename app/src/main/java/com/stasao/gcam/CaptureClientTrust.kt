@@ -53,6 +53,7 @@ internal object CaptureClientTrust {
             IQCarCamCapture.Stub.TRANSACTION_hudStats,
             IQCarCamCapture.Stub.TRANSACTION_startHudV2,
             IQCarCamCapture.Stub.TRANSACTION_configureHudV2,
+            IQCarCamCapture.Stub.TRANSACTION_setHudClientActive,
             IQCarCamCapture.Stub.TRANSACTION_warmInput -> true
             else -> false
         }

@@ -71,6 +71,10 @@ typedef struct {
     atomic_ullong draw_total_ns, draw_max_ns, draw_count, swap_total_ns, swap_max_ns, swap_count;
     atomic_ullong hold_total_ns, hold_max_ns, hold_count, gap_max_ns;
     atomic_ullong upload_total_ns, upload_max_ns, upload_count;
+    atomic_ullong sync_total_ns, sync_count, pbo_wait_total_ns, pbo_wait_count;
+    atomic_ullong map_total_ns, map_count, tex_total_ns, tex_count;
+    atomic_ullong make_current_total_ns, make_current_count, release_total_ns, release_count;
+    atomic_ullong unmap_total_ns, unmap_count;
     unsigned input; int recordable, target_fps;
     _Atomic float crop_x, crop_y, crop_zoom, crop_width, crop_height, fisheye;
     atomic_int shape, quarter_turns, custom_crop, active_upload_mode;
@@ -577,7 +581,7 @@ static jstring start_state(JNIEnv *e,state_t *state,jobject surface,jint input,i
 }
 static uint64_t metric_average_us(atomic_ullong *total,atomic_ullong *count){uint64_t n=atomic_load(count);return n?atomic_load(total)/n/1000ull:0;}
 static jlongArray state_stats(JNIEnv *e,state_t *state){
-    jlong v[20]={
+    jlong v[]={
         atomic_load(&state->running),(jlong)atomic_load(&state->frames),(jlong)atomic_load(&state->dropped),
         (jlong)atomic_load(&state->first_ms),(jlong)atomic_load(&state->last_ns),
         (jlong)metric_average_us(&state->get_total_ns,&state->get_count),(jlong)(atomic_load(&state->get_max_ns)/1000ull),
@@ -587,9 +591,23 @@ static jlongArray state_stats(JNIEnv *e,state_t *state){
         (jlong)metric_average_us(&state->hold_total_ns,&state->hold_count),(jlong)(atomic_load(&state->hold_max_ns)/1000ull),
         (jlong)(atomic_load(&state->gap_max_ns)/1000ull),atomic_load(&state->zero_copy),
         (jlong)metric_average_us(&state->upload_total_ns,&state->upload_count),(jlong)(atomic_load(&state->upload_max_ns)/1000ull),
-        atomic_load(&state->active_upload_mode)
+        atomic_load(&state->active_upload_mode),
+        atomic_load(&state->get_total_ns),atomic_load(&state->get_count),
+        atomic_load(&state->memcpy_total_ns),atomic_load(&state->memcpy_count),
+        atomic_load(&state->upload_total_ns),atomic_load(&state->upload_count),
+        atomic_load(&state->draw_total_ns),atomic_load(&state->draw_count),
+        atomic_load(&state->swap_total_ns),atomic_load(&state->swap_count),
+        atomic_load(&state->hold_total_ns),atomic_load(&state->hold_count),
+        atomic_load(&state->sync_total_ns),atomic_load(&state->sync_count),
+        atomic_load(&state->pbo_wait_total_ns),atomic_load(&state->pbo_wait_count),
+        atomic_load(&state->map_total_ns),atomic_load(&state->map_count),
+        atomic_load(&state->tex_total_ns),atomic_load(&state->tex_count),
+        atomic_load(&state->make_current_total_ns),atomic_load(&state->make_current_count),
+        atomic_load(&state->release_total_ns),atomic_load(&state->release_count),
+        atomic_load(&state->unmap_total_ns),atomic_load(&state->unmap_count)
     };
-    jlongArray a=(*e)->NewLongArray(e,20);if(a)(*e)->SetLongArrayRegion(e,a,0,20,v);return a;
+    const jsize count=(jsize)(sizeof(v)/sizeof(v[0]));
+    jlongArray a=(*e)->NewLongArray(e,count);if(a)(*e)->SetLongArrayRegion(e,a,0,count,v);return a;
 }
 
 /* One QCarCam handle and one GPU upload per physical input. HUD surfaces and the
@@ -645,6 +663,13 @@ static void reset_output_stats(state_t *state,int input,int recordable,int fps){
     atomic_store(&state->swap_count,0);atomic_store(&state->hold_total_ns,0);
     atomic_store(&state->hold_max_ns,0);atomic_store(&state->hold_count,0);
     atomic_store(&state->gap_max_ns,0);
+    atomic_store(&state->sync_total_ns,0);atomic_store(&state->sync_count,0);
+    atomic_store(&state->pbo_wait_total_ns,0);atomic_store(&state->pbo_wait_count,0);
+    atomic_store(&state->map_total_ns,0);atomic_store(&state->map_count,0);
+    atomic_store(&state->tex_total_ns,0);atomic_store(&state->tex_count,0);
+    atomic_store(&state->make_current_total_ns,0);atomic_store(&state->make_current_count,0);
+    atomic_store(&state->release_total_ns,0);atomic_store(&state->release_count,0);
+    atomic_store(&state->unmap_total_ns,0);atomic_store(&state->unmap_count,0);
     state->input=(unsigned)input;state->recordable=recordable;state->target_fps=fps;
     statusf(state,"Запуск QCarCam input %d…",input);
 }
@@ -674,25 +699,39 @@ static void apply_shared_outputs(shared_camera_t *camera,renderer_t *r){
     }
     pthread_mutex_unlock(&camera->mutex);
 }
-static int shared_upload(renderer_t *r,unsigned idx,const void *pixels,draw_metrics_t *metrics){
+static int shared_upload(renderer_t *r,unsigned idx,const void *pixels,draw_metrics_t *metrics,state_t *stage){
     if(r->upload_mode==UPLOAD_DMABUF_RGBA){glBindTexture(GL_TEXTURE_2D,r->imported_texture[idx]);return 0;}
     uint64_t start=now_ns();glBindTexture(GL_TEXTURE_2D,r->texture);
     if(r->upload_mode==UPLOAD_DIRECT){
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER,0);
+        uint64_t tex_start=now_ns();
         glTexSubImage2D(GL_TEXTURE_2D,0,0,0,W/2,H,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+        atomic_fetch_add(&stage->tex_total_ns,now_ns()-tex_start);atomic_fetch_add(&stage->tex_count,1);
     }else{
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER,r->pbo[idx]);
         if(r->pbo_fence[idx]){
+            uint64_t wait_start=now_ns();
             GLenum waited=glClientWaitSync(r->pbo_fence[idx],GL_SYNC_FLUSH_COMMANDS_BIT,1000000000ull);
+            atomic_fetch_add(&stage->pbo_wait_total_ns,now_ns()-wait_start);atomic_fetch_add(&stage->pbo_wait_count,1);
             if(waited!=GL_ALREADY_SIGNALED&&waited!=GL_CONDITION_SATISFIED){glBindBuffer(GL_PIXEL_UNPACK_BUFFER,0);return -1;}
             glDeleteSync(r->pbo_fence[idx]);r->pbo_fence[idx]=0;
         }
-        void *staging=glMapBufferRange(GL_PIXEL_UNPACK_BUFFER,0,BYTES,GL_MAP_WRITE_BIT);
+        uint64_t map_start=now_ns();
+        /* This PBO has either never been submitted or its explicit fence has completed.
+         * Avoid a second implicit driver wait without orphaning/reallocating storage. */
+        void *staging=glMapBufferRange(GL_PIXEL_UNPACK_BUFFER,0,BYTES,
+                                      GL_MAP_WRITE_BIT|GL_MAP_UNSYNCHRONIZED_BIT);
+        atomic_fetch_add(&stage->map_total_ns,now_ns()-map_start);atomic_fetch_add(&stage->map_count,1);
         if(!staging){glBindBuffer(GL_PIXEL_UNPACK_BUFFER,0);return -1;}
         uint64_t copy_start=now_ns();memcpy(staging,pixels,BYTES);metrics->memcpy_ns=now_ns()-copy_start;
-        if(!glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER)){glBindBuffer(GL_PIXEL_UNPACK_BUFFER,0);return -1;}
+        uint64_t unmap_start=now_ns();
+        GLboolean unmapped=glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+        atomic_fetch_add(&stage->unmap_total_ns,now_ns()-unmap_start);atomic_fetch_add(&stage->unmap_count,1);
+        if(!unmapped){glBindBuffer(GL_PIXEL_UNPACK_BUFFER,0);return -1;}
+        uint64_t tex_start=now_ns();
         glTexSubImage2D(GL_TEXTURE_2D,0,0,0,W/2,H,GL_RGBA,GL_UNSIGNED_BYTE,0);
         r->pbo_fence[idx]=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);
+        atomic_fetch_add(&stage->tex_total_ns,now_ns()-tex_start);atomic_fetch_add(&stage->tex_count,1);
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER,0);
         if(!r->pbo_fence[idx])return -1;
     }
@@ -700,8 +739,12 @@ static int shared_upload(renderer_t *r,unsigned idx,const void *pixels,draw_metr
     return glGetError()==GL_NO_ERROR?0:-1;
 }
 static int shared_draw(renderer_t *r,shared_output_t *out,uint64_t timestamp,draw_metrics_t *metrics){
-    if(!eglMakeCurrent(r->d,out->surface,out->surface,r->c))return -1;
     state_t *state=out->stats;
+    uint64_t current_start=now_ns();
+    EGLBoolean current=eglMakeCurrent(r->d,out->surface,out->surface,r->c);
+    atomic_fetch_add(&state->make_current_total_ns,now_ns()-current_start);
+    atomic_fetch_add(&state->make_current_count,1);
+    if(!current)return -1;
     uint64_t start=now_ns();
     glUseProgram(r->program);glUniform1i(r->sampler,0);
     glUniform2f(r->crop_center,atomic_load(&state->crop_x),atomic_load(&state->crop_y));
@@ -712,8 +755,9 @@ static int shared_draw(renderer_t *r,shared_output_t *out,uint64_t timestamp,dra
     glUniform1i(r->shape,atomic_load(&state->shape));
     glUniform1i(r->quarter_turns,atomic_load(&state->quarter_turns));
     glUniform1i(r->custom_crop,atomic_load(&state->custom_crop));
-    glViewport(0,0,out->width,out->height);glClearColor(0,0,0,0);
-    glClear(GL_COLOR_BUFFER_BIT);glDrawArrays(GL_TRIANGLES,0,3);
+    /* The fullscreen triangle writes every pixel, including the transparent mask.
+     * Clearing first only adds another full-surface GPU pass per output. */
+    glViewport(0,0,out->width,out->height);glDrawArrays(GL_TRIANGLES,0,3);
     if(state->recordable)overlay_draw(r,state,out->width,out->height);
     metrics->draw_ns=now_ns()-start;
     if(state->recordable&&r->presentation_time)r->presentation_time(r->d,out->surface,(EGLnsecsANDROID)timestamp);
@@ -772,12 +816,18 @@ static void *shared_stream_thread(void *argument){
         pthread_mutex_unlock(&camera->mutex);
         if(!due_count){record_hold(&recorders[camera->input],acquired_ns,frame.idx);api.release(cam,frame.idx);continue;}
         int cpu_reads=memory[frame.idx].cached&&r.upload_mode!=UPLOAD_DMABUF_RGBA;
-        if(cpu_reads&&sync_cpu_buffer(memory[frame.idx].fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_READ)){
+        uint64_t sync_start=now_ns();
+        int sync_failed=cpu_reads&&sync_cpu_buffer(memory[frame.idx].fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_READ);
+        if(cpu_reads){atomic_fetch_add(&recorders[camera->input].sync_total_ns,now_ns()-sync_start);atomic_fetch_add(&recorders[camera->input].sync_count,1);}
+        if(sync_failed){
             record_hold(&recorders[camera->input],acquired_ns,frame.idx);api.release(cam,frame.idx);
             snprintf(error,sizeof(error),"ION cache sync failed");break;
         }
-        draw_metrics_t upload={0};int failed=shared_upload(&r,frame.idx,memory[frame.idx].address,&upload);
-        if(cpu_reads&&sync_cpu_buffer(memory[frame.idx].fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_READ))failed=1;
+        draw_metrics_t upload={0};int failed=shared_upload(&r,frame.idx,memory[frame.idx].address,&upload,&recorders[camera->input]);
+        sync_start=now_ns();
+        sync_failed=cpu_reads&&sync_cpu_buffer(memory[frame.idx].fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_READ);
+        if(cpu_reads){atomic_fetch_add(&recorders[camera->input].sync_total_ns,now_ns()-sync_start);atomic_fetch_add(&recorders[camera->input].sync_count,1);}
+        if(sync_failed)failed=1;
         if(failed){record_hold(&recorders[camera->input],acquired_ns,frame.idx);api.release(cam,frame.idx);snprintf(error,sizeof(error),"ION/GPU upload failed");break;}
         /* HUD is drawn first so encoder backpressure cannot delay its current frame. */
         pthread_mutex_lock(&camera->mutex);
@@ -819,7 +869,12 @@ static void *shared_stream_thread(void *argument){
                 api.release(cam,frame.idx);snprintf(error,sizeof(error),"GPU fence failed");break;
             }
             glFlush();
-        }else{record_hold(&recorders[camera->input],acquired_ns,frame.idx);api.release(cam,frame.idx);}
+        }else{
+            record_hold(&recorders[camera->input],acquired_ns,frame.idx);
+            uint64_t release_start=now_ns();api.release(cam,frame.idx);
+            atomic_fetch_add(&recorders[camera->input].release_total_ns,now_ns()-release_start);
+            atomic_fetch_add(&recorders[camera->input].release_count,1);
+        }
     }
 fail:
     if(r.d!=EGL_NO_DISPLAY){

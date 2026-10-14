@@ -16,6 +16,7 @@ import android.content.pm.ServiceInfo
 import android.os.IBinder
 import android.os.Process
 import android.os.Debug
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -162,6 +163,13 @@ class DashcamService : Service() {
         statsJob?.cancel()
         statsJob = scope.launch {
             val previous = mutableMapOf<Int, Pair<Long, Long>>()
+            val previousTiming = mutableMapOf<Int, LongArray>()
+            val previousMux = mutableMapOf<Int, Pair<Long, Long>>()
+            fun stageUs(current: LongArray, old: LongArray?, index: Int): Long {
+                val total = (current.getOrElse(index) { 0 } - (old?.getOrElse(index) { 0 } ?: 0)).coerceAtLeast(0)
+                val count = (current.getOrElse(index + 1) { 0 } - (old?.getOrElse(index + 1) { 0 } ?: 0)).coerceAtLeast(0)
+                return if (count > 0) total / count / 1_000 else 0
+            }
             var usedBytes = RecordingStore.usedBytes(this@DashcamService)
             var tick = 0
             var previousSampleElapsed = SystemClock.elapsedRealtime()
@@ -176,8 +184,10 @@ class DashcamService : Service() {
                     previousStamp = stamp
                 }
                 val now = System.nanoTime()
+                val rawStats = mutableMapOf<Int, LongArray>()
                 val cameras = config.cameraIds.associateWith { id ->
                     val stats = runCatching { remote.stats(id) }.getOrDefault(longArrayOf())
+                    rawStats[id] = stats
                     val frames = stats.getOrElse(1) { 0 }
                     val old = previous[id] ?: (frames to now)
                     val fps = (frames - old.first).coerceAtLeast(0) /
@@ -268,11 +278,14 @@ class DashcamService : Service() {
                         append(" qcarcamGraphicsKb=").append(captureRuntime.getOrElse(4) { -1 })
                         append(" systemAvailableBytes=").append(systemMemory.availMem)
                         append(" systemLowMemory=").append(systemMemory.lowMemory)
+                        append(" thermalStatus=").append(getSystemService(PowerManager::class.java)?.currentThermalStatus ?: -1)
                         append(" freeStorageBytes=").append(filesDir.usableSpace)
                         append(" archiveBytes=").append(usedBytes)
                         config.cameraIds.sorted().forEach { id ->
                             val c = cameras[id]
                             val encoder = encoders[id]
+                            val stages = rawStats[id] ?: longArrayOf()
+                            val oldStages = previousTiming[id]
                             append(" | input=$id fps=").append("%.1f".format(Locale.US, c?.fps ?: 0.0))
                             append(" qFrames=").append(c?.frames ?: 0)
                             append(" timeouts=").append(c?.timeouts ?: 0)
@@ -283,6 +296,25 @@ class DashcamService : Service() {
                             append(" segments=").append(encoder?.completedSegments ?: 0)
                             append(" drainAlive=").append(encoder?.drainAlive ?: false)
                             append(" error=").append(c?.error?.replace(' ', '_') ?: "none")
+                            if (stages.size >= 46) {
+                                append(" stageUs[get/copy/upload/draw/swap/hold/sync/pboWait/map/tex/makeCurrent/release/unmap]=")
+                                append((20..44 step 2).joinToString("/") { stageUs(stages, oldStages, it).toString() })
+                                append(" stageSamples=").append((stages[25] - (oldStages?.getOrElse(25) { 0 } ?: 0)).coerceAtLeast(0))
+                                append(" maxUs[get/upload/draw/swap]=")
+                                append(stages.getOrElse(6) { 0 }).append('/')
+                                append(stages.getOrElse(18) { 0 }).append('/')
+                                append(stages.getOrElse(10) { 0 }).append('/')
+                                append(stages.getOrElse(12) { 0 })
+                            }
+                            if (encoder != null) {
+                                val oldMux = previousMux[id] ?: (0L to 0L)
+                                val writes = (encoder.muxWriteCount - oldMux.second).coerceAtLeast(0)
+                                val writeNs = (encoder.muxWriteTotalNs - oldMux.first).coerceAtLeast(0)
+                                append(" muxWriteAvgUs=").append(if (writes > 0) writeNs / writes / 1_000 else 0)
+                                append(" muxWriteMaxUs=").append(encoder.muxWriteMaxNs / 1_000)
+                                previousMux[id] = encoder.muxWriteTotalNs to encoder.muxWriteCount
+                            }
+                            previousTiming[id] = stages
                         }
                     })
                     previousSampleElapsed = elapsed
@@ -357,7 +389,10 @@ class DashcamService : Service() {
             putExtra(EXTRA_MAX_GAP_MS, cameras.map(CameraRecordingState::maxGapMs).toDoubleArray())
             putExtra(EXTRA_TIMEOUTS, cameras.map(CameraRecordingState::timeouts).toLongArray())
         })
-        val recordingVideo = state.recording && cameras.any { it.recording && it.frames > 0 }
+        val now = SystemClock.elapsedRealtime()
+        val recordingVideo = state.recording && encoders.values.any {
+            it.outputFrames > 0 && it.lastOutputElapsedMs > 0 && now - it.lastOutputElapsedMs <= 3_000L
+        }
         GCamHealthReporter.send(
             this,
             GCamHealthReporter.SOURCE_RECORDER,
@@ -393,7 +428,7 @@ class DashcamService : Service() {
         private const val NOTIFICATION_ID = 360
         private const val PERF_TAG = "GCAM_PERF"
         private const val PERF_LOG_INTERVAL_SECONDS = 5
-        private const val DIAGNOSTIC_INTERVAL_SECONDS = 15
+        private const val DIAGNOSTIC_INTERVAL_SECONDS = 5
         private const val MIN_AVAILABLE_RAM_BYTES = 512L * 1024 * 1024
         private const val EXTRA_SELECTED_CAMERAS = "selected_cameras"
         private const val EXTRA_WIDTH = "recording_width"

@@ -26,4 +26,6 @@ interface IQCarCamCapture {
     void warmInput(int inputId, boolean enabled);
     /** Small ASCII label drawn by GLES only into the encoder Surface. */
     void setRecorderOverlay(int inputId, String text);
+    /** ANHUD projection client lifecycle, independent of active turn-camera output. */
+    void setHudClientActive(int slot, boolean active);
 }

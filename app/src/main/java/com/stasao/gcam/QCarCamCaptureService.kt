@@ -10,7 +10,9 @@ import android.os.Looper
 import android.os.Binder
 import android.os.Parcel
 import android.view.Surface
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
+import java.util.Locale
 
 /**
  * Owns all closed QCarCam/HIDL libraries in an isolated process. Keeping them out
@@ -20,9 +22,16 @@ import androidx.core.app.NotificationCompat
 class QCarCamCaptureService : Service() {
     private val healthHandler = Handler(Looper.getMainLooper())
     private val hudRequested = BooleanArray(2)
+    private val hudClientActive = BooleanArray(2)
+    private var hudClientKnown = false
+    private val hudInputs = IntArray(2) { -1 }
     private val hudErrors = arrayOfNulls<String>(2)
+    private val previousHudStats = Array(2) { longArrayOf() }
+    private var previousHudLogMs = 0L
+    private var lastLiveVideoAtMs = 0L
     @Volatile private var hudConnected = false
     @Volatile private var hudVideoReceived = false
+    @Volatile private var hudEverVideoReceived = false
     @Volatile private var hudError: String? = null
     private val healthHeartbeat = object : Runnable {
         override fun run() {
@@ -82,6 +91,8 @@ class QCarCamCaptureService : Service() {
             if (slot !in 0..3) return "Некорректный HUD slot"
             if (slot < 2) {
                 hudRequested[slot] = true
+                hudInputs[slot] = inputId
+                previousHudStats[slot] = longArrayOf()
                 hudConnected = true
                 hudErrors[slot] = null
             }
@@ -90,9 +101,10 @@ class QCarCamCaptureService : Service() {
                 cropZoom, fisheye, shape
             )
             if (slot < 2) {
-                hudErrors[slot] = result.takeIf {
-                    it.contains("ошиб", true) || it.contains("занят", true) || it.contains("недоступ", true)
-                }
+                val accepted = result.contains("Запуск принят", ignoreCase = true)
+                hudRequested[slot] = accepted
+                if (!accepted) hudInputs[slot] = -1
+                hudErrors[slot] = result.takeUnless { accepted }
                 publishHudHealth()
             }
             return result
@@ -117,6 +129,8 @@ class QCarCamCaptureService : Service() {
             if (slot !in 0..3) return "Некорректный HUD slot"
             if (slot < 2) {
                 hudRequested[slot] = true
+                hudInputs[slot] = inputId
+                previousHudStats[slot] = longArrayOf()
                 hudConnected = true
                 hudErrors[slot] = null
             }
@@ -125,9 +139,10 @@ class QCarCamCaptureService : Service() {
                 cropWidth, cropHeight, fisheye, shape, quarterTurns
             )
             if (slot < 2) {
-                hudErrors[slot] = result.takeIf {
-                    it.contains("ошиб", true) || it.contains("занят", true) || it.contains("недоступ", true)
-                }
+                val accepted = result.contains("Запуск принят", ignoreCase = true)
+                hudRequested[slot] = accepted
+                if (!accepted) hudInputs[slot] = -1
+                hudErrors[slot] = result.takeUnless { accepted }
                 publishHudHealth()
             }
             return result
@@ -147,6 +162,7 @@ class QCarCamCaptureService : Service() {
             NativeQCarCam.hudStop(slot)
             if (slot < 2) {
                 hudRequested[slot] = false
+                hudInputs[slot] = -1
                 hudErrors[slot] = null
                 publishHudHealth()
             }
@@ -155,10 +171,24 @@ class QCarCamCaptureService : Service() {
         override fun hudStatus(slot: Int): String = NativeQCarCam.hudStatus(slot)
 
         override fun hudStats(slot: Int): LongArray = NativeQCarCam.hudStats(slot)
+
+        override fun setHudClientActive(slot: Int, active: Boolean) {
+            if (slot !in 0..1) return
+            hudClientKnown = true
+            hudClientActive[slot] = active
+            hudConnected = hudClientActive.any { it }
+            if (!hudConnected) {
+                hudEverVideoReceived = false
+                hudVideoReceived = false
+                lastLiveVideoAtMs = 0L
+            }
+            publishHudHealth()
+        }
     }
 
     override fun onCreate() {
         super.onCreate()
+        previousHudLogMs = SystemClock.elapsedRealtime()
         healthHandler.post(healthHeartbeat)
     }
 
@@ -185,9 +215,14 @@ class QCarCamCaptureService : Service() {
         NativeQCarCam.warmInput(0, false)
         NativeQCarCam.warmInput(1, false)
         hudRequested.fill(false)
+        hudClientActive.fill(false)
+        hudClientKnown = false
+        hudInputs.fill(-1)
         hudErrors.fill(null)
         hudConnected = false
         hudVideoReceived = false
+        hudEverVideoReceived = false
+        lastLiveVideoAtMs = 0L
         hudError = null
         publishHudHealth()
         return super.onUnbind(intent)
@@ -199,12 +234,21 @@ class QCarCamCaptureService : Service() {
     }
 
     private fun publishHudHealth() {
-        var anyVideo = false
+        val nowMs = SystemClock.elapsedRealtime()
+        val nowNs = SystemClock.elapsedRealtimeNanos()
+        val sampled = Array(2) { longArrayOf() }
+        var anyLiveVideo = false
+        var activeRequests = false
         for (slot in 0..1) {
-            if (!hudRequested[slot] || hudErrors[slot] != null) continue
+            if (!hudRequested[slot]) continue
+            activeRequests = true
             val stats = runCatching { NativeQCarCam.hudStats(slot) }.getOrDefault(longArrayOf())
-            if (stats.getOrElse(1) { 0L } > 0L) {
-                anyVideo = true
+            sampled[slot] = stats
+            val lastFrameNs = stats.getOrElse(4) { 0L }
+            val frameFresh = lastFrameNs > 0L && nowNs >= lastFrameNs &&
+                nowNs - lastFrameNs <= FRAME_STALE_NS
+            if (stats.getOrElse(0) { 0L } == 1L && frameFresh) {
+                anyLiveVideo = true
                 hudErrors[slot] = null
             } else {
                 val status = runCatching { NativeQCarCam.hudStatus(slot) }.getOrNull().orEmpty()
@@ -214,8 +258,51 @@ class QCarCamCaptureService : Service() {
                 } ?: hudErrors[slot]
             }
         }
-        hudVideoReceived = anyVideo
-        hudError = hudErrors.firstOrNull { it != null }
+        if (anyLiveVideo) {
+            hudEverVideoReceived = true
+            lastLiveVideoAtMs = nowMs
+        }
+        hudVideoReceived = if (activeRequests)
+            anyLiveVideo || (hudEverVideoReceived && nowMs - lastLiveVideoAtMs <= ACTIVE_SWITCH_GRACE_MS)
+        else hudEverVideoReceived
+        if (hudClientKnown && !hudConnected) hudVideoReceived = false
+        // An old failed slot must not turn the dot red after the turn signal is off.
+        hudError = if (anyLiveVideo) null else (0..1).firstNotNullOfOrNull { slot ->
+            hudErrors[slot].takeIf { hudRequested[slot] }
+        }
+        if (nowMs - previousHudLogMs >= HUD_LOG_INTERVAL_MS) {
+            val windowMs = (nowMs - previousHudLogMs).coerceAtLeast(1L)
+            RecorderDiagnostics.recordHud(this, buildString {
+                append("hud_sample connected=").append(hudConnected)
+                append(" active=").append(activeRequests)
+                append(" videoNow=").append(anyLiveVideo)
+                append(" videoEver=").append(hudEverVideoReceived)
+                append(" error=").append(hudError?.replace(' ', '_') ?: "none")
+                for (slot in 0..1) {
+                    val stats = sampled[slot]
+                    val old = previousHudStats[slot]
+                    val frames = stats.getOrElse(1) { 0L }
+                    val previousFrames = old.getOrElse(1) { 0L }
+                    val fps = if (hudRequested[slot])
+                        (frames - previousFrames).coerceAtLeast(0L) * 1000.0 / windowMs else 0.0
+                    val lastNs = stats.getOrElse(4) { 0L }
+                    val ageMs = if (lastNs > 0L && nowNs >= lastNs) (nowNs - lastNs) / 1_000_000 else -1L
+                    append(" | projectionSlot=").append(slot)
+                    append(" input=").append(hudInputs[slot])
+                    append(" requested=").append(hudRequested[slot])
+                    append(" fps=").append(String.format(Locale.US, "%.1f", fps))
+                    append(" frames=").append(frames)
+                    append(" firstFrameMs=").append(stats.getOrElse(3) { -1L })
+                    append(" frameAgeMs=").append(ageMs)
+                    append(" maxGapMs=").append(stats.getOrElse(15) { 0L } / 1_000)
+                    append(" swapAvgUs=").append(stageAverageUs(stats, old, 28))
+                    append(" drawAvgUs=").append(stageAverageUs(stats, old, 26))
+                    append(" status=").append(hudErrors[slot]?.replace(' ', '_') ?: "ok")
+                    previousHudStats[slot] = stats
+                }
+            })
+            previousHudLogMs = nowMs
+        }
         GCamHealthReporter.send(
             this,
             GCamHealthReporter.SOURCE_HUD,
@@ -225,9 +312,18 @@ class QCarCamCaptureService : Service() {
         )
     }
 
+    private fun stageAverageUs(current: LongArray, old: LongArray, index: Int): Long {
+        val total = (current.getOrElse(index) { 0L } - old.getOrElse(index) { 0L }).coerceAtLeast(0L)
+        val count = (current.getOrElse(index + 1) { 0L } - old.getOrElse(index + 1) { 0L }).coerceAtLeast(0L)
+        return if (count > 0L) total / count / 1_000 else 0L
+    }
+
     companion object {
         const val ACTION_KEEP_ALIVE = "com.stasao.gcam.KEEP_ALIVE"
         const val HEALTH_INTERVAL_MS = 1_000L
+        const val HUD_LOG_INTERVAL_MS = 5_000L
+        const val ACTIVE_SWITCH_GRACE_MS = 2_500L
+        const val FRAME_STALE_NS = 2_500_000_000L
         const val HEALTH_CHANNEL_ID = "gcam_anhud_bridge"
         const val HEALTH_NOTIFICATION_ID = 361
     }

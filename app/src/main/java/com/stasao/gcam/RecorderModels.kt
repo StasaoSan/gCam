@@ -1,11 +1,11 @@
 package com.stasao.gcam
 
 data class RecorderConfig(
-    val cameraIds: Set<Int> = setOf(2, 3),
-    val width: Int = 960,
-    val height: Int = 600,
-    val fps: Int = 20,
-    val bitrateMbps: Int = 3,
+    val cameraIds: Set<Int> = setOf(0, 1, 2, 3),
+    val width: Int = 640,
+    val height: Int = 400,
+    val fps: Int = 15,
+    val bitrateMbps: Int = 2,
     val segmentMinutes: Int = 2,
     val storageLimitGb: Int = 40,
     val stampTime: Boolean = false,

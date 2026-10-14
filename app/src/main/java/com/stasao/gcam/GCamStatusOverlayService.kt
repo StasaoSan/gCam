@@ -29,7 +29,13 @@ class GCamStatusOverlayService : Service() {
     private var layout: WindowManager.LayoutParams? = null
     private val handler = Handler(Looper.getMainLooper())
     private var lastHudAt = 0L
+    private var lastHudReadyAt = 0L
     private var lastRecorderAt = 0L
+    private var lastStatusLogAt = 0L
+    private var lastColor = 0
+    private var hudConnected = false
+    private var hudVideoReceived = false
+    private var hudError: String? = null
     private var hudReady = false
     private var recordingRequested = false
     private var recordingVideo = false
@@ -41,9 +47,11 @@ class GCamStatusOverlayService : Service() {
             when (intent.getStringExtra(GCamHealthReporter.EXTRA_SOURCE)) {
                 GCamHealthReporter.SOURCE_HUD -> {
                     lastHudAt = now
-                    hudReady = intent.getBooleanExtra(GCamHealthReporter.EXTRA_HUD_CONNECTED, false) &&
-                        intent.getBooleanExtra(GCamHealthReporter.EXTRA_VIDEO_RECEIVED, false) &&
-                        intent.getStringExtra(GCamHealthReporter.EXTRA_ERROR).isNullOrBlank()
+                    hudConnected = intent.getBooleanExtra(GCamHealthReporter.EXTRA_HUD_CONNECTED, false)
+                    hudVideoReceived = intent.getBooleanExtra(GCamHealthReporter.EXTRA_VIDEO_RECEIVED, false)
+                    hudError = intent.getStringExtra(GCamHealthReporter.EXTRA_ERROR)
+                    hudReady = hudConnected && hudVideoReceived && hudError.isNullOrBlank()
+                    if (hudReady) lastHudReadyAt = now
                 }
                 GCamHealthReporter.SOURCE_RECORDER -> {
                     lastRecorderAt = now
@@ -171,11 +179,33 @@ class GCamStatusOverlayService : Service() {
     private fun updateColor(now: Long = SystemClock.elapsedRealtime()) {
         val hudFresh = now - lastHudAt <= HEALTH_TIMEOUT_MS
         val recorderFresh = now - lastRecorderAt <= HEALTH_TIMEOUT_MS
+        // ANHUD briefly drops its HUD slots while switching sides. Keep the last
+        // healthy state during that hand-off, but never mask an explicit error.
+        val hudSwitching = lastHudReadyAt > 0L &&
+            now - lastHudReadyAt <= HUD_SWITCH_GRACE_MS && hudError.isNullOrBlank()
         val color = when {
-            !hudFresh || !hudReady -> GCamStatusDotView.STATUS_ERROR
+            !hudFresh || (!hudReady && !hudSwitching) -> GCamStatusDotView.STATUS_ERROR
             recordingRequested && (!recorderFresh || !recordingVideo) -> GCamStatusDotView.STATUS_ERROR
             recorderFresh && recordingVideo -> GCamStatusDotView.STATUS_RECORDING
             else -> GCamStatusDotView.STATUS_READY
+        }
+        if (color != lastColor || now - lastStatusLogAt >= STATUS_LOG_INTERVAL_MS) {
+            RecorderDiagnostics.recordStatus(this, buildString {
+                append("status_dot color=").append(when (color) {
+                    GCamStatusDotView.STATUS_ERROR -> "red"
+                    GCamStatusDotView.STATUS_RECORDING -> "green"
+                    else -> "orange"
+                })
+                append(" hudFresh=").append(hudFresh)
+                append(" hudConnected=").append(hudConnected)
+                append(" hudVideo=").append(hudVideoReceived)
+                append(" hudError=").append(hudError?.replace(' ', '_') ?: "none")
+                append(" recorderFresh=").append(recorderFresh)
+                append(" recordingRequested=").append(recordingRequested)
+                append(" recordingVideo=").append(recordingVideo)
+            })
+            lastColor = color
+            lastStatusLogAt = now
         }
         dot?.setStatusColor(color)
     }
@@ -233,6 +263,8 @@ class GCamStatusOverlayService : Service() {
         const val EXTRA_Y = "y_fraction"
         const val TOUCH_SIZE_DP = 36
         const val HEALTH_TIMEOUT_MS = 5_000L
+        const val HUD_SWITCH_GRACE_MS = 1_500L
+        const val STATUS_LOG_INTERVAL_MS = 5_000L
         const val CHANNEL_ID = "gcam_status_overlay"
         const val NOTIFICATION_ID = 362
     }

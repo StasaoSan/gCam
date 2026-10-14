@@ -32,6 +32,12 @@ class CameraEncoder(
         private set
     @Volatile var completedSegments: Int = 0
         private set
+    @Volatile var muxWriteTotalNs: Long = 0
+        private set
+    @Volatile var muxWriteCount: Long = 0
+        private set
+    @Volatile var muxWriteMaxNs: Long = 0
+        private set
     val drainAlive: Boolean get() = drainThread?.isAlive == true
 
     private lateinit var capture: IQCarCamCapture
@@ -51,6 +57,9 @@ class CameraEncoder(
                 setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
             }
             codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            RecorderDiagnostics.record(context,
+                "encoder_config input=$inputId name=${codec.name} hardware=${codec.codecInfo.isHardwareAccelerated} " +
+                    "size=${config.width}x${config.height} fps=${config.fps} bitrateMbps=${config.bitrateMbps}")
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             inputSurface = codec.createInputSurface()
             codec.start()
@@ -159,7 +168,12 @@ class CameraEncoder(
                             buffer.position(info.offset)
                             buffer.limit(info.offset + info.size)
                             writeInfo.set(info.offset, info.size, info.presentationTimeUs - segmentFirstPts, info.flags)
+                            val writeStart = System.nanoTime()
                             muxer?.writeSampleData(track, buffer, writeInfo)
+                            val writeNs = System.nanoTime() - writeStart
+                            muxWriteTotalNs += writeNs
+                            muxWriteCount++
+                            if (writeNs > muxWriteMaxNs) muxWriteMaxNs = writeNs
                             segmentHasSamples = true
                             outputFrames++
                             outputBytes += info.size

@@ -18,14 +18,21 @@ object RecorderDiagnostics {
 
     private fun directory(context: Context) = File(context.filesDir, "diagnostics")
 
-    fun record(context: Context, event: String) {
+    fun record(context: Context, event: String) = append(context, "recorder", event)
+
+    /** The camera and overlay processes use separate files to avoid cross-process append races. */
+    fun recordHud(context: Context, event: String) = append(context, "hud", event)
+
+    fun recordStatus(context: Context, event: String) = append(context, "status", event)
+
+    private fun append(context: Context, source: String, event: String) {
         Log.i(TAG, event)
         runCatching {
             synchronized(lock) {
                 val dir = directory(context).apply { mkdirs() }
-                val current = File(dir, "recorder.log")
+                val current = File(dir, "$source.log")
                 if (current.length() >= MAX_BYTES) {
-                    val previous = File(dir, "recorder-previous.log")
+                    val previous = File(dir, "$source-previous.log")
                     if (previous.exists()) previous.delete()
                     current.renameTo(previous)
                 }
@@ -41,9 +48,16 @@ object RecorderDiagnostics {
             val outDir = File(context.cacheDir, "diagnostics").apply { mkdirs() }
             val file = File(outDir, "gCam-recorder-diagnostics.txt")
             file.outputStream().buffered().use { output ->
-                listOf("recorder-previous.log", "recorder.log").forEach { name ->
+                listOf(
+                    "recorder-previous.log", "recorder.log",
+                    "hud-previous.log", "hud.log",
+                    "status-previous.log", "status.log"
+                ).forEach { name ->
                     val source = File(dir, name)
-                    if (source.isFile) source.inputStream().buffered().use { it.copyTo(output) }
+                    if (source.isFile) {
+                        output.write("\n# $name\n".toByteArray(Charsets.UTF_8))
+                        source.inputStream().buffered().use { it.copyTo(output) }
+                    }
                 }
             }
             file
