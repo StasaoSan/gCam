@@ -28,4 +28,6 @@ interface IQCarCamCapture {
     void setRecorderOverlay(int inputId, String text);
     /** ANHUD projection client lifecycle, independent of active turn-camera output. */
     void setHudClientActive(int slot, boolean active);
+    /** gBlind reports the independent instrument-cluster path; never grants recorder control. */
+    void reportBlindHealth(boolean enabled, boolean connected, boolean video, String error);
 }

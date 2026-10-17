@@ -1,5 +1,7 @@
 package com.stasao.gcam
 
+enum class RecordingStorage { EXTERNAL, INTERNAL }
+
 data class RecorderConfig(
     val cameraIds: Set<Int> = setOf(0, 1, 2, 3),
     val width: Int = 640,
@@ -8,6 +10,7 @@ data class RecorderConfig(
     val bitrateMbps: Int = 2,
     val segmentMinutes: Int = 2,
     val storageLimitGb: Int = 40,
+    val storage: RecordingStorage = RecordingStorage.EXTERNAL,
     val stampTime: Boolean = false,
     val stampGps: Boolean = false,
     val stampSpeed: Boolean = false
@@ -38,7 +41,8 @@ data class RecordingFile(
     val sizeBytes: Long,
     val modifiedAt: Long,
     val protected: Boolean,
-    val durationMs: Long = 0
+    val durationMs: Long = 0,
+    val storage: RecordingStorage = RecordingStorage.INTERNAL
 )
 
 val recorderCameraNames = mapOf(0 to "Левая", 1 to "Правая", 2 to "Перед", 3 to "Зад")

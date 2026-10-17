@@ -12,9 +12,11 @@ object GCamHealthReporter {
     const val EXTRA_RECORDING = "recording"
     const val EXTRA_RECORDING_VIDEO = "recording_video"
     const val EXTRA_ERROR = "error"
+    const val EXTRA_ENABLED = "enabled"
 
     const val SOURCE_HUD = "hud"
     const val SOURCE_RECORDER = "recorder"
+    const val SOURCE_BLIND = "blind"
 
     fun send(
         context: Context,
@@ -23,6 +25,7 @@ object GCamHealthReporter {
         videoReceived: Boolean? = null,
         recording: Boolean? = null,
         recordingVideo: Boolean? = null,
+        enabled: Boolean? = null,
         error: String? = null
     ) {
         context.sendBroadcast(Intent(ACTION_HEALTH).setPackage(context.packageName).apply {
@@ -32,6 +35,7 @@ object GCamHealthReporter {
             videoReceived?.let { putExtra(EXTRA_VIDEO_RECEIVED, it) }
             recording?.let { putExtra(EXTRA_RECORDING, it) }
             recordingVideo?.let { putExtra(EXTRA_RECORDING_VIDEO, it) }
+            enabled?.let { putExtra(EXTRA_ENABLED, it) }
             error?.takeIf(String::isNotBlank)?.let { putExtra(EXTRA_ERROR, it) }
         })
     }

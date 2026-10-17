@@ -124,7 +124,7 @@ class CameraEncoder(
         fun openSegment(format: MediaFormat) {
             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
             val name = "cam${inputId}_${stamp}_s${sessionId}.mp4"
-            val segment = RecordingStore.createSegment(context, inputId, name)
+            val segment = RecordingStore.createSegment(context, inputId, name, storage = config.storage)
             RecorderDiagnostics.record(context, "segment_open input=$inputId name=$name")
             target = segment
             try {

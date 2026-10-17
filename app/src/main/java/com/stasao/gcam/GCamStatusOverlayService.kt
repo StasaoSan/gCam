@@ -31,9 +31,15 @@ class GCamStatusOverlayService : Service() {
     private var lastHudAt = 0L
     private var lastHudReadyAt = 0L
     private var lastRecorderAt = 0L
+    private var lastBlindAt = 0L
+    private var blindEnabled = false
+    private var blindConnected = false
+    private var blindVideo = false
+    private var blindError: String? = null
     private var lastStatusLogAt = 0L
     private var lastColor = 0
     private var hudConnected = false
+    private var hudEnabled = false
     private var hudVideoReceived = false
     private var hudError: String? = null
     private var hudReady = false
@@ -47,6 +53,7 @@ class GCamStatusOverlayService : Service() {
             when (intent.getStringExtra(GCamHealthReporter.EXTRA_SOURCE)) {
                 GCamHealthReporter.SOURCE_HUD -> {
                     lastHudAt = now
+                    hudEnabled = intent.getBooleanExtra(GCamHealthReporter.EXTRA_ENABLED, false)
                     hudConnected = intent.getBooleanExtra(GCamHealthReporter.EXTRA_HUD_CONNECTED, false)
                     hudVideoReceived = intent.getBooleanExtra(GCamHealthReporter.EXTRA_VIDEO_RECEIVED, false)
                     hudError = intent.getStringExtra(GCamHealthReporter.EXTRA_ERROR)
@@ -58,6 +65,13 @@ class GCamStatusOverlayService : Service() {
                     recordingRequested = intent.getBooleanExtra(GCamHealthReporter.EXTRA_RECORDING, false)
                     recordingVideo = recordingRequested &&
                         intent.getBooleanExtra(GCamHealthReporter.EXTRA_RECORDING_VIDEO, false)
+                }
+                GCamHealthReporter.SOURCE_BLIND -> {
+                    lastBlindAt = now
+                    blindEnabled = intent.getBooleanExtra(GCamHealthReporter.EXTRA_ENABLED, false)
+                    blindConnected = intent.getBooleanExtra(GCamHealthReporter.EXTRA_HUD_CONNECTED, false)
+                    blindVideo = intent.getBooleanExtra(GCamHealthReporter.EXTRA_VIDEO_RECEIVED, false)
+                    blindError = intent.getStringExtra(GCamHealthReporter.EXTRA_ERROR)
                 }
             }
             updateColor(now)
@@ -184,7 +198,10 @@ class GCamStatusOverlayService : Service() {
         val hudSwitching = lastHudReadyAt > 0L &&
             now - lastHudReadyAt <= HUD_SWITCH_GRACE_MS && hudError.isNullOrBlank()
         val color = when {
-            !hudFresh || (!hudReady && !hudSwitching) -> GCamStatusDotView.STATUS_ERROR
+            (!hudEnabled && !blindEnabled) ||
+                (hudEnabled && (!hudFresh || (!hudReady && !hudSwitching))) -> GCamStatusDotView.STATUS_ERROR
+            blindEnabled && (now - lastBlindAt > HEALTH_TIMEOUT_MS || !blindConnected ||
+                !blindVideo || !blindError.isNullOrBlank()) -> GCamStatusDotView.STATUS_ERROR
             recordingRequested && (!recorderFresh || !recordingVideo) -> GCamStatusDotView.STATUS_ERROR
             recorderFresh && recordingVideo -> GCamStatusDotView.STATUS_RECORDING
             else -> GCamStatusDotView.STATUS_READY
@@ -198,8 +215,13 @@ class GCamStatusOverlayService : Service() {
                 })
                 append(" hudFresh=").append(hudFresh)
                 append(" hudConnected=").append(hudConnected)
+                append(" hudEnabled=").append(hudEnabled)
                 append(" hudVideo=").append(hudVideoReceived)
                 append(" hudError=").append(hudError?.replace(' ', '_') ?: "none")
+                append(" blindEnabled=").append(blindEnabled)
+                append(" blindConnected=").append(blindConnected)
+                append(" blindVideo=").append(blindVideo)
+                append(" blindError=").append(blindError?.replace(' ', '_') ?: "none")
                 append(" recorderFresh=").append(recorderFresh)
                 append(" recordingRequested=").append(recordingRequested)
                 append(" recordingVideo=").append(recordingVideo)

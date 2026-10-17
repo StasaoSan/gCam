@@ -9,31 +9,51 @@ import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.os.StatFs
 import android.provider.MediaStore
+import android.provider.DocumentsContract
+import android.os.storage.StorageManager
+import android.os.storage.StorageVolume
 import java.io.File
 
-data class RecordingTarget(val uri: Uri, val descriptor: ParcelFileDescriptor)
+data class RecordingTarget(val uri: Uri, val descriptor: ParcelFileDescriptor, val storage: RecordingStorage)
 data class StorageStats(val totalBytes: Long, val freeBytes: Long, val recordingBytes: Long)
+data class ArchiveMaintenance(val deletedFiles: Int, val usedBytes: Long, val freeBytes: Long,
+                              val ready: Boolean)
+data class RemovableDrive(val volume: StorageVolume?, val id: String, val name: String,
+                          val availableBytes: Long = -1L)
 
 object RecordingStore {
     private const val ROOT = "gCam"
     private const val PROTECTED = "protected"
     const val RESERVED_FREE_BYTES = 2L * 1024 * 1024 * 1024
     private const val GB = 1024L * 1024L * 1024L
-    private val collection: Uri get() = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+    // The synthetic "external" volume may include USB files. Keep the internal
+    // archive scoped to primary storage so its quota never counts or deletes USB clips.
+    private val collection: Uri get() = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
     private val rootPath = "${Environment.DIRECTORY_MOVIES}/$ROOT/"
 
-    fun createSegment(context: Context, inputId: Int, name: String, protected: Boolean = false): RecordingTarget {
+    @Synchronized fun createSegment(context: Context, inputId: Int, name: String,
+                                    protected: Boolean = false,
+                                    storage: RecordingStorage = RecordingStorage.INTERNAL): RecordingTarget {
+        if (storage == RecordingStorage.EXTERNAL) {
+            validateExternal(context)?.let { error(it) }
+            return createMediaSegment(context, externalCollection(context), inputId, name, protected, storage)
+        }
+        return createMediaSegment(context, collection, inputId, name, protected, storage)
+    }
+
+    private fun createMediaSegment(context: Context, destination: Uri, inputId: Int, name: String,
+                                   protected: Boolean, storage: RecordingStorage): RecordingTarget {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
             put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
             put(MediaStore.MediaColumns.RELATIVE_PATH, if (protected) "$rootPath$PROTECTED/" else cameraPath(inputId))
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
-        val uri = requireNotNull(context.contentResolver.insert(collection, values)) {
-            "Не удалось создать файл в Movies/gCam"
+        val uri = requireNotNull(context.contentResolver.insert(destination, values)) {
+            "Не удалось создать файл в Movies/gCam на выбранном накопителе"
         }
         return try {
-            RecordingTarget(uri, requireNotNull(context.contentResolver.openFileDescriptor(uri, "w")))
+            RecordingTarget(uri, requireNotNull(context.contentResolver.openFileDescriptor(uri, "w")), storage)
         } catch (t: Throwable) {
             context.contentResolver.delete(uri, null, null)
             throw t
@@ -53,7 +73,11 @@ object RecordingStore {
         context.contentResolver.delete(target.uri, null, null)
     }
 
-    fun list(context: Context): List<RecordingFile> {
+    fun list(context: Context): List<RecordingFile> = listInternal(context) + listExternal(context)
+
+    private fun listInternal(context: Context): List<RecordingFile> = listMedia(context, collection, RecordingStorage.INTERNAL)
+
+    private fun listMedia(context: Context, destination: Uri, storage: RecordingStorage): List<RecordingFile> {
         val projection = arrayOf(
             MediaStore.MediaColumns._ID,
             MediaStore.MediaColumns.DISPLAY_NAME,
@@ -64,7 +88,7 @@ object RecordingStore {
         )
         return buildList {
             context.contentResolver.query(
-                collection, projection,
+                destination, projection,
                 "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? AND ${MediaStore.MediaColumns.IS_PENDING}=0",
                 arrayOf("$rootPath%"),
                 "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
@@ -77,22 +101,28 @@ object RecordingStore {
                 val pathIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH)
                 while (cursor.moveToNext()) {
                     val name = cursor.getString(nameIndex)
+                    if (storage == RecordingStorage.EXTERNAL && !name.matches(RECORDING_NAME)) continue
                     val path = cursor.getString(pathIndex).orEmpty()
                     add(RecordingFile(
-                        ContentUris.withAppendedId(collection, cursor.getLong(idIndex)).toString(),
+                        ContentUris.withAppendedId(destination, cursor.getLong(idIndex)).toString(),
                         name,
                         Regex("cam(\\d)").find(name)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: -1,
                         cursor.getLong(sizeIndex),
                         cursor.getLong(modifiedIndex) * 1000,
                         path.contains("/$PROTECTED/"),
-                        cursor.getLong(durationIndex).coerceAtLeast(0)
+                        cursor.getLong(durationIndex).coerceAtLeast(0),
+                        storage
                     ))
                 }
             }
         }
     }
 
-    fun usedBytes(context: Context): Long = list(context).sumOf(RecordingFile::sizeBytes)
+    fun usedBytes(context: Context, storage: RecordingStorage = RecorderSettings.load(context).storage): Long =
+        listForStorage(context, storage).sumOf(RecordingFile::sizeBytes)
+
+    private fun listForStorage(context: Context, storage: RecordingStorage): List<RecordingFile> =
+        if (storage == RecordingStorage.EXTERNAL) listExternal(context) else listInternal(context)
 
     /** For the player only; metadata fallback may open MP4 files and must run off the UI thread. */
     fun listWithDurations(context: Context): List<RecordingFile> = list(context).map { file ->
@@ -107,51 +137,80 @@ object RecordingStore {
         }
     }
 
-    fun storageStats(context: Context): StorageStats {
-        val stat = StatFs(Environment.getExternalStorageDirectory().absolutePath)
-        return StorageStats(stat.totalBytes, stat.availableBytes, usedBytes(context))
+    fun storageStats(context: Context, storage: RecordingStorage = RecorderSettings.load(context).storage): StorageStats {
+        val drive = if (storage == RecordingStorage.EXTERNAL) selectedDrive(context) else null
+        val path = if (storage == RecordingStorage.INTERNAL) Environment.getExternalStorageDirectory().absolutePath
+                   else drive?.volume?.directory?.absolutePath
+                       ?: drive?.id?.let { "/storage/$it" }?.takeIf { File(it).exists() }
+        val stat = path?.let { runCatching { StatFs(it) }.getOrNull() }
+        return StorageStats(stat?.totalBytes ?: -1L,
+            stat?.availableBytes ?: drive?.availableBytes ?: -1L, usedBytes(context, storage))
     }
 
-    fun maxArchiveGb(context: Context): Int {
-        val stats = storageStats(context)
-        return ((stats.freeBytes + stats.recordingBytes - RESERVED_FREE_BYTES) / GB)
-            .coerceAtLeast(1).coerceAtMost(512).toInt()
+    fun maxArchiveGb(context: Context, storage: RecordingStorage = RecorderSettings.load(context).storage): Int? {
+        val stats = storageStats(context, storage)
+        if (stats.freeBytes < 0) return null
+        val available = (stats.freeBytes / GB) + (stats.recordingBytes / GB) - (RESERVED_FREE_BYTES / GB)
+        return available.coerceAtLeast(1).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
     }
 
-    @Synchronized fun enforceLimit(context: Context, config: RecorderConfig) {
+    @Synchronized fun enforceLimit(context: Context, config: RecorderConfig): ArchiveMaintenance {
         val limit = config.storageLimitGb * GB
-        val deletable = list(context).filterNot(RecordingFile::protected).sortedBy(RecordingFile::modifiedAt)
-        val stats = storageStats(context)
+        val segmentBudget = (config.bitrateMbps.toLong() * 1_000_000L / 8L *
+            config.cameraIds.size.coerceAtLeast(1) * config.segmentMinutes * 60L * 12L / 10L)
+            .coerceAtLeast(32L * 1024 * 1024)
+        val deletable = listForStorage(context, config.storage).filterNot(RecordingFile::protected)
+            .sortedBy(RecordingFile::modifiedAt)
+        val stats = storageStats(context, config.storage)
         var used = stats.recordingBytes
         var available = stats.freeBytes
+        var deleted = 0
         for (recording in deletable) {
-            if (used <= limit && available >= RESERVED_FREE_BYTES) break
+            if (used + segmentBudget <= limit && available >= RESERVED_FREE_BYTES + segmentBudget) break
             if (delete(context, recording)) {
                 used -= recording.sizeBytes
-                available += recording.sizeBytes
+                if (available >= 0) available += recording.sizeBytes
+                deleted++
             }
         }
+        return ArchiveMaintenance(deleted, used, available,
+            used + segmentBudget <= limit && available >= RESERVED_FREE_BYTES + segmentBudget)
     }
 
     @Synchronized fun setProtected(context: Context, recording: RecordingFile, protect: Boolean): Boolean {
         if (recording.protected == protect) return true
+        if (recording.storage == RecordingStorage.EXTERNAL && Uri.parse(recording.uri).authority != "media") {
+            val prefs = context.getSharedPreferences("protected_usb_recordings", Context.MODE_PRIVATE)
+            prefs.edit().apply {
+                if (protect) putBoolean(recording.uri, true) else remove(recording.uri)
+            }.apply()
+            return true
+        }
         val path = if (protect) "$rootPath$PROTECTED/" else cameraPath(recording.inputId)
         return context.contentResolver.update(Uri.parse(recording.uri), ContentValues().apply {
             put(MediaStore.MediaColumns.RELATIVE_PATH, path)
         }, null, null) > 0
     }
 
-    @Synchronized fun delete(context: Context, recording: RecordingFile): Boolean =
-        context.contentResolver.delete(Uri.parse(recording.uri), null, null) > 0
+    @Synchronized fun delete(context: Context, recording: RecordingFile): Boolean {
+        val deleted = context.contentResolver.delete(Uri.parse(recording.uri), null, null) > 0
+        if (deleted && recording.storage == RecordingStorage.EXTERNAL) {
+            context.getSharedPreferences("protected_usb_recordings", Context.MODE_PRIVATE).edit()
+                .remove(recording.uri).apply()
+        }
+        return deleted
+    }
 
-    fun removeInterrupted(context: Context) {
+    fun removeInterrupted(context: Context, storage: RecordingStorage = RecordingStorage.INTERNAL) {
+        val destination = if (storage == RecordingStorage.EXTERNAL) externalCollection(context) else collection
         context.contentResolver.query(
-            collection, arrayOf(MediaStore.MediaColumns._ID),
+            destination, arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME),
             "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? AND ${MediaStore.MediaColumns.IS_PENDING}=1",
             arrayOf("$rootPath%"), null
         )?.use { cursor ->
             while (cursor.moveToNext()) {
-                context.contentResolver.delete(ContentUris.withAppendedId(collection, cursor.getLong(0)), null, null)
+                if (!cursor.getString(1).orEmpty().matches(RECORDING_NAME)) continue
+                context.contentResolver.delete(ContentUris.withAppendedId(destination, cursor.getLong(0)), null, null)
             }
         }
     }
@@ -165,7 +224,8 @@ object RecordingStore {
                 ?: return@forEach
             var target: RecordingTarget? = null
             runCatching {
-                target = createSegment(context, inputId, source.name, source.parentFile?.name == PROTECTED)
+                target = createSegment(context, inputId, source.name, source.parentFile?.name == PROTECTED,
+                    RecordingStorage.INTERNAL)
                 ParcelFileDescriptor.AutoCloseOutputStream(target!!.descriptor).use { output ->
                     source.inputStream().use { it.copyTo(output) }
                 }
@@ -176,4 +236,148 @@ object RecordingStore {
     }
 
     private fun cameraPath(inputId: Int) = "$rootPath${"camera_$inputId"}/"
+
+    /** Only a removable volume is accepted; an emulated internal directory is not a USB destination. */
+    fun validateExternal(context: Context): String? {
+        val drive = selectedDrive(context) ?: return "Выберите подключённый USB-накопитель"
+        if (mediaVolumeName(context, drive) == null)
+            return "USB-накопитель ${drive.name} не доступен через медиахранилище Android"
+        return null
+    }
+
+    fun treeVolumeId(tree: Uri): String? = runCatching {
+        DocumentsContract.getTreeDocumentId(tree).substringBefore(':').takeIf(String::isNotBlank)
+    }.getOrNull()
+
+    fun removableDrives(context: Context): List<RemovableDrive> {
+        val volumes = (context.getSystemService(Context.STORAGE_SERVICE) as StorageManager).storageVolumes
+            .filter { it.isRemovable && it.state == Environment.MEDIA_MOUNTED && !it.uuid.isNullOrBlank() }
+            .map { RemovableDrive(it, requireNotNull(it.uuid), it.getDescription(context)) }
+        // Some vendor builds expose a USB root to the system file picker but omit it from StorageManager.
+        val authority = "com.android.externalstorage.documents"
+        val roots = runCatching {
+            buildList {
+                context.contentResolver.query(DocumentsContract.buildRootsUri(authority), arrayOf(
+                    DocumentsContract.Root.COLUMN_ROOT_ID,
+                    DocumentsContract.Root.COLUMN_TITLE,
+                    DocumentsContract.Root.COLUMN_AVAILABLE_BYTES
+                ), null, null, null)?.use { cursor ->
+                    while (cursor.moveToNext()) {
+                        val id = cursor.getString(0) ?: continue
+                        if (id.equals("primary", true) || id.equals("home", true)) continue
+                        add(RemovableDrive(null, id, cursor.getString(1) ?: "USB $id",
+                            if (cursor.isNull(2)) -1L else cursor.getLong(2)))
+                    }
+                }
+            }
+        }.getOrDefault(emptyList())
+        return (volumes + roots).groupBy { it.id.uppercase(java.util.Locale.ROOT) }
+            .values.map { group ->
+                val volume = group.firstOrNull { it.volume != null } ?: group.first()
+                volume.copy(availableBytes = group.firstOrNull { it.availableBytes >= 0 }?.availableBytes ?: -1L)
+            }
+    }
+
+    fun selectedDrive(context: Context): RemovableDrive? {
+        val drives = removableDrives(context)
+        val id = RecorderSettings.externalDriveId(context)
+        return drives.firstOrNull { it.id.equals(id, ignoreCase = true) }
+            ?: drives.singleOrNull().takeIf { id == null }
+    }
+
+    private fun mediaVolumeName(context: Context, drive: RemovableDrive): String? {
+        val candidate = drive.volume?.mediaStoreVolumeName ?: drive.id
+        return MediaStore.getExternalVolumeNames(context).firstOrNull {
+            it.equals(candidate, ignoreCase = true) || it.equals(drive.id, ignoreCase = true)
+        }
+    }
+
+    private fun externalCollection(context: Context): Uri {
+        val drive = requireNotNull(selectedDrive(context)) { "Выберите подключённый USB-накопитель" }
+        val volumeName = requireNotNull(mediaVolumeName(context, drive)) {
+            "USB-накопитель ${drive.name} не доступен через медиахранилище Android"
+        }
+        return MediaStore.Video.Media.getContentUri(volumeName)
+    }
+
+    fun isRemovableTree(context: Context, tree: Uri): Boolean =
+        removableDrives(context).any { it.id.equals(treeVolumeId(tree), ignoreCase = true) }
+
+    fun hasExternalTreePermission(context: Context, tree: Uri): Boolean =
+        context.contentResolver.persistedUriPermissions.any {
+            it.uri == tree && it.isReadPermission && it.isWritePermission
+        }
+
+    private fun treeRoot(tree: Uri): Uri = DocumentsContract.buildDocumentUriUsingTree(
+        tree, DocumentsContract.getTreeDocumentId(tree))
+
+    private fun childDocuments(context: Context, tree: Uri, parent: Uri): List<Pair<Uri, String>> {
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, DocumentsContract.getDocumentId(parent))
+        return buildList {
+            context.contentResolver.query(children, arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_SIZE,
+                DocumentsContract.Document.COLUMN_LAST_MODIFIED
+            ), null, null, null)?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    val uri = DocumentsContract.buildDocumentUriUsingTree(tree, cursor.getString(0))
+                    add(uri to cursor.getString(1))
+                }
+            }
+        }
+    }
+
+    private fun findOrCreateDirectory(context: Context, tree: Uri, parent: Uri, name: String): Uri =
+        childDocuments(context, tree, parent).firstOrNull { it.second == name }?.first
+            ?: requireNotNull(DocumentsContract.createDocument(context.contentResolver, parent,
+                DocumentsContract.Document.MIME_TYPE_DIR, name)) { "Не удалось создать папку $name на USB" }
+
+    private fun listExternal(context: Context): List<RecordingFile> {
+        val mediaFiles = runCatching { listMedia(context, externalCollection(context), RecordingStorage.EXTERNAL) }
+            .getOrDefault(emptyList())
+        val legacyFiles = listExternalTree(context)
+        return (mediaFiles + legacyFiles).distinctBy(RecordingFile::name)
+    }
+
+    private fun listExternalTree(context: Context): List<RecordingFile> {
+        val tree = RecorderSettings.externalTree(context) ?: return emptyList()
+        if (!treeVolumeId(tree).equals(selectedDrive(context)?.id, ignoreCase = true) ||
+            !hasExternalTreePermission(context, tree)) return emptyList()
+        return runCatching {
+            val root = treeRoot(tree)
+            val gcam = childDocuments(context, tree, root).firstOrNull { it.second == ROOT }?.first
+                ?: return@runCatching emptyList()
+            val protectedPrefs = context.getSharedPreferences("protected_usb_recordings", Context.MODE_PRIVATE)
+            buildList {
+                for ((folder, folderName) in childDocuments(context, tree, gcam)) {
+                    if (folderName != PROTECTED && !folderName.startsWith("camera_")) continue
+                    val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree,
+                        DocumentsContract.getDocumentId(folder))
+                    context.contentResolver.query(children, arrayOf(
+                        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                        DocumentsContract.Document.COLUMN_MIME_TYPE,
+                        DocumentsContract.Document.COLUMN_SIZE,
+                        DocumentsContract.Document.COLUMN_LAST_MODIFIED
+                    ), null, null, null)?.use { cursor ->
+                        while (cursor.moveToNext()) {
+                            if (cursor.getString(2) != "video/mp4") continue
+                            val uri = DocumentsContract.buildDocumentUriUsingTree(tree, cursor.getString(0)).toString()
+                            val name = cursor.getString(1)
+                            if (!name.matches(RECORDING_NAME)) continue
+                            add(RecordingFile(uri, name,
+                                Regex("cam(\\d)").find(name)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: -1,
+                                cursor.getLong(3), cursor.getLong(4),
+                                folderName == PROTECTED || protectedPrefs.getBoolean(uri, false),
+                                storage = RecordingStorage.EXTERNAL))
+                        }
+                    }
+                }
+            }.sortedByDescending(RecordingFile::modifiedAt)
+        }.getOrElse { emptyList() }
+    }
+
+    private val RECORDING_NAME = Regex("cam[0-3]_\\d{8}_\\d{6}_\\d{3}(?:_s\\d+)?\\.mp4")
 }

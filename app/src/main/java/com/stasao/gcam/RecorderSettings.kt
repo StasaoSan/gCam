@@ -1,6 +1,7 @@
 package com.stasao.gcam
 
 import android.content.Context
+import android.net.Uri
 
 object RecorderSettings {
     private const val PREFS = "dashcam_settings"
@@ -24,7 +25,9 @@ object RecorderSettings {
             bitrateMbps = p.getInt("bitrate_mbps", defaults.bitrateMbps)
                 .takeIf { it in setOf(2, 3, 4, 6) } ?: defaults.bitrateMbps,
             segmentMinutes = p.getInt("segment_minutes", defaults.segmentMinutes).coerceIn(1, 5),
-            storageLimitGb = p.getInt("storage_limit_gb", defaults.storageLimitGb).coerceIn(1, 512),
+            storageLimitGb = p.getInt("storage_limit_gb", defaults.storageLimitGb).coerceAtLeast(1),
+            storage = runCatching { RecordingStorage.valueOf(p.getString("storage", defaults.storage.name)!!) }
+                .getOrDefault(defaults.storage),
             stampTime = p.getBoolean("stamp_time", defaults.stampTime),
             stampGps = p.getBoolean("stamp_gps", defaults.stampGps),
             stampSpeed = p.getBoolean("stamp_speed", defaults.stampSpeed)
@@ -39,10 +42,40 @@ object RecorderSettings {
             putInt("bitrate_mbps", config.bitrateMbps)
             putInt("segment_minutes", config.segmentMinutes)
             putInt("storage_limit_gb", config.storageLimitGb)
+            putString("storage", config.storage.name)
             putBoolean("stamp_time", config.stampTime)
             putBoolean("stamp_gps", config.stampGps)
             putBoolean("stamp_speed", config.stampSpeed)
         }.commit()
+    }
+
+    fun externalTree(context: Context): Uri? = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        .getString("external_tree", null)?.let(Uri::parse)
+
+    fun externalDriveId(context: Context): String? = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        .getString("external_drive_id", null)
+        ?: externalTree(context)?.let(RecordingStore::treeVolumeId)
+
+    fun saveExternalDriveId(context: Context, id: String) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("external_drive_id", id).commit()
+    }
+
+    fun savedExternalTree(context: Context, volumeId: String): Uri? {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val saved = prefs.getString("external_tree_${volumeId.uppercase(java.util.Locale.ROOT)}", null)
+            ?.let(Uri::parse)
+        if (saved != null) return saved
+        // Existing installations stored only the active tree. Keep that choice when upgrading.
+        return externalTree(context)?.takeIf { RecordingStore.treeVolumeId(it).equals(volumeId, true) }
+    }
+
+    fun saveExternalTree(context: Context, uri: Uri) {
+        val volumeId = requireNotNull(RecordingStore.treeVolumeId(uri)) { "Неверная USB-папка" }
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("external_tree", uri.toString())
+            .putString("external_tree_${volumeId.uppercase(java.util.Locale.ROOT)}", uri.toString())
+            .commit()
     }
 
     fun loadUiScale(context: Context): Float {

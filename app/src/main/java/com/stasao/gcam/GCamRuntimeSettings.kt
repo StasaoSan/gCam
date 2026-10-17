@@ -8,6 +8,7 @@ data class GCamRuntimeConfig(
     val autostart: Boolean,
     val recordingAutostart: Boolean,
     val statusOverlay: Boolean,
+    val cameraOverlay: Boolean,
     val statusOverlayX: Float,
     val statusOverlayY: Float
 )
@@ -17,6 +18,7 @@ object GCamRuntimeSettings {
     private const val KEY_AUTOSTART = "autostart"
     private const val KEY_RECORDING_AUTOSTART = "recording_autostart"
     private const val KEY_STATUS_OVERLAY = "status_overlay"
+    private const val KEY_CAMERA_OVERLAY = "camera_overlay"
     private const val KEY_STATUS_OVERLAY_X = "status_overlay_x"
     private const val KEY_STATUS_OVERLAY_Y = "status_overlay_y"
     private const val KEY_AUTOSTART_SESSION = "autostart_session"
@@ -29,6 +31,7 @@ object GCamRuntimeSettings {
             autostart = autostart,
             recordingAutostart = autostart && prefs.getBoolean(KEY_RECORDING_AUTOSTART, false),
             statusOverlay = prefs.getBoolean(KEY_STATUS_OVERLAY, false),
+            cameraOverlay = prefs.getBoolean(KEY_CAMERA_OVERLAY, false),
             statusOverlayX = position.first,
             statusOverlayY = position.second
         )
@@ -39,6 +42,7 @@ object GCamRuntimeSettings {
             .putBoolean(KEY_AUTOSTART, config.autostart)
             .putBoolean(KEY_RECORDING_AUTOSTART, config.autostart && config.recordingAutostart)
             .putBoolean(KEY_STATUS_OVERLAY, config.statusOverlay)
+            .putBoolean(KEY_CAMERA_OVERLAY, config.cameraOverlay)
             .putFloat(KEY_STATUS_OVERLAY_X, config.statusOverlayX.coerceIn(0f, 1f))
             .putFloat(KEY_STATUS_OVERLAY_Y, config.statusOverlayY.coerceIn(0f, 1f))
             .apply()

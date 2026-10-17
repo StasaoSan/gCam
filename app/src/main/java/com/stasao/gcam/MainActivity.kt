@@ -139,7 +139,7 @@ class MainActivity : ComponentActivity() {
                 uiScale = it
                 RecorderSettings.saveUiScale(context, it)
             }
-            1 -> RecordingsScreen()
+            1 -> RecordingsScreen(recorder.recording)
             else -> UpdateScreen(recorder.recording)
         }
     } }
@@ -233,14 +233,36 @@ class MainActivity : ComponentActivity() {
     val scope = rememberCoroutineScope()
     var preparing by remember { mutableStateOf(false) }
     var previewController by remember { mutableStateOf<MultiCameraPreviewController?>(null) }
-    val storage = remember(state.usedBytes) { RecordingStore.storageStats(context) }
-    val maxArchiveGb = remember(storage) { RecordingStore.maxArchiveGb(context) }
-    val minArchiveGb = if (maxArchiveGb >= 5) 5 else 1
-    var config by remember { mutableStateOf(RecorderSettings.load(context).let {
-        it.copy(storageLimitGb = it.storageLimitGb.coerceIn(minArchiveGb, maxArchiveGb.coerceAtLeast(minArchiveGb)))
-    }) }
+    var externalFolderRevision by remember { mutableIntStateOf(0) }
+    var driveListRevision by remember { mutableIntStateOf(0) }
+    var folderError by remember { mutableStateOf<String?>(null) }
+    var showQualityWarning by remember { mutableStateOf(false) }
+    var showInternalWarning by remember { mutableStateOf(false) }
+    val removableDrives = remember(driveListRevision, externalFolderRevision) {
+        RecordingStore.removableDrives(context)
+    }
+    fun chooseDrive(drive: RemovableDrive) {
+        RecorderSettings.saveExternalDriveId(context, drive.id)
+        externalFolderRevision++
+        folderError = RecordingStore.validateExternal(context)
+    }
+    var config by remember { mutableStateOf(RecorderSettings.load(context)) }
+    val storage = remember(state.usedBytes, config.storage, externalFolderRevision) {
+        RecordingStore.storageStats(context, config.storage)
+    }
+    val externalError = remember(config.storage, externalFolderRevision) {
+        if (config.storage == RecordingStorage.EXTERNAL) RecordingStore.validateExternal(context) else null
+    }
+    val maxArchiveGb = remember(storage, config.storage) { RecordingStore.maxArchiveGb(context, config.storage) }
+    val sliderMaxGb = maxArchiveGb ?: config.storageLimitGb.coerceAtLeast(40)
+    val minArchiveGb = if (sliderMaxGb >= 5) 5 else 1
+    LaunchedEffect(maxArchiveGb) {
+        if (maxArchiveGb != null && config.storageLimitGb > maxArchiveGb)
+            config = config.copy(storageLimitGb = maxArchiveGb)
+    }
     var runtimeConfig by remember { mutableStateOf(GCamRuntimeSettings.load(context)) }
     var anhudAccess by remember { mutableStateOf(CaptureClientTrust.status(context)) }
+    var blindAccess by remember { mutableStateOf(CaptureClientTrust.blindStatus(context)) }
     var anhudAccessMessage by remember { mutableStateOf<String?>(null) }
     var overlayAllowed by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
     var locationAllowed by remember { mutableStateOf(context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) }
@@ -248,23 +270,73 @@ class MainActivity : ComponentActivity() {
     LaunchedEffect(state.recording) { if (!state.recording) RecorderRepository.update(state.copy(usedBytes = RecordingStore.usedBytes(context))) }
     LaunchedEffect(Unit) {
         while (true) {
-            overlayAllowed = Settings.canDrawOverlays(context)
+            val nowAllowed = Settings.canDrawOverlays(context)
+            if (nowAllowed && !overlayAllowed && runtimeConfig.cameraOverlay) {
+                GCamRuntimeController.applyCameraOverlaySetting(context, true)
+            }
+            overlayAllowed = nowAllowed
+            runtimeConfig = GCamRuntimeSettings.load(context)
             locationAllowed = context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
             anhudAccess = CaptureClientTrust.status(context)
+            blindAccess = CaptureClientTrust.blindStatus(context)
             delay(1_000)
         }
     }
     val hours = config.storageLimitGb * 8192.0 / (config.bitrateMbps * config.cameraIds.size.coerceAtLeast(1) * 3600.0)
+    fun launchRecording() {
+        val storageError = if (config.storage == RecordingStorage.EXTERNAL) RecordingStore.validateExternal(context) else null
+        if (storageError != null) {
+            folderError = storageError
+            return
+        }
+        val controllerToClose = previewController
+        RecorderDiagnostics.record(context, "record_button_start previewActive=${controllerToClose != null} cameras=${config.cameraIds.sorted()} storage=${config.storage}")
+        preparing = true
+        RecorderRepository.update(RecorderState(recording = true, status = "Подготовка записи…"))
+        scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) { controllerToClose?.close() }
+                RecorderDiagnostics.record(context, "preview_closed start_service=true")
+                RecorderSettings.save(context, config)
+                DashcamService.start(context, config)
+            }.onFailure {
+                RecorderDiagnostics.record(context, "record_button_error type=${it.javaClass.simpleName} message=${it.message}")
+                RecorderRepository.update(RecorderState(status = "Не удалось запустить запись: ${it.message}"))
+            }
+            preparing = false
+        }
+    }
+    if (showQualityWarning) AlertDialog(
+        onDismissRequest = { showQualityWarning = false },
+        title = { Text("Высокая нагрузка") },
+        text = { Text("Четыре камеры при 1280×800 могут перегрузить G636 и вызвать пропуски кадров. Рекомендуется 640×400, 15 FPS и 2 Мбит/с на камеру.") },
+        confirmButton = { TextButton(onClick = { showQualityWarning = false; launchRecording() }) { Text("Всё равно записывать") } },
+        dismissButton = { TextButton(onClick = { showQualityWarning = false }) { Text("Назад") } }
+    )
+    if (showInternalWarning) AlertDialog(
+        onDismissRequest = { showInternalWarning = false },
+        title = { Text("Запись во внутреннюю память") },
+        text = { Text("Длительная запись четырёх камер создаёт постоянную нагрузку на внутренний накопитель и расходует его ресурс. По возможности используйте USB-накопитель.") },
+        confirmButton = { TextButton(onClick = {
+            config = config.copy(storage = RecordingStorage.INTERNAL)
+            RecorderSettings.save(context, config)
+            showInternalWarning = false
+        }) { Text("Понимаю") } },
+        dismissButton = { TextButton(onClick = { showInternalWarning = false }) { Text("Отмена") } }
+    )
     LazyColumn(
         Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 120.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         item {
-            if (!state.recording && !preparing) MultiCameraGrid(
+            if (!state.recording && !preparing && !(runtimeConfig.cameraOverlay && overlayAllowed)) MultiCameraGrid(
                 onMounted = { previewController = it },
                 onClosed = { closed -> if (previewController === closed) previewController = null }
             )
+            else if (!state.recording && !preparing) Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = MaterialTheme.shapes.medium) {
+                Text("Камеры показаны в плавающем окне поверх приложений.", modifier = Modifier.fillMaxWidth().padding(14.dp))
+            }
             else Surface(color = Color(0xFF1B5E20), shape = MaterialTheme.shapes.medium) {
                 Text(if (preparing) "Останавливаю превью и запускаю запись…" else state.status,
                     color = Color.White, modifier = Modifier.fillMaxWidth().padding(14.dp))
@@ -283,6 +355,17 @@ class MainActivity : ComponentActivity() {
         item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { cameraInputs.forEach { c ->
             FilterChip(enabled = enabled, selected = c.id in config.cameraIds, onClick = { config = config.copy(cameraIds = config.cameraIds.toMutableSet().apply { if (!add(c.id)) remove(c.id) }) }, label = { Text(c.title) }, modifier = Modifier.weight(1f))
         } } }
+        item {
+            SectionTitle("Рекомендуемые настройки")
+            val four = config.cameraIds.size >= 3
+            Text(if (four) "Для 3–4 камер: 640×400 · 15 FPS · 2 Мбит/с на камеру" else
+                "Для 1–2 камер: 960×600 · 20 FPS · 3 Мбит/с на камеру", fontSize = 13.sp)
+            OutlinedButton(onClick = {
+                config = if (four) config.copy(width = 640, height = 400, fps = 15, bitrateMbps = 2)
+                else config.copy(width = 960, height = 600, fps = 20, bitrateMbps = 3)
+                RecorderSettings.save(context, config)
+            }, enabled = enabled) { Text("Применить") }
+        }
         item { SectionTitle("Разрешение записи") }
         item { ChoiceRow(listOf(640 to "640×400", 960 to "960×600", 1280 to "1280×800"), config.width, enabled) { width ->
             config = config.copy(width = width, height = when (width) { 640 -> 400; 1280 -> 800; else -> 600 })
@@ -291,13 +374,62 @@ class MainActivity : ComponentActivity() {
         item { ChoiceRow(listOf(15 to "15 FPS", 20 to "20 FPS", 25 to "25 FPS"), config.fps, enabled) { config = config.copy(fps = it) } }
         item { SectionTitle("Битрейт H.264 на камеру") }
         item { ChoiceRow(listOf(2 to "2 Мбит/с", 3 to "3 Мбит/с", 4 to "4 Мбит/с", 6 to "6 Мбит/с"), config.bitrateMbps, enabled) { config = config.copy(bitrateMbps = it) } }
+        if (config.cameraIds.size == 4 && config.width == 1280) item {
+            Text("⚠ 4 камеры в максимальном разрешении: возможны сильная нагрузка, падение FPS и пропуски кадров.",
+                color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
+        }
         item { SectionTitle("Длительность сегмента") }
         item { ChoiceRow(listOf(1 to "1 мин", 2 to "2 мин", 3 to "3 мин", 5 to "5 мин"), config.segmentMinutes, enabled) { config = config.copy(segmentMinutes = it) } }
-        item { SectionTitle("Лимит архива: ${config.storageLimitGb} ГБ из доступных $maxArchiveGb ГБ")
+        item {
+            SectionTitle("Куда сохранять видео")
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = config.storage == RecordingStorage.EXTERNAL, enabled = enabled,
+                    onClick = {
+                        config = config.copy(storage = RecordingStorage.EXTERNAL)
+                        RecorderSettings.save(context, config)
+                    }, label = { Text("USB · основной") }, modifier = Modifier.weight(1f))
+                FilterChip(selected = config.storage == RecordingStorage.INTERNAL, enabled = enabled,
+                    onClick = { showInternalWarning = true }, label = { Text("Внутренняя") }, modifier = Modifier.weight(1f))
+            }
+            if (config.storage == RecordingStorage.EXTERNAL) {
+                val selectedId = remember(externalFolderRevision, driveListRevision) {
+                    RecordingStore.selectedDrive(context)?.id ?: RecorderSettings.externalDriveId(context)
+                }
+                Text("Флешка для записи", fontSize = 14.sp)
+                if (removableDrives.isEmpty()) Text("Подключённые USB-накопители не найдены", fontSize = 12.sp)
+                removableDrives.forEach { drive ->
+                    val selected = selectedId.equals(drive.id, ignoreCase = true)
+                    FilterChip(
+                        selected = selected,
+                        enabled = enabled,
+                        onClick = { chooseDrive(drive) },
+                        label = { Text("${if (selected) "✓ ВЫБРАНА · " else "Выбрать · "}${drive.name} · ${drive.id}") }
+                    )
+                }
+                removableDrives.firstOrNull { it.id.equals(selectedId, ignoreCase = true) }?.let { drive ->
+                    Text("Запись на: ${drive.name} (${drive.id}) → Movies/gCam", fontSize = 13.sp)
+                }
+                OutlinedButton(onClick = { driveListRevision++ }, enabled = enabled) {
+                    Text("Обновить список флешек")
+                }
+                if (selectedId != null && removableDrives.none { it.id.equals(selectedId, ignoreCase = true) }) {
+                    Text("Ранее выбранная флешка $selectedId сейчас не подключена", fontSize = 12.sp)
+                }
+                Text("Файлы будут в Movies/gCam на выбранной флешке. Системный выбор папки не требуется. При отключении USB запись не переключится на внутреннюю память.", fontSize = 12.sp)
+                (folderError ?: externalError)?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                }
+            } else Text("Длительная запись изнашивает внутренний накопитель. Рекомендуется USB.",
+                color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+        }
+        item { SectionTitle("Лимит архива: ${config.storageLimitGb} ГБ${maxArchiveGb?.let { " из доступных $it ГБ" } ?: ""}")
             Slider(config.storageLimitGb.toFloat(), { config = config.copy(storageLimitGb = it.toInt()) },
-                valueRange = minArchiveGb.toFloat()..maxArchiveGb.coerceAtLeast(minArchiveGb).toFloat(), enabled = enabled)
-            Text("Память устройства: занято ${formatBytes(storage.totalBytes - storage.freeBytes)} из ${formatBytes(storage.totalBytes)} · свободно ${formatBytes(storage.freeBytes)}", fontSize = 13.sp)
-            Text("Записи gCam: ${formatBytes(storage.recordingBytes)} · максимум = свободно + записи − резерв 2 ГБ", fontSize = 13.sp)
+                valueRange = minArchiveGb.toFloat()..sliderMaxGb.coerceAtLeast(minArchiveGb).toFloat(), enabled = enabled)
+            if (storage.freeBytes >= 0) {
+                if (storage.totalBytes >= 0) Text("Выбранный накопитель: занято ${formatBytes(storage.totalBytes - storage.freeBytes)} из ${formatBytes(storage.totalBytes)} · свободно ${formatBytes(storage.freeBytes)}", fontSize = 13.sp)
+                else Text("Выбранный накопитель: свободно ${formatBytes(storage.freeBytes)}; полный объём система не сообщает", fontSize = 13.sp)
+                Text("Записи gCam: ${formatBytes(storage.recordingBytes)} · максимум = свободно + записи − резерв 2 ГБ", fontSize = 13.sp)
+            } else Text("Свободное место накопителя недоступно от системы. 512 ГБ не подставляются; лимит можно выставить после выбора доступной флешки.", fontSize = 12.sp)
             Text("Ориентировочно ${"%.1f".format(Locale.US, hours)} ч записи", fontSize = 13.sp)
         }
         item {
@@ -357,6 +489,19 @@ class MainActivity : ComponentActivity() {
                     context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}")))
                 } else {
                     GCamRuntimeController.applyOverlaySetting(context, checked)
+                }
+            }
+            RuntimeSwitchRow(
+                title = "Поверх остальных окон",
+                subtitle = if (overlayAllowed) "Плавающее окно с четырьмя камерами; его можно перемещать" else "Нужно разрешение на показ поверх окон",
+                checked = runtimeConfig.cameraOverlay
+            ) { checked ->
+                runtimeConfig = runtimeConfig.copy(cameraOverlay = checked)
+                GCamRuntimeSettings.save(context, runtimeConfig)
+                if (checked && !Settings.canDrawOverlays(context)) {
+                    context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}")))
+                } else {
+                    GCamRuntimeController.applyCameraOverlaySetting(context, checked)
                 }
             }
             Text("Позиция по горизонтали: ${(runtimeConfig.statusOverlayX * 100).toInt()}%", fontSize = 13.sp)
@@ -436,25 +581,27 @@ class MainActivity : ComponentActivity() {
             anhudAccessMessage?.let { Text(it, fontSize = 12.sp) }
             Text("Разрешение привязано к подписи установленного ANHUD, а не к паролю или ключу внутри него.", fontSize = 12.sp)
         }
-        item { Button(onClick = {
-            if (state.recording) DashcamService.stop(context) else {
-                val controllerToClose = previewController
-                RecorderDiagnostics.record(context, "record_button_start previewActive=${controllerToClose != null} cameras=${config.cameraIds.sorted()}")
-                preparing = true
-                RecorderRepository.update(RecorderState(recording = true, status = "Подготовка записи…"))
-                scope.launch {
-                    runCatching {
-                        withContext(Dispatchers.IO) { controllerToClose?.close() }
-                        RecorderDiagnostics.record(context, "preview_closed start_service=true")
-                        RecorderSettings.save(context, config)
-                        DashcamService.start(context, config)
-                    }.onFailure {
-                        RecorderDiagnostics.record(context, "record_button_error type=${it.javaClass.simpleName} message=${it.message}")
-                        RecorderRepository.update(RecorderState(status = "Не удалось запустить запись: ${it.message}"))
-                    }
-                    preparing = false
-                }
+        item {
+            SectionTitle("Доступ gBlind к камерам приборки")
+            Text(when {
+                !blindAccess.installed -> "gBlind не установлен"
+                blindAccess.sameSigner -> "Доступ разрешён: приложения подписаны одинаково"
+                blindAccess.approved -> "Доступ к камерам приборки разрешён"
+                blindAccess.signerChanged -> "Подпись gBlind изменилась — подтвердите снова"
+                else -> "Подтвердите доступ gBlind к отдельным слотам камер приборки"
+            }, fontSize = 13.sp)
+            if (blindAccess.installed && !blindAccess.sameSigner) {
+                OutlinedButton(onClick = {
+                    if (blindAccess.approved) CaptureClientTrust.revokeBlind(context)
+                    else CaptureClientTrust.approveBlind(context)
+                    blindAccess = CaptureClientTrust.blindStatus(context)
+                }) { Text(if (blindAccess.approved) "Отозвать доступ" else "Разрешить gBlind") }
             }
+        }
+        item { Button(onClick = {
+            if (state.recording) DashcamService.stop(context)
+            else if (config.cameraIds.size == 4 && config.width == 1280) showQualityWarning = true
+            else launchRecording()
         }, enabled = !preparing && (state.recording || config.cameraIds.isNotEmpty()), modifier = Modifier.fillMaxWidth()) {
             Text(if (state.recording) "Остановить запись" else "Начать запись")
         } }
@@ -573,31 +720,71 @@ class MainActivity : ComponentActivity() {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { options.forEach { (v, title) -> FilterChip(selected = selected == v, enabled = enabled, onClick = { onSelect(v) }, label = { Text(title) }, modifier = Modifier.weight(1f)) } }
 }
 
-@Composable private fun RecordingsScreen() {
+@Composable private fun RecordingsScreen(recording: Boolean) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var revision by remember { mutableIntStateOf(0) }
     var playing by remember { mutableStateOf<RecordingTimeline?>(null) }
     var expanded by remember { mutableStateOf<Set<String>>(emptySet()) }
     var recordings by remember { mutableStateOf<List<RecordingFile>>(emptyList()) }
+    var selecting by remember { mutableStateOf(false) }
+    var selectedUris by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var confirmDelete by remember { mutableStateOf<List<RecordingFile>?>(null) }
+    var deleting by remember { mutableStateOf(false) }
+    var deletionMessage by remember { mutableStateOf<String?>(null) }
     val timelines = remember(recordings) { RecordingTimelines.group(recordings) }
     LaunchedEffect(revision) {
         recordings = kotlinx.coroutines.withContext(Dispatchers.IO) {
             if (revision == 0) RecordingStore.migrateLegacy(context)
             RecordingStore.listWithDurations(context)
         }
+        selectedUris = selectedUris.intersect(recordings.mapTo(HashSet()) { it.uri })
     }
     LazyColumn(
         Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 12.dp, top = 12.dp, end = 12.dp, bottom = 120.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        item { Text("Movies/gCam · ${timelines.size} записей / ${recordings.size} файлов · ${formatBytes(recordings.sumOf { it.sizeBytes })}", style = MaterialTheme.typography.titleMedium) }
+        item {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("USB/gCam и Movies/gCam · ${timelines.size} записей / ${recordings.size} файлов · ${formatBytes(recordings.sumOf { it.sizeBytes })}", style = MaterialTheme.typography.titleMedium)
+                if (!selecting) {
+                    Button(onClick = { selecting = true }, enabled = recordings.isNotEmpty()) {
+                        Text("Выбрать файлы")
+                    }
+                } else {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = {
+                            selectedUris = recordings.mapTo(HashSet()) { it.uri }
+                        }, enabled = !deleting && recordings.isNotEmpty()) { Text("Выбрать все") }
+                        TextButton(onClick = { selectedUris = emptySet() },
+                            enabled = !deleting && selectedUris.isNotEmpty()) { Text("Снять выбор") }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Button(onClick = {
+                            confirmDelete = recordings.filter { it.uri in selectedUris }
+                        }, enabled = !deleting && !recording && selectedUris.isNotEmpty()) {
+                            Text(if (deleting) "Удаление…" else "Удалить выбранные (${selectedUris.size})")
+                        }
+                        TextButton(onClick = { selecting = false; selectedUris = emptySet() },
+                            enabled = !deleting) { Text("Отмена") }
+                    }
+                    if (recording) Text("Чтобы удалить файлы, сначала остановите запись.", fontSize = 12.sp)
+                }
+            }
+        }
         if (timelines.isEmpty()) item { Text("Записей пока нет") }
         items(timelines, key = { it.parts.first().uri }) { timeline ->
             val key = timeline.parts.first().uri
             Card {
                 Column(Modifier.fillMaxWidth().padding(10.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (selecting) Checkbox(
+                            checked = timeline.parts.all { it.uri in selectedUris },
+                            onCheckedChange = { checked ->
+                                val partUris = timeline.parts.mapTo(HashSet()) { it.uri }
+                                selectedUris = if (checked) selectedUris + partUris else selectedUris - partUris
+                            }, enabled = !deleting)
                         Column(Modifier.weight(1f)) {
                             Text(recorderCameraNames[timeline.inputId] ?: "Камера ${timeline.inputId}")
                             Text("${DateFormat.getDateTimeInstance().format(Date(timeline.startedAt))} · ${formatDuration(timeline.durationMs)} · ${timeline.parts.size} фрагм. · ${formatBytes(timeline.sizeBytes)}", fontSize = 12.sp)
@@ -609,14 +796,57 @@ class MainActivity : ComponentActivity() {
                     }
                     if (key in expanded) timeline.parts.forEach { r ->
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Text("${DateFormat.getTimeInstance().format(Date(r.modifiedAt))} · ${formatDuration(r.durationMs)}${if (r.protected) " · защищено" else ""}", modifier = Modifier.weight(1f), fontSize = 12.sp)
-                            TextButton(onClick = { RecordingStore.setProtected(context, r, !r.protected); revision++ }) { Text(if (r.protected) "Снять защиту" else "Защитить") }
-                            TextButton(onClick = { RecordingStore.delete(context, r); revision++ }) { Text("Удалить") }
+                            if (selecting) Checkbox(checked = r.uri in selectedUris,
+                                onCheckedChange = { checked ->
+                                    selectedUris = if (checked) selectedUris + r.uri else selectedUris - r.uri
+                                }, enabled = !deleting)
+                            Text("${DateFormat.getTimeInstance().format(Date(r.modifiedAt))} · ${formatDuration(r.durationMs)} · ${if (r.storage == RecordingStorage.EXTERNAL) "USB" else "внутренняя"}${if (r.protected) " · защищено" else ""}", modifier = Modifier.weight(1f), fontSize = 12.sp)
+                            if (!selecting) {
+                                TextButton(onClick = { RecordingStore.setProtected(context, r, !r.protected); revision++ }) { Text(if (r.protected) "Снять защиту" else "Защитить") }
+                                TextButton(onClick = { RecordingStore.delete(context, r); revision++ }) { Text("Удалить") }
+                            }
                         }
                     }
                 }
             }
         }
+    }
+    confirmDelete?.let { targets ->
+        AlertDialog(
+            onDismissRequest = { if (!deleting) confirmDelete = null },
+            title = { Text("Удалить выбранные файлы?") },
+            text = { Text(buildString {
+                append("Будут безвозвратно удалены ${targets.size} файлов (${formatBytes(targets.sumOf { it.sizeBytes })}) из gCam.")
+                val protectedCount = targets.count { it.protected }
+                if (protectedCount > 0) append(" В выбор входят защищённые файлы: $protectedCount.")
+            }) },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDelete = null
+                    deleting = true
+                    scope.launch {
+                        val failed = withContext(Dispatchers.IO) {
+                            targets.filter { file ->
+                                RecorderRepository.state.value.recording ||
+                                    !runCatching { RecordingStore.delete(context, file) }.getOrDefault(false)
+                            }
+                        }
+                        deleting = false
+                        selectedUris = failed.mapTo(HashSet()) { it.uri }
+                        if (failed.isEmpty()) selecting = false
+                        deletionMessage = "Удалено ${targets.size - failed.size} из ${targets.size} файлов" +
+                            if (failed.isNotEmpty()) ". Не удалось удалить ${failed.size}; они остались выделены." else "."
+                        revision++
+                    }
+                }, enabled = !deleting && !recording) { Text("Удалить") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text("Отмена") } }
+        )
+    }
+    deletionMessage?.let { message ->
+        AlertDialog(onDismissRequest = { deletionMessage = null },
+            title = { Text("Удаление завершено") }, text = { Text(message) },
+            confirmButton = { TextButton(onClick = { deletionMessage = null }) { Text("ОК") } })
     }
     playing?.let { VideoPlayer(it) { playing = null } }
 }

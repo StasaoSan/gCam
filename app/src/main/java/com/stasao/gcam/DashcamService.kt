@@ -29,6 +29,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 import java.util.Locale
 
@@ -38,11 +39,12 @@ class DashcamService : Service() {
     private val errors = ConcurrentHashMap<Int, String>()
     private var statsJob: Job? = null
     private var maintenanceJob: Job? = null
+    private var startupJob: Job? = null
     private var config = RecorderConfig()
     private var stampSource: RecorderStampSource? = null
     private var capture: IQCarCamCapture? = null
     private var captureBound = false
-    private var starting = false
+    @Volatile private var starting = false
     private var currentState = RecorderState()
     private var recordingSessionId = 0L
     private val captureConnection = object : ServiceConnection {
@@ -93,16 +95,15 @@ class DashcamService : Service() {
                 fps = request.getIntExtra(EXTRA_FPS_SETTING, saved.fps).coerceIn(15, 25),
                 bitrateMbps = request.getIntExtra(EXTRA_BITRATE, saved.bitrateMbps).coerceIn(2, 6),
                 segmentMinutes = request.getIntExtra(EXTRA_SEGMENT_MINUTES, saved.segmentMinutes).coerceIn(1, 5),
-                storageLimitGb = request.getIntExtra(EXTRA_STORAGE_LIMIT_GB, saved.storageLimitGb).coerceIn(1, 512),
+                storageLimitGb = request.getIntExtra(EXTRA_STORAGE_LIMIT_GB, saved.storageLimitGb).coerceAtLeast(1),
+                storage = runCatching { RecordingStorage.valueOf(
+                    request.getStringExtra(EXTRA_STORAGE) ?: saved.storage.name) }.getOrDefault(saved.storage),
                 stampTime = request.getBooleanExtra(EXTRA_STAMP_TIME, saved.stampTime),
                 stampGps = request.getBooleanExtra(EXTRA_STAMP_GPS, saved.stampGps),
                 stampSpeed = request.getBooleanExtra(EXTRA_STAMP_SPEED, saved.stampSpeed)
             )
         } ?: RecorderSettings.load(this)
-        RecorderDiagnostics.record(this, "recording_start cameras=${config.cameraIds.sorted()} size=${config.width}x${config.height} fps=${config.fps} bitrateMbps=${config.bitrateMbps} segmentMinutes=${config.segmentMinutes} limitGb=${config.storageLimitGb}")
-        RecordingStore.migrateLegacy(this)
-        RecordingStore.removeInterrupted(this)
-        RecordingStore.enforceLimit(this, config)
+        RecorderDiagnostics.record(this, "recording_start cameras=${config.cameraIds.sorted()} size=${config.width}x${config.height} fps=${config.fps} bitrateMbps=${config.bitrateMbps} segmentMinutes=${config.segmentMinutes} limitGb=${config.storageLimitGb} storage=${config.storage}")
         if (config.cameraIds.isEmpty()) {
             RecorderDiagnostics.record(this, "recording_rejected reason=no_cameras")
             publish(RecorderState(status = "Выберите хотя бы одну камеру"))
@@ -111,14 +112,46 @@ class DashcamService : Service() {
             return
         }
         startForeground(NOTIFICATION_ID, notification("Запуск камер…"), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        errors.clear()
-        val intent = Intent(this, QCarCamCaptureService::class.java)
-        if (!bindService(intent, captureConnection, BIND_AUTO_CREATE)) {
-            RecorderDiagnostics.record(this, "recording_error reason=bind_failed")
-            starting = false
-            publish(RecorderState(status = "Не удалось запустить сервис камер"))
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+        publish(RecorderState(recording = true, status = "Освобождаю место для записи…"))
+        startupJob?.cancel()
+        startupJob = scope.launch(Dispatchers.IO) {
+            val preflight = runCatching {
+                if (config.storage == RecordingStorage.EXTERNAL)
+                    RecordingStore.validateExternal(this@DashcamService)?.let { error(it) }
+                RecordingStore.removeInterrupted(this@DashcamService, config.storage)
+                RecordingStore.enforceLimit(this@DashcamService, config)
+            }
+            if (!isActive) return@launch
+            withContext(Dispatchers.Main) {
+                if (!starting) return@withContext
+                val maintenance = preflight.getOrElse { failure ->
+                    RecorderDiagnostics.record(this@DashcamService,
+                        "recording_rejected reason=archive_preflight type=${failure.javaClass.simpleName} message=${failure.message}")
+                    publish(RecorderState(status = "Запись не запущена: ${failure.message ?: "ошибка накопителя"}"))
+                    starting = false
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                    return@withContext
+                }
+                RecorderDiagnostics.record(this@DashcamService,
+                    "archive_preflight deleted=${maintenance.deletedFiles} usedBytes=${maintenance.usedBytes} freeBytes=${maintenance.freeBytes} ready=${maintenance.ready}")
+                if (!maintenance.ready) {
+                    publish(RecorderState(status = "Запись не запущена: недостаточно места в лимите архива или все старые файлы защищены"))
+                    starting = false
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                    return@withContext
+                }
+                errors.clear()
+                val captureIntent = Intent(this@DashcamService, QCarCamCaptureService::class.java)
+                if (!bindService(captureIntent, captureConnection, BIND_AUTO_CREATE)) {
+                    RecorderDiagnostics.record(this@DashcamService, "recording_error reason=bind_failed")
+                    starting = false
+                    publish(RecorderState(status = "Не удалось запустить сервис камер"))
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+            }
         }
     }
 
@@ -244,7 +277,9 @@ class DashcamService : Service() {
                     scope.launch(Dispatchers.Main) { stopRecording("Запись остановлена: $reason") }
                     break
                 }
-                if (tick++ % 10 == 0) usedBytes = RecordingStore.usedBytes(this@DashcamService)
+                if (tick++ % (if (config.storage == RecordingStorage.EXTERNAL) 60 else 10) == 0) {
+                    usedBytes = RecordingStore.usedBytes(this@DashcamService)
+                }
                 if (tick % 60 == 0 && maintenanceJob?.isActive != true) {
                     maintenanceJob = scope.launch(Dispatchers.IO) {
                         runCatching { RecordingStore.enforceLimit(this@DashcamService, config) }
@@ -338,6 +373,7 @@ class DashcamService : Service() {
 
     private fun stopRecording(reason: String? = null) {
         RecorderDiagnostics.record(this, "recording_stop requested cameras=${encoders.keys.sorted()}")
+        startupJob?.cancel(); startupJob = null
         statsJob?.cancel(); statsJob = null
         stampSource?.stop(); stampSource = null
         maintenanceJob?.cancel(); maintenanceJob = null
@@ -346,7 +382,7 @@ class DashcamService : Service() {
         RecorderDiagnostics.record(this, "recording_stopped")
         starting = false
         unbindCapture()
-        publish(RecorderState(usedBytes = RecordingStore.usedBytes(this),
+        publish(RecorderState(usedBytes = currentState.usedBytes,
             status = reason ?: "Регистратор остановлен"))
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -436,6 +472,7 @@ class DashcamService : Service() {
         private const val EXTRA_BITRATE = "bitrate_mbps"
         private const val EXTRA_SEGMENT_MINUTES = "segment_minutes"
         private const val EXTRA_STORAGE_LIMIT_GB = "storage_limit_gb"
+        private const val EXTRA_STORAGE = "storage"
         private const val EXTRA_STAMP_TIME = "stamp_time"
         private const val EXTRA_STAMP_GPS = "stamp_gps"
         private const val EXTRA_STAMP_SPEED = "stamp_speed"
@@ -465,6 +502,7 @@ class DashcamService : Service() {
                     putExtra(EXTRA_BITRATE, config.bitrateMbps)
                     putExtra(EXTRA_SEGMENT_MINUTES, config.segmentMinutes)
                     putExtra(EXTRA_STORAGE_LIMIT_GB, config.storageLimitGb)
+                    putExtra(EXTRA_STORAGE, config.storage.name)
                     putExtra(EXTRA_STAMP_TIME, config.stampTime)
                     putExtra(EXTRA_STAMP_GPS, config.stampGps)
                     putExtra(EXTRA_STAMP_SPEED, config.stampSpeed)

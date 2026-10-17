@@ -88,7 +88,8 @@ class QCarCamCaptureService : Service() {
             fisheye: Float,
             shape: Int
         ): String {
-            if (slot !in 0..3) return "Некорректный HUD slot"
+            checkBlindSlot(slot)
+            if (slot !in 0..9) return "Некорректный HUD slot"
             if (slot < 2) {
                 hudRequested[slot] = true
                 hudInputs[slot] = inputId
@@ -118,6 +119,7 @@ class QCarCamCaptureService : Service() {
             fisheye: Float,
             shape: Int
         ) {
+            checkBlindSlot(slot)
             NativeQCarCam.hudConfigure(slot, cropX, cropY, cropZoom, fisheye, shape)
         }
 
@@ -126,7 +128,8 @@ class QCarCamCaptureService : Service() {
             cropX: Float, cropY: Float, cropWidth: Float, cropHeight: Float,
             fisheye: Float, shape: Int, quarterTurns: Int
         ): String {
-            if (slot !in 0..3) return "Некорректный HUD slot"
+            checkBlindSlot(slot)
+            if (slot !in 0..9) return "Некорректный HUD slot"
             if (slot < 2) {
                 hudRequested[slot] = true
                 hudInputs[slot] = inputId
@@ -152,13 +155,15 @@ class QCarCamCaptureService : Service() {
             slot: Int, cropX: Float, cropY: Float, cropWidth: Float, cropHeight: Float,
             fisheye: Float, shape: Int, quarterTurns: Int
         ) {
+            checkBlindSlot(slot)
             NativeQCarCam.hudConfigureV2(
                 slot, cropX, cropY, cropWidth, cropHeight, fisheye, shape, quarterTurns
             )
         }
 
         override fun stopHud(slot: Int) {
-            if (slot !in 0..3) return
+            checkBlindSlot(slot)
+            if (slot !in 0..9) return
             NativeQCarCam.hudStop(slot)
             if (slot < 2) {
                 hudRequested[slot] = false
@@ -168,9 +173,21 @@ class QCarCamCaptureService : Service() {
             }
         }
 
-        override fun hudStatus(slot: Int): String = NativeQCarCam.hudStatus(slot)
+        override fun hudStatus(slot: Int): String {
+            checkBlindSlot(slot)
+            return NativeQCarCam.hudStatus(slot)
+        }
 
-        override fun hudStats(slot: Int): LongArray = NativeQCarCam.hudStats(slot)
+        override fun hudStats(slot: Int): LongArray {
+            checkBlindSlot(slot)
+            return NativeQCarCam.hudStats(slot)
+        }
+
+        override fun reportBlindHealth(enabled: Boolean, connected: Boolean, video: Boolean, error: String) {
+            GCamHealthReporter.send(this@QCarCamCaptureService,
+                GCamHealthReporter.SOURCE_BLIND, enabled = enabled,
+                hudConnected = connected, videoReceived = video, error = error.take(120))
+        }
 
         override fun setHudClientActive(slot: Int, active: Boolean) {
             if (slot !in 0..1) return
@@ -183,6 +200,15 @@ class QCarCamCaptureService : Service() {
                 lastLiveVideoAtMs = 0L
             }
             publishHudHealth()
+        }
+    }
+
+    private fun checkBlindSlot(slot: Int) {
+        if (slot >= 6 && Binder.getCallingUidOrThrow() != android.os.Process.myUid()) {
+            throw SecurityException("Плавающие окна gCam доступны только gCam")
+        }
+        if (CaptureClientTrust.isBlindCaller(this, Binder.getCallingUidOrThrow()) && slot !in listOf(2, 3, 5)) {
+            throw SecurityException("gBlind может использовать только слоты приборки 2 и 3 и редактор 5")
         }
     }
 
@@ -308,6 +334,7 @@ class QCarCamCaptureService : Service() {
             GCamHealthReporter.SOURCE_HUD,
             hudConnected = hudConnected,
             videoReceived = hudVideoReceived,
+            enabled = hudConnected || hudRequested.any { it },
             error = hudError
         )
     }

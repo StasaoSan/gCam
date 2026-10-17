@@ -4,6 +4,7 @@
 
     <queries>
         <package android:name="com.g992.anhud" />
+        <package android:name="com.stasao.gblind" />
     </queries>
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
@@ -59,6 +60,14 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Shows a small persistent camera and recording health indicator" />
+        </service>
+        <service
+            android:name=".GCamCameraOverlayService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Shows an optional floating preview of the four vehicle cameras" />
         </service>
         <service
             android:name=".GCamAccessibilityService"

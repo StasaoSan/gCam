@@ -15,12 +15,14 @@ object GCamRuntimeController {
             return
         }
         startOverlayIfAllowed(context, config)
+        applyCameraOverlaySetting(context, config.cameraOverlay)
         if (config.recordingAutostart) DashcamService.start(context)
     }
 
     fun startAfterManualLaunch(context: Context) {
         startCameraBridge(context)
         startOverlayIfAllowed(context, GCamRuntimeSettings.load(context))
+        applyCameraOverlaySetting(context, GCamRuntimeSettings.load(context).cameraOverlay)
     }
 
     fun applyOverlaySetting(context: Context, enabled: Boolean) {
@@ -29,6 +31,12 @@ object GCamRuntimeController {
         } else {
             context.stopService(Intent(context, GCamStatusOverlayService::class.java))
         }
+    }
+
+    fun applyCameraOverlaySetting(context: Context, enabled: Boolean) {
+        val intent = Intent(context, GCamCameraOverlayService::class.java)
+        if (enabled && Settings.canDrawOverlays(context)) startForeground(context, intent)
+        else context.stopService(intent)
     }
 
     fun updateOverlayPosition(context: Context, x: Float, y: Float) {
