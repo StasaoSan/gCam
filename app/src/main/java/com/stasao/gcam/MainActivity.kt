@@ -9,6 +9,7 @@ import android.content.IntentFilter
 import android.net.Uri
 import android.os.Bundle
 import android.os.Build
+import android.os.SystemClock
 import android.content.pm.PackageManager
 import android.provider.Settings
 import android.widget.VideoView
@@ -48,6 +49,9 @@ import java.util.Locale
 
 private data class CameraInput(val id: Int, val title: String)
 private data class CameraDiagnostics(val zeroCopy: Boolean, val fps: Double, val maxGapMs: Double)
+private data class LinkHealth(val receivedAt: Long = 0, val enabled: Boolean = false,
+                              val connected: Boolean = false, val video: Boolean = false,
+                              val error: String? = null)
 private val cameraInputs = listOf(CameraInput(0, "Левая"), CameraInput(1, "Правая"), CameraInput(2, "Перед"), CameraInput(3, "Зад"))
 
 class MainActivity : ComponentActivity() {
@@ -117,6 +121,7 @@ class MainActivity : ComponentActivity() {
 @Composable private fun GCamApp() {
     val context = LocalContext.current
     val baseDensity = LocalDensity.current
+    val appVersion = remember(context) { GCamUpdater.installedVersion(context) }
     var uiScale by remember { mutableFloatStateOf(RecorderSettings.loadUiScale(context)) }
     var tab by remember { mutableIntStateOf(0) }
     var updateAvailable by remember { mutableStateOf(false) }
@@ -129,7 +134,7 @@ class MainActivity : ComponentActivity() {
     }
     CompositionLocalProvider(LocalDensity provides Density(baseDensity.density * uiScale, baseDensity.fontScale)) {
     Scaffold(topBar = { Column {
-        TopAppBar(title = { Text("Камеры 360°") }, colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primaryContainer))
+        TopAppBar(title = { Text("Камеры 360° · v$appVersion") }, colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primaryContainer))
         PrimaryTabRow(selectedTabIndex = tab) { listOf("Камеры и запись", "Записи", if (updateAvailable) "Обновление ●" else "Обновление").forEachIndexed { i, title ->
             Tab(selected = tab == i, onClick = { tab = i }, text = { Text(title) })
         } }
@@ -139,7 +144,8 @@ class MainActivity : ComponentActivity() {
                 uiScale = it
                 RecorderSettings.saveUiScale(context, it)
             }
-            1 -> RecordingsScreen(recorder.recording)
+            1 -> RecordingsScreen(recorder.recording, recorder.warning,
+                recorder.recording && recorder.cameras.values.any { it.recording })
             else -> UpdateScreen(recorder.recording)
         }
     } }
@@ -238,6 +244,45 @@ class MainActivity : ComponentActivity() {
     var folderError by remember { mutableStateOf<String?>(null) }
     var showQualityWarning by remember { mutableStateOf(false) }
     var showInternalWarning by remember { mutableStateOf(false) }
+    var hudHealth by remember { mutableStateOf(LinkHealth()) }
+    var blindHealth by remember { mutableStateOf(LinkHealth()) }
+    var recorderVideoAt by remember { mutableLongStateOf(0L) }
+    var healthNow by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+    var usbError by remember { mutableStateOf<String?>(null) }
+    var config by remember { mutableStateOf(RecorderSettings.load(context)) }
+    LaunchedEffect(config) { RecorderSettings.save(context, config) }
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action != GCamHealthReporter.ACTION_HEALTH) return
+                val state = LinkHealth(SystemClock.elapsedRealtime(),
+                    intent.getBooleanExtra(GCamHealthReporter.EXTRA_ENABLED, false),
+                    intent.getBooleanExtra(GCamHealthReporter.EXTRA_HUD_CONNECTED, false),
+                    intent.getBooleanExtra(GCamHealthReporter.EXTRA_VIDEO_RECEIVED, false),
+                    intent.getStringExtra(GCamHealthReporter.EXTRA_ERROR))
+                when (intent.getStringExtra(GCamHealthReporter.EXTRA_SOURCE)) {
+                    GCamHealthReporter.SOURCE_HUD -> hudHealth = state
+                    GCamHealthReporter.SOURCE_BLIND -> blindHealth = state
+                    GCamHealthReporter.SOURCE_RECORDER -> if (
+                        intent.getBooleanExtra(GCamHealthReporter.EXTRA_RECORDING_VIDEO, false)
+                    ) recorderVideoAt = SystemClock.elapsedRealtime()
+                }
+            }
+        }
+        ContextCompat.registerReceiver(context, receiver, IntentFilter(GCamHealthReporter.ACTION_HEALTH),
+            ContextCompat.RECEIVER_NOT_EXPORTED)
+        onDispose { context.unregisterReceiver(receiver) }
+    }
+    LaunchedEffect(config.storage, externalFolderRevision, driveListRevision) {
+        while (true) {
+            usbError = if (config.storage == RecordingStorage.EXTERNAL) withContext(Dispatchers.IO) {
+                runCatching { RecordingStore.validateExternal(context) }
+                    .getOrElse { it.message ?: "Ошибка USB" }
+            } else null
+            healthNow = SystemClock.elapsedRealtime()
+            delay(3_000)
+        }
+    }
     val removableDrives = remember(driveListRevision, externalFolderRevision) {
         RecordingStore.removableDrives(context)
     }
@@ -246,7 +291,6 @@ class MainActivity : ComponentActivity() {
         externalFolderRevision++
         folderError = RecordingStore.validateExternal(context)
     }
-    var config by remember { mutableStateOf(RecorderSettings.load(context)) }
     val storage = remember(state.usedBytes, config.storage, externalFolderRevision) {
         RecordingStore.storageStats(context, config.storage)
     }
@@ -263,6 +307,7 @@ class MainActivity : ComponentActivity() {
     var runtimeConfig by remember { mutableStateOf(GCamRuntimeSettings.load(context)) }
     var anhudAccess by remember { mutableStateOf(CaptureClientTrust.status(context)) }
     var blindAccess by remember { mutableStateOf(CaptureClientTrust.blindStatus(context)) }
+    var zonesAccess by remember { mutableStateOf(CaptureClientTrust.zonesStatus(context)) }
     var anhudAccessMessage by remember { mutableStateOf<String?>(null) }
     var overlayAllowed by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
     var locationAllowed by remember { mutableStateOf(context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) }
@@ -274,11 +319,19 @@ class MainActivity : ComponentActivity() {
             if (nowAllowed && !overlayAllowed && runtimeConfig.cameraOverlay) {
                 GCamRuntimeController.applyCameraOverlaySetting(context, true)
             }
+            if (nowAllowed && !overlayAllowed &&
+                (runtimeConfig.statusOverlay || runtimeConfig.blindStatusOverlay || runtimeConfig.hudStatusOverlay)) {
+                GCamRuntimeController.applyOverlaySetting(context)
+            }
+            if (nowAllowed && !overlayAllowed && runtimeConfig.recordOverlay) {
+                GCamRuntimeController.applyRecordOverlaySetting(context, true)
+            }
             overlayAllowed = nowAllowed
             runtimeConfig = GCamRuntimeSettings.load(context)
             locationAllowed = context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
             anhudAccess = CaptureClientTrust.status(context)
             blindAccess = CaptureClientTrust.blindStatus(context)
+            zonesAccess = CaptureClientTrust.zonesStatus(context)
             delay(1_000)
         }
     }
@@ -292,7 +345,7 @@ class MainActivity : ComponentActivity() {
         val controllerToClose = previewController
         RecorderDiagnostics.record(context, "record_button_start previewActive=${controllerToClose != null} cameras=${config.cameraIds.sorted()} storage=${config.storage}")
         preparing = true
-        RecorderRepository.update(RecorderState(recording = true, status = "Подготовка записи…"))
+        RecorderRepository.update(RecorderRepository.state.value.copy(recording = true, status = "Подготовка записи…"))
         scope.launch {
             runCatching {
                 withContext(Dispatchers.IO) { controllerToClose?.close() }
@@ -301,7 +354,8 @@ class MainActivity : ComponentActivity() {
                 DashcamService.start(context, config)
             }.onFailure {
                 RecorderDiagnostics.record(context, "record_button_error type=${it.javaClass.simpleName} message=${it.message}")
-                RecorderRepository.update(RecorderState(status = "Не удалось запустить запись: ${it.message}"))
+                RecorderRepository.update(RecorderRepository.state.value.copy(recording = false,
+                    status = "Не удалось запустить запись: ${it.message}"))
             }
             preparing = false
         }
@@ -318,6 +372,7 @@ class MainActivity : ComponentActivity() {
         title = { Text("Запись во внутреннюю память") },
         text = { Text("Длительная запись четырёх камер создаёт постоянную нагрузку на внутренний накопитель и расходует его ресурс. По возможности используйте USB-накопитель.") },
         confirmButton = { TextButton(onClick = {
+            RecorderSettings.saveStorage(context, RecordingStorage.INTERNAL)
             config = config.copy(storage = RecordingStorage.INTERNAL)
             RecorderSettings.save(context, config)
             showInternalWarning = false
@@ -329,6 +384,10 @@ class MainActivity : ComponentActivity() {
         contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 120.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        state.warning?.let { warning ->
+            item { RecorderWarningBanner(warning,
+                state.recording && state.cameras.values.any { it.recording }) }
+        }
         item {
             if (!state.recording && !preparing && !(runtimeConfig.cameraOverlay && overlayAllowed)) MultiCameraGrid(
                 onMounted = { previewController = it },
@@ -340,6 +399,27 @@ class MainActivity : ComponentActivity() {
             else Surface(color = Color(0xFF1B5E20), shape = MaterialTheme.shapes.medium) {
                 Text(if (preparing) "Останавливаю превью и запускаю запись…" else state.status,
                     color = Color.White, modifier = Modifier.fillMaxWidth().padding(14.dp))
+            }
+        }
+        item {
+            val adviceState: (CaptureClientTrust.Status, LinkHealth) -> ImagePathAdvice.State = { access, health ->
+                ImagePathAdvice.State(
+                    installed = access.installed,
+                    access = access.sameSigner || access.approved,
+                    reportFresh = health.receivedAt > 0L && healthNow - health.receivedAt <= 6_000L,
+                    enabled = health.enabled,
+                    connected = health.connected,
+                    video = health.video,
+                    error = health.error,
+                )
+            }
+            Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = MaterialTheme.shapes.medium) {
+                Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Почему нет изображения?", style = MaterialTheme.typography.titleMedium)
+                    Text("Штатное 360° работает отдельно. Проверьте живые боковые камеры в превью выше, затем путь до нужного экрана.", fontSize = 13.sp)
+                    Text("Проекция: ${ImagePathAdvice.explain("ANHUD", adviceState(anhudAccess, hudHealth))}", fontSize = 13.sp)
+                    Text("Приборка: ${ImagePathAdvice.explain("gBlind", adviceState(blindAccess, blindHealth))}", fontSize = 13.sp)
+                }
             }
         }
         item { Surface(color = if (state.recording) Color(0xFF1B5E20) else MaterialTheme.colorScheme.surfaceVariant, shape = MaterialTheme.shapes.medium) {
@@ -385,9 +465,10 @@ class MainActivity : ComponentActivity() {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(selected = config.storage == RecordingStorage.EXTERNAL, enabled = enabled,
                     onClick = {
+                        RecorderSettings.saveStorage(context, RecordingStorage.EXTERNAL)
                         config = config.copy(storage = RecordingStorage.EXTERNAL)
                         RecorderSettings.save(context, config)
-                    }, label = { Text("USB · основной") }, modifier = Modifier.weight(1f))
+                    }, label = { Text("USB") }, modifier = Modifier.weight(1f))
                 FilterChip(selected = config.storage == RecordingStorage.INTERNAL, enabled = enabled,
                     onClick = { showInternalWarning = true }, label = { Text("Внутренняя") }, modifier = Modifier.weight(1f))
             }
@@ -479,8 +560,30 @@ class MainActivity : ComponentActivity() {
                 GCamRuntimeSettings.save(context, runtimeConfig)
             }
             RuntimeSwitchRow(
-                title = "Точка состояния",
-                subtitle = if (overlayAllowed) "Показывать поверх других приложений" else "Нужно разрешение на показ поверх окон",
+                title = "Точка: gCam + gBlind",
+                subtitle = "Камера приборки и запись: красный — нет связи; синий — кадр был, запись не нужна; оранжевый — запись ожидается; зелёный — пишет",
+                checked = runtimeConfig.blindStatusOverlay
+            ) { checked ->
+                runtimeConfig = runtimeConfig.copy(blindStatusOverlay = checked)
+                GCamRuntimeSettings.save(context, runtimeConfig)
+                if (checked && !Settings.canDrawOverlays(context)) {
+                    context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}")))
+                } else GCamRuntimeController.applyOverlaySetting(context)
+            }
+            RuntimeSwitchRow(
+                title = "Точка: gCam + ANHUD",
+                subtitle = "Камера проекции и запись: красный — нет связи; синий — кадр был, запись не нужна; оранжевый — запись ожидается; зелёный — пишет",
+                checked = runtimeConfig.hudStatusOverlay
+            ) { checked ->
+                runtimeConfig = runtimeConfig.copy(hudStatusOverlay = checked)
+                GCamRuntimeSettings.save(context, runtimeConfig)
+                if (checked && !Settings.canDrawOverlays(context)) {
+                    context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}")))
+                } else GCamRuntimeController.applyOverlaySetting(context)
+            }
+            RuntimeSwitchRow(
+                title = "Точка: gCam + ANHUD + gBlind",
+                subtitle = "Разделена пополам: слева проекция, справа приборка; каждая половина учитывает запись",
                 checked = runtimeConfig.statusOverlay
             ) { checked ->
                 runtimeConfig = runtimeConfig.copy(statusOverlay = checked)
@@ -488,7 +591,7 @@ class MainActivity : ComponentActivity() {
                 if (checked && !Settings.canDrawOverlays(context)) {
                     context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}")))
                 } else {
-                    GCamRuntimeController.applyOverlaySetting(context, checked)
+                    GCamRuntimeController.applyOverlaySetting(context)
                 }
             }
             RuntimeSwitchRow(
@@ -504,6 +607,31 @@ class MainActivity : ComponentActivity() {
                     GCamRuntimeController.applyCameraOverlaySetting(context, checked)
                 }
             }
+            RuntimeSwitchRow(
+                title = "Плавающая кнопка записи",
+                subtitle = if (overlayAllowed) "Отдельная кнопка: красный — ошибка камер; синий — готово, запись выключена; оранжевый — USB не готов; зелёный — запись идёт. Нажмите для старта/остановки, перетащите для перемещения"
+                    else "Нужно разрешение на показ поверх окон",
+                checked = runtimeConfig.recordOverlay
+            ) { checked ->
+                runtimeConfig = runtimeConfig.copy(recordOverlay = checked)
+                GCamRuntimeSettings.save(context, runtimeConfig)
+                if (checked && !Settings.canDrawOverlays(context)) {
+                    context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}")))
+                } else {
+                    GCamRuntimeController.applyRecordOverlaySetting(context, checked)
+                }
+            }
+            Text("Размер кнопки записи: ${runtimeConfig.recordOverlaySizeDp} dp", fontSize = 13.sp)
+            Slider(
+                value = runtimeConfig.recordOverlaySizeDp.toFloat(),
+                onValueChange = { value ->
+                    runtimeConfig = runtimeConfig.copy(recordOverlaySizeDp = value.toInt())
+                    GCamRuntimeSettings.save(context, runtimeConfig)
+                    GCamRuntimeController.updateRecordOverlay(context)
+                },
+                valueRange = 88f..180f,
+                enabled = runtimeConfig.recordOverlay && overlayAllowed
+            )
             Text("Позиция по горизонтали: ${(runtimeConfig.statusOverlayX * 100).toInt()}%", fontSize = 13.sp)
             Slider(
                 value = runtimeConfig.statusOverlayX,
@@ -538,9 +666,11 @@ class MainActivity : ComponentActivity() {
                 valueRange = 0f..1f,
                 enabled = runtimeConfig.statusOverlay && overlayAllowed
             )
-            Text("● красный — нет связи с ANHUD или кадров", color = Color(0xFFF44336), fontSize = 12.sp)
-            Text("● оранжевый — связь установлена, видео получено", color = Color(0xFFFF9800), fontSize = 12.sp)
-            Text("● зелёный — видео получено и идёт запись", color = Color(0xFF4CAF50), fontSize = 12.sp)
+            Text("Точки можно перетаскивать независимо; короткое нажатие открывает gCam.", fontSize = 12.sp)
+            Text("● красный — нет связи или сигнала", color = Color(0xFFF44336), fontSize = 12.sp)
+            Text("● синий — сигнал получен, запись не запланирована", color = Color(0xFF2196F3), fontSize = 12.sp)
+            Text("● оранжевый — сигнал получен, но ожидаемая запись не идёт", color = Color(0xFFFF9800), fontSize = 12.sp)
+            Text("● зелёный — сигнал получен и запись идёт", color = Color(0xFF4CAF50), fontSize = 12.sp)
             TextButton(onClick = { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }) {
                 Text("Открыть специальные возможности")
             }
@@ -556,8 +686,8 @@ class MainActivity : ComponentActivity() {
                     !anhudAccess.installed -> "ANHUD не установлен. После установки откройте эту страницу снова."
                     anhudAccess.sameSigner -> "Доступ разрешён автоматически: ANHUD подписан тем же ключом, что и gCam."
                     anhudAccess.approved -> "Доступ разрешён для установленной версии ANHUD."
-                    anhudAccess.signerChanged -> "Подпись ANHUD изменилась. Подтвердите доступ заново."
-                    else -> "ANHUD подписан другим ключом. Подтвердите доступ к боковым камерам."
+                    anhudAccess.signerChanged -> "Предупреждение: подпись ANHUD изменилась. Автодоступ отключён; проверьте сборку и подтвердите доступ вручную."
+                    else -> "Предупреждение: ANHUD подписан неизвестным ключом. Автодоступ отключён; проверьте сборку и подтвердите доступ вручную."
                 },
                 fontSize = 13.sp
             )
@@ -585,10 +715,10 @@ class MainActivity : ComponentActivity() {
             SectionTitle("Доступ gBlind к камерам приборки")
             Text(when {
                 !blindAccess.installed -> "gBlind не установлен"
-                blindAccess.sameSigner -> "Доступ разрешён: приложения подписаны одинаково"
+                blindAccess.sameSigner -> "Доступ выдан автоматически: gBlind подписан тем же ключом, что и gCam."
                 blindAccess.approved -> "Доступ к камерам приборки разрешён"
-                blindAccess.signerChanged -> "Подпись gBlind изменилась — подтвердите снова"
-                else -> "Подтвердите доступ gBlind к отдельным слотам камер приборки"
+                blindAccess.signerChanged -> "Предупреждение: подпись gBlind изменилась. Автодоступ отключён; проверьте сборку и подтвердите доступ вручную."
+                else -> "Предупреждение: gBlind подписан неизвестным ключом. Автодоступ отключён; проверьте сборку и подтвердите доступ вручную."
             }, fontSize = 13.sp)
             if (blindAccess.installed && !blindAccess.sameSigner) {
                 OutlinedButton(onClick = {
@@ -598,6 +728,23 @@ class MainActivity : ComponentActivity() {
                 }) { Text(if (blindAccess.approved) "Отозвать доступ" else "Разрешить gBlind") }
             }
         }
+        item {
+            SectionTitle("Доступ gZones к боковым камерам")
+            Text(when {
+                !zonesAccess.installed -> "gZones не установлен"
+                zonesAccess.sameSigner -> "Доступ выдан автоматически: приложения подписаны одним ключом."
+                zonesAccess.approved -> "Доступ к двум потокам анализа разрешён"
+                zonesAccess.signerChanged -> "Подпись gZones изменилась. Проверьте сборку и подтвердите доступ снова."
+                else -> "Проверьте установленный gZones и разрешите доступ к камерам."
+            }, fontSize = 13.sp)
+            if (zonesAccess.installed && !zonesAccess.sameSigner) {
+                OutlinedButton(onClick = {
+                    if (zonesAccess.approved) CaptureClientTrust.revokeZones(context)
+                    else CaptureClientTrust.approveZones(context)
+                    zonesAccess = CaptureClientTrust.zonesStatus(context)
+                }) { Text(if (zonesAccess.approved) "Отозвать доступ" else "Разрешить gZones") }
+            }
+        }
         item { Button(onClick = {
             if (state.recording) DashcamService.stop(context)
             else if (config.cameraIds.size == 4 && config.width == 1280) showQualityWarning = true
@@ -605,6 +752,28 @@ class MainActivity : ComponentActivity() {
         }, enabled = !preparing && (state.recording || config.cameraIds.isNotEmpty()), modifier = Modifier.fillMaxWidth()) {
             Text(if (state.recording) "Остановить запись" else "Начать запись")
         } }
+        item {
+            val linkText: (LinkHealth) -> String = { link -> when {
+                !link.enabled -> "выключен"
+                healthNow - link.receivedAt > 6_000 -> "нет свежего статуса"
+                !link.error.isNullOrBlank() -> "ошибка: ${link.error}"
+                link.connected && link.video -> "связь и кадры есть"
+                link.connected -> "связь есть, кадры ожидаются"
+                else -> "нет связи"
+            } }
+            Text("ANHUD: ${linkText(hudHealth)}", fontSize = 13.sp)
+            Text("gBlind: ${linkText(blindHealth)}", fontSize = 13.sp)
+            val videoRecording = state.recording && recorderVideoAt > 0 && healthNow - recorderVideoAt <= 6_000L
+            val recordText = when {
+                videoRecording -> "запись идёт"
+                state.recording -> state.status
+                config.storage == RecordingStorage.EXTERNAL && usbError != null -> "USB не готов: $usbError"
+                state.status.startsWith("Запись не запущена") || state.status.startsWith("Не удалось") -> state.status
+                config.storage == RecordingStorage.INTERNAL -> "запись не идёт · выбрана внутренняя память"
+                else -> "запись не идёт · USB готов"
+            }
+            Text("Регистратор: $recordText", fontSize = 13.sp)
+        }
         item {
             OutlinedButton(
                 onClick = { runCatching { RecorderDiagnostics.share(context) } },
@@ -679,6 +848,10 @@ class MainActivity : ComponentActivity() {
                                 val now = System.nanoTime()
                                 if (stats.size >= 17 && stats[1] > 0) {
                                     val frames = stats[1]
+                                    if (frames > previousFrames) {
+                                        GCamHealthReporter.send(context, GCamHealthReporter.SOURCE_CAMERA,
+                                            videoReceived = true)
+                                    }
                                     val elapsed = (now - previousTime).coerceAtLeast(1L) / 1_000_000_000.0
                                     val fps = if (previousFrames > 0) (frames - previousFrames).coerceAtLeast(0) / elapsed else 0.0
                                     diagnostics = CameraDiagnostics(stats[16] != 0L, fps, stats[15] / 1_000.0)
@@ -720,7 +893,23 @@ class MainActivity : ComponentActivity() {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { options.forEach { (v, title) -> FilterChip(selected = selected == v, enabled = enabled, onClick = { onSelect(v) }, label = { Text(title) }, modifier = Modifier.weight(1f)) } }
 }
 
-@Composable private fun RecordingsScreen(recording: Boolean) {
+@Composable private fun RecorderWarningBanner(warning: String, recordingActive: Boolean) {
+    val context = LocalContext.current
+    Surface(color = Color(0xFFFFE0B2), shape = MaterialTheme.shapes.medium) {
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Предупреждение о записи", style = MaterialTheme.typography.titleMedium,
+                color = Color(0xFF4E2600))
+            Text(warning, color = Color(0xFF4E2600))
+            Text(if (recordingActive) "Запись продолжена." else "Запись сейчас не идёт или восстанавливается.",
+                color = Color(0xFF4E2600), fontSize = 13.sp)
+            TextButton(onClick = { runCatching { RecorderDiagnostics.share(context) } }) {
+                Text("Поделиться диагностикой")
+            }
+        }
+    }
+}
+
+@Composable private fun RecordingsScreen(recording: Boolean, warning: String?, recordingActive: Boolean) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var revision by remember { mutableIntStateOf(0) }
@@ -745,6 +934,7 @@ class MainActivity : ComponentActivity() {
         contentPadding = PaddingValues(start = 12.dp, top = 12.dp, end = 12.dp, bottom = 120.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
+        warning?.let { message -> item { RecorderWarningBanner(message, recordingActive) } }
         item {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("USB/gCam и Movies/gCam · ${timelines.size} записей / ${recordings.size} файлов · ${formatBytes(recordings.sumOf { it.sizeBytes })}", style = MaterialTheme.typography.titleMedium)

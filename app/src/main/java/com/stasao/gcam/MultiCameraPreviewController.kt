@@ -7,8 +7,18 @@ import android.content.ServiceConnection
 import android.os.IBinder
 import android.view.Surface
 import java.util.concurrent.ConcurrentHashMap
+import java.util.Collections
+import java.util.WeakHashMap
 
 class MultiCameraPreviewController(context: Context) {
+    companion object {
+        private val active = Collections.newSetFromMap(WeakHashMap<MultiCameraPreviewController, Boolean>())
+
+        fun closeAll() {
+            val controllers = synchronized(active) { active.toList() }
+            controllers.forEach { it.close() }
+        }
+    }
     private val appContext = context.applicationContext
     private val surfaces = ConcurrentHashMap<Int, Surface>()
     private var capture: IQCarCamCapture? = null
@@ -30,6 +40,7 @@ class MultiCameraPreviewController(context: Context) {
     }
 
     init {
+        synchronized(active) { active.add(this) }
         appContext.bindService(
             Intent(appContext, QCarCamCaptureService::class.java), connection, Context.BIND_AUTO_CREATE
         )
@@ -62,6 +73,7 @@ class MultiCameraPreviewController(context: Context) {
     @Synchronized fun close() {
         if (closed) return
         closed = true
+        synchronized(active) { active.remove(this) }
         surfaces.keys.toList().forEach(::stop)
         runCatching { appContext.unbindService(connection) }
         capture = null

@@ -11,8 +11,10 @@ import java.security.MessageDigest
 internal object CaptureClientTrust {
     private const val ANHUD_PACKAGE = "com.g992.anhud"
     private const val BLIND_PACKAGE = "com.stasao.gblind"
+    private const val ZONES_PACKAGE = "com.stasao.gzones"
     private const val TRUST_FILE = "anhud_camera_signer.sha256"
     private const val BLIND_TRUST_FILE = "gblind_camera_signer.sha256"
+    private const val ZONES_TRUST_FILE = "gzones_camera_signer.sha256"
 
     data class Status(
         val installed: Boolean,
@@ -23,6 +25,7 @@ internal object CaptureClientTrust {
 
     fun status(context: Context): Status = statusFor(context, ANHUD_PACKAGE, TRUST_FILE)
     fun blindStatus(context: Context): Status = statusFor(context, BLIND_PACKAGE, BLIND_TRUST_FILE)
+    fun zonesStatus(context: Context): Status = statusFor(context, ZONES_PACKAGE, ZONES_TRUST_FILE)
 
     private fun statusFor(context: Context, appPackage: String, fileName: String): Status {
         val signer = currentSigner(context, appPackage) ?: return Status(false, false, false, false)
@@ -34,6 +37,7 @@ internal object CaptureClientTrust {
 
     fun approve(context: Context): Boolean = approveFor(context, ANHUD_PACKAGE, TRUST_FILE)
     fun approveBlind(context: Context): Boolean = approveFor(context, BLIND_PACKAGE, BLIND_TRUST_FILE)
+    fun approveZones(context: Context): Boolean = approveFor(context, ZONES_PACKAGE, ZONES_TRUST_FILE)
 
     private fun approveFor(context: Context, appPackage: String, fileName: String): Boolean {
         val signer = currentSigner(context, appPackage) ?: return false
@@ -51,9 +55,13 @@ internal object CaptureClientTrust {
 
     fun revoke(context: Context) = trustFile(context, TRUST_FILE).delete()
     fun revokeBlind(context: Context) = trustFile(context, BLIND_TRUST_FILE).delete()
+    fun revokeZones(context: Context) = trustFile(context, ZONES_TRUST_FILE).delete()
 
     fun isBlindCaller(context: Context, uid: Int): Boolean =
         context.packageManager.getPackagesForUid(uid)?.contains(BLIND_PACKAGE) == true
+
+    fun isZonesCaller(context: Context, uid: Int): Boolean =
+        context.packageManager.getPackagesForUid(uid)?.contains(ZONES_PACKAGE) == true
 
     fun enforceCaller(context: Context, callingUid: Int, transactionCode: Int) {
         if (callingUid == Process.myUid()) return
@@ -74,11 +82,20 @@ internal object CaptureClientTrust {
         val manager = context.packageManager
         // Check the actual Binder UID first; an Intent extra or a claimed package name is forgeable.
         val blind = isBlindCaller(context, callingUid)
-        val appPackage = if (blind) BLIND_PACKAGE else ANHUD_PACKAGE
-        val fileName = if (blind) BLIND_TRUST_FILE else TRUST_FILE
+        val zones = isZonesCaller(context, callingUid)
+        val appPackage = when {
+            zones -> ZONES_PACKAGE
+            blind -> BLIND_PACKAGE
+            else -> ANHUD_PACKAGE
+        }
+        val fileName = when {
+            zones -> ZONES_TRUST_FILE
+            blind -> BLIND_TRUST_FILE
+            else -> TRUST_FILE
+        }
         if (manager.getPackagesForUid(callingUid)?.contains(appPackage) != true ||
             (blindReport && !blind)) {
-            throw SecurityException("Доступ к камерам gCam разрешён только ANHUD или gBlind")
+            throw SecurityException("Доступ к камерам gCam разрешён только ANHUD, gBlind или gZones")
         }
         if (blind && !blindReport && transactionCode !in setOf(
                 IQCarCamCapture.Stub.TRANSACTION_startHudV2,
@@ -87,6 +104,13 @@ internal object CaptureClientTrust {
                 IQCarCamCapture.Stub.TRANSACTION_hudStatus,
                 IQCarCamCapture.Stub.TRANSACTION_hudStats)) {
             throw SecurityException("gBlind не может управлять проекцией")
+        }
+        if (zones && transactionCode !in setOf(
+                IQCarCamCapture.Stub.TRANSACTION_startHudV2,
+                IQCarCamCapture.Stub.TRANSACTION_stopHud,
+                IQCarCamCapture.Stub.TRANSACTION_hudStatus,
+                IQCarCamCapture.Stub.TRANSACTION_hudStats)) {
+            throw SecurityException("gZones может только читать свои потоки")
         }
         if (manager.checkSignatures(callingUid, Process.myUid()) == PackageManager.SIGNATURE_MATCH) {
             return // Existing debug builds signed by the same Android debug key.

@@ -42,11 +42,18 @@ object RecorderSettings {
             putInt("bitrate_mbps", config.bitrateMbps)
             putInt("segment_minutes", config.segmentMinutes)
             putInt("storage_limit_gb", config.storageLimitGb)
-            putString("storage", config.storage.name)
+            // Destination is saved only by an explicit user choice. A stale UI configuration
+            // must not silently switch INTERNAL back to the default EXTERNAL destination.
             putBoolean("stamp_time", config.stampTime)
             putBoolean("stamp_gps", config.stampGps)
             putBoolean("stamp_speed", config.stampSpeed)
         }.commit()
+    }
+
+    fun saveStorage(context: Context, storage: RecordingStorage) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("storage", storage.name)
+            .commit()
     }
 
     fun externalTree(context: Context): Uri? = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

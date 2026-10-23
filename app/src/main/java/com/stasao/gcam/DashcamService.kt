@@ -40,6 +40,11 @@ class DashcamService : Service() {
     private var statsJob: Job? = null
     private var maintenanceJob: Job? = null
     private var startupJob: Job? = null
+    private var recoveryJob: Job? = null
+    @Volatile private var recoveryPending = false
+    @Volatile private var recoveryStartedElapsedMs = 0L
+    @Volatile private var lastRecoveryReason = ""
+    private var recoveryWarning: String? = null
     private var config = RecorderConfig()
     private var stampSource: RecorderStampSource? = null
     private var capture: IQCarCamCapture? = null
@@ -56,15 +61,18 @@ class DashcamService : Service() {
 
         override fun onServiceDisconnected(name: ComponentName?) {
             capture = null
-            captureBound = false
             errors[-1] = "Сервис камер отключился"
             RecorderDiagnostics.record(this@DashcamService, "capture_disconnected")
+            if (starting || encoders.isNotEmpty()) {
+                scope.launch(Dispatchers.Main) { recoverFromCameraFailure("Сервис камер отключился") }
+            }
         }
     }
 
     override fun onCreate() {
         super.onCreate()
         createChannel()
+        recoveryWarning = savedRecoveryWarning()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -106,56 +114,83 @@ class DashcamService : Service() {
         RecorderDiagnostics.record(this, "recording_start cameras=${config.cameraIds.sorted()} size=${config.width}x${config.height} fps=${config.fps} bitrateMbps=${config.bitrateMbps} segmentMinutes=${config.segmentMinutes} limitGb=${config.storageLimitGb} storage=${config.storage}")
         if (config.cameraIds.isEmpty()) {
             RecorderDiagnostics.record(this, "recording_rejected reason=no_cameras")
-            publish(RecorderState(status = "Выберите хотя бы одну камеру"))
-            starting = false
-            stopSelf()
+            startupFailed("Выберите хотя бы одну камеру")
             return
         }
         startForeground(NOTIFICATION_ID, notification("Запуск камер…"), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        publish(RecorderState(recording = true, status = "Освобождаю место для записи…"))
+        val waitForUsb = intent?.getBooleanExtra(EXTRA_WAIT_FOR_USB, false) == true
+        publish(RecorderState(recording = true, status = if (waitForUsb && config.storage == RecordingStorage.EXTERNAL)
+            "Ожидаю выбранный USB-накопитель…" else "Освобождаю место для записи…"))
         startupJob?.cancel()
         startupJob = scope.launch(Dispatchers.IO) {
-            val preflight = runCatching {
-                if (config.storage == RecordingStorage.EXTERNAL)
-                    RecordingStore.validateExternal(this@DashcamService)?.let { error(it) }
-                RecordingStore.removeInterrupted(this@DashcamService, config.storage)
-                RecordingStore.enforceLimit(this@DashcamService, config)
-            }
+            val preflight = runCatching { prepareArchive(waitForUsb) }
             if (!isActive) return@launch
             withContext(Dispatchers.Main) {
                 if (!starting) return@withContext
                 val maintenance = preflight.getOrElse { failure ->
-                    RecorderDiagnostics.record(this@DashcamService,
-                        "recording_rejected reason=archive_preflight type=${failure.javaClass.simpleName} message=${failure.message}")
-                    publish(RecorderState(status = "Запись не запущена: ${failure.message ?: "ошибка накопителя"}"))
-                    starting = false
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+                    RecorderDiagnostics.recordException(this@DashcamService,
+                        "recording_rejected reason=archive_preflight type=${failure.javaClass.name} message=${failure.message}", failure)
+                    startupFailed("Запись не запущена: ${failure.message ?: "ошибка накопителя"}")
                     return@withContext
                 }
                 RecorderDiagnostics.record(this@DashcamService,
                     "archive_preflight deleted=${maintenance.deletedFiles} usedBytes=${maintenance.usedBytes} freeBytes=${maintenance.freeBytes} ready=${maintenance.ready}")
                 if (!maintenance.ready) {
-                    publish(RecorderState(status = "Запись не запущена: недостаточно места в лимите архива или все старые файлы защищены"))
-                    starting = false
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+                    startupFailed("Запись не запущена: недостаточно места в лимите архива или все старые файлы защищены")
                     return@withContext
                 }
                 errors.clear()
                 val captureIntent = Intent(this@DashcamService, QCarCamCaptureService::class.java)
-                if (!bindService(captureIntent, captureConnection, BIND_AUTO_CREATE)) {
+                val bound = runCatching { bindService(captureIntent, captureConnection, BIND_AUTO_CREATE) }
+                    .onFailure { RecorderDiagnostics.recordException(this@DashcamService,
+                        "recording_error reason=bind_failed type=${it.javaClass.name} message=${it.message}", it) }
+                    .getOrDefault(false)
+                if (bound) {
+                    captureBound = true
+                } else {
                     RecorderDiagnostics.record(this@DashcamService, "recording_error reason=bind_failed")
-                    starting = false
-                    publish(RecorderState(status = "Не удалось запустить сервис камер"))
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+                    recoverFromCameraFailure("Не удалось запустить сервис камер")
                 }
             }
         }
     }
 
+    private suspend fun prepareArchive(waitForUsb: Boolean): ArchiveMaintenance {
+        if (!waitForUsb || config.storage != RecordingStorage.EXTERNAL) {
+            if (config.storage == RecordingStorage.EXTERNAL)
+                RecordingStore.validateExternal(this)?.let { error(it) }
+            RecordingStore.removeInterrupted(this, config.storage)
+            return RecordingStore.enforceLimit(this, config)
+        }
+        val deadline = SystemClock.elapsedRealtime() + USB_WAIT_TIMEOUT_MS
+        var lastReason: String? = null
+        while (true) {
+            val attempt = runCatching {
+                RecordingStore.validateExternal(this)?.let { error(it) }
+                RecordingStore.removeInterrupted(this, config.storage)
+                RecordingStore.enforceLimit(this, config)
+            }
+            attempt.getOrNull()?.let {
+                RecorderDiagnostics.record(this, "autostart_usb_ready")
+                return it
+            }
+            val reason = attempt.exceptionOrNull()?.message ?: "Ошибка USB"
+            if (reason != lastReason) {
+                RecorderDiagnostics.record(this, "autostart_usb_wait reason=${reason.replace(' ', '_')}")
+                lastReason = reason
+            }
+            val remaining = deadline - SystemClock.elapsedRealtime()
+            if (remaining <= 0) error("USB не появился за 5 минут: $reason")
+            withContext(Dispatchers.Main) {
+                if (starting) publish(RecorderState(recording = true,
+                    status = "Ожидаю выбранный USB (${(remaining / 1_000).coerceAtLeast(1)} с)…"))
+            }
+            delay(minOf(USB_RETRY_INTERVAL_MS, remaining))
+        }
+    }
+
     private fun startEncoders() {
+        if (!starting) return
         val remote = capture ?: return
         val locationRequested = config.stampGps || config.stampSpeed
         val locationReady = locationRequested &&
@@ -178,21 +213,26 @@ class DashcamService : Service() {
                 }
             }.onFailure {
                 errors[id] = it.message ?: it.javaClass.simpleName
-                RecorderDiagnostics.record(this, "encoder_start_error input=$id type=${it.javaClass.simpleName} message=${it.message}")
+                RecorderDiagnostics.recordException(this,
+                    "encoder_start_error input=$id type=${it.javaClass.name} message=${it.message}", it)
             }
         }
         starting = false
         if (encoders.isEmpty()) {
             stampSource?.stop(); stampSource = null
-            val cameras = config.cameraIds.associateWith { id ->
-                CameraRecordingState(id, error = errors[id] ?: "Не удалось запустить")
-            }
-            publish(RecorderState(cameras = cameras, usedBytes = RecordingStore.usedBytes(this), status = "Запись не запущена"))
-            unbindCapture()
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            RecorderDiagnostics.record(this, "recording_start_no_cameras errors=${errors.toSortedMap()}")
+            scope.launch(Dispatchers.Main) { recoverFromCameraFailure("Камеры не запустились") }
             return
         }
+        if (encoders.size != config.cameraIds.size) {
+            val failedIds = config.cameraIds - encoders.keys
+            RecorderDiagnostics.record(this, "recording_partial_start failedInputs=${failedIds.sorted()} errors=${failedIds.map { errors[it] }}")
+            scope.launch(Dispatchers.Main) {
+                recoverFromCameraFailure("Не запустились камеры: ${failedIds.sorted().joinToString()}")
+            }
+            return
+        }
+        if (recoveryPending) recoveryStartedElapsedMs = SystemClock.elapsedRealtime()
         statsJob?.cancel()
         statsJob = scope.launch {
             val previous = mutableMapOf<Int, Pair<Long, Long>>()
@@ -274,8 +314,21 @@ class DashcamService : Service() {
                     val reason = errors[deadEncoder.inputId] ?: "Кодер камеры ${deadEncoder.inputId} остановился"
                     RecorderDiagnostics.record(this@DashcamService,
                         "recording_auto_stop reason=encoder_stopped input=${deadEncoder.inputId} error=$reason")
-                    scope.launch(Dispatchers.Main) { stopRecording("Запись остановлена: $reason") }
+                    scope.launch(Dispatchers.Main) { recoverFromCameraFailure(reason) }
                     break
+                }
+                if (recoveryPending) {
+                    if (encoders.values.all { it.outputFrames > 0 }) {
+                        recoveryPending = false
+                        RecorderDiagnostics.record(this@DashcamService,
+                            "recording_recovered cameras=${encoders.keys.sorted()} outputFrames=${encoders.mapValues { it.value.outputFrames }}")
+                        postRecoveryNotice("Запись всех камер восстановлена после сбоя: $lastRecoveryReason", recovered = true)
+                    } else if (SystemClock.elapsedRealtime() - recoveryStartedElapsedMs > RECOVERY_FRAME_TIMEOUT_MS) {
+                        RecorderDiagnostics.record(this@DashcamService,
+                            "recording_recovery_no_frames outputFrames=${encoders.mapValues { it.value.outputFrames }}")
+                        scope.launch(Dispatchers.Main) { recoverFromCameraFailure("Нет кадров после перезапуска камер") }
+                        break
+                    }
                 }
                 if (tick++ % (if (config.storage == RecordingStorage.EXTERNAL) 60 else 10) == 0) {
                     usedBytes = RecordingStore.usedBytes(this@DashcamService)
@@ -360,7 +413,11 @@ class DashcamService : Service() {
                     if (consecutiveLowMemorySamples >= 2) {
                         RecorderDiagnostics.record(this@DashcamService,
                             "recording_auto_stop reason=low_memory availableBytes=${systemMemory.availMem}")
-                        scope.launch(Dispatchers.Main) { stopRecording("Запись остановлена: мало свободной ОЗУ") }
+                        scope.launch(Dispatchers.Main) {
+                            val message = "Запись остановлена: мало свободной ОЗУ. Автоперезапуск отключён для безопасности"
+                            stopRecording(message)
+                            postRecoveryNotice(message)
+                        }
                         break
                     }
                 }
@@ -371,21 +428,109 @@ class DashcamService : Service() {
         }
     }
 
-    private fun stopRecording(reason: String? = null) {
+    private fun recoverFromCameraFailure(reason: String) {
+        if (recoveryJob?.isActive == true) return
+        val attemptsInWindow = noteRecoveryFailure()
+        val delayMs = RECOVERY_DELAYS_MS[(attemptsInWindow - 1).coerceIn(0, RECOVERY_DELAYS_MS.lastIndex)]
+        val selected = config
+        val message = "Сбой записи: $reason. Перезапуск камер через ${delayMs / 1_000} с " +
+            "($attemptsInWindow за 15 мин)" +
+            if (attemptsInWindow > FREQUENT_RECOVERY_THRESHOLD) ". Частые сбои — отправьте диагностику" else ""
+        lastRecoveryReason = reason
+        RecorderDiagnostics.record(this,
+            "recording_recovery_scheduled attempts15m=$attemptsInWindow delayMs=$delayMs " +
+                "cameras=${selected.cameraIds.sorted()} storage=${selected.storage} reason=$reason")
+        recoveryPending = true
+        stopRecording(message, keepServiceAlive = true)
+        postRecoveryNotice(message)
+        recoveryJob = scope.launch(Dispatchers.Main) {
+            delay(delayMs)
+            RecorderDiagnostics.record(this@DashcamService,
+                "recording_recovery_start attempts15m=$attemptsInWindow")
+            startRecording(recordingIntent(this@DashcamService, selected, selected.storage == RecordingStorage.EXTERNAL))
+        }
+    }
+
+    private fun noteRecoveryFailure(): Int {
+        val now = System.currentTimeMillis()
+        val prefs = getSharedPreferences(RECOVERY_PREFS, MODE_PRIVATE)
+        val recent = prefs.getString(RECOVERY_EVENTS, null).orEmpty().split(',')
+            .mapNotNull(String::toLongOrNull)
+            .filter { it <= now && now - it <= RECOVERY_WINDOW_MS }
+            .takeLast(100)
+            .toMutableList()
+        recent += now
+        val frequent = recent.size > FREQUENT_RECOVERY_THRESHOLD
+        val previousWarning = recoveryWarning
+        val frequentUntil = if (frequent) now + RECOVERY_WARNING_LIFETIME_MS
+            else prefs.getLong(RECOVERY_FREQUENT_UNTIL, 0L)
+        prefs.edit()
+            .putString(RECOVERY_EVENTS, recent.joinToString(","))
+            .putLong(RECOVERY_WARNING_UNTIL, now + RECOVERY_WARNING_LIFETIME_MS)
+            .putLong(RECOVERY_FREQUENT_UNTIL, frequentUntil)
+            .apply()
+        recoveryWarning = warningText(frequentUntil > now)
+        if (previousWarning != recoveryWarning) {
+            RecorderDiagnostics.record(this,
+                "recording_recovery_warning severity=${if (frequentUntil > now) "frequent" else "single"} " +
+                    "attempts15m=${recent.size} message=${recoveryWarning}")
+        }
+        return recent.size
+    }
+
+    private fun savedRecoveryWarning(): String? {
+        val prefs = getSharedPreferences(RECOVERY_PREFS, MODE_PRIVATE)
+        val now = System.currentTimeMillis()
+        return if (prefs.getLong(RECOVERY_WARNING_UNTIL, 0L) > now)
+            warningText(prefs.getLong(RECOVERY_FREQUENT_UNTIL, 0L) > now) else null
+    }
+
+    private fun warningText(frequent: Boolean) = if (frequent)
+        "Частые сбои записи: больше 5 перезапусков за 15 минут. Проверьте видео и отправьте логи разработчику."
+    else
+        "Обнаружен сбой записи и перезапуск камер. Проверьте видео и отправьте логи разработчику."
+
+    private fun startupFailed(message: String) {
+        starting = false
+        publish(RecorderState(status = message))
+        if (recoveryPending) {
+            recoveryPending = false
+            RecorderDiagnostics.record(this, "recording_recovery_failed message=$message")
+        }
+        postRecoveryNotice(message)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun stopRecording(reason: String? = null, keepServiceAlive: Boolean = false) {
         RecorderDiagnostics.record(this, "recording_stop requested cameras=${encoders.keys.sorted()}")
+        if (!keepServiceAlive) {
+            recoveryJob?.cancel(); recoveryJob = null
+            recoveryPending = false
+        }
         startupJob?.cancel(); startupJob = null
         statsJob?.cancel(); statsJob = null
         stampSource?.stop(); stampSource = null
         maintenanceJob?.cancel(); maintenanceJob = null
-        encoders.values.toList().forEach { runCatching { it.stop() } }
+        encoders.values.toList().forEach { encoder ->
+            runCatching { encoder.stop() }.onFailure {
+                RecorderDiagnostics.recordException(this,
+                    "encoder_stop_error input=${encoder.inputId} type=${it.javaClass.name} message=${it.message}", it)
+            }
+        }
         encoders.clear()
         RecorderDiagnostics.record(this, "recording_stopped")
         starting = false
         unbindCapture()
         publish(RecorderState(usedBytes = currentState.usedBytes,
             status = reason ?: "Регистратор остановлен"))
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        if (keepServiceAlive) {
+            getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID,
+                notification(reason ?: "Перезапуск камер…"))
+        } else {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
     }
 
     override fun onDestroy() {
@@ -408,13 +553,16 @@ class DashcamService : Service() {
     }
 
     private fun publish(state: RecorderState) {
-        currentState = state
-        RecorderRepository.update(state)
-        val cameras = state.cameras.values.sortedBy(CameraRecordingState::inputId)
+        if (recoveryWarning != null && savedRecoveryWarning() == null) recoveryWarning = null
+        val visibleState = state.copy(warning = recoveryWarning)
+        currentState = visibleState
+        RecorderRepository.update(visibleState)
+        val cameras = visibleState.cameras.values.sortedBy(CameraRecordingState::inputId)
         sendBroadcast(Intent(ACTION_STATE).setPackage(packageName).apply {
-            putExtra(EXTRA_RECORDING, state.recording)
-            putExtra(EXTRA_USED_BYTES, state.usedBytes)
-            putExtra(EXTRA_STATUS, state.status)
+            putExtra(EXTRA_RECORDING, visibleState.recording)
+            putExtra(EXTRA_USED_BYTES, visibleState.usedBytes)
+            putExtra(EXTRA_STATUS, visibleState.status)
+            putExtra(EXTRA_WARNING, visibleState.warning)
             putExtra(EXTRA_CAMERA_IDS, cameras.map(CameraRecordingState::inputId).toIntArray())
             putExtra(EXTRA_FRAMES, cameras.map(CameraRecordingState::frames).toLongArray())
             putExtra(EXTRA_FPS, cameras.map(CameraRecordingState::fps).toDoubleArray())
@@ -426,22 +574,44 @@ class DashcamService : Service() {
             putExtra(EXTRA_TIMEOUTS, cameras.map(CameraRecordingState::timeouts).toLongArray())
         })
         val now = SystemClock.elapsedRealtime()
-        val recordingVideo = state.recording && encoders.values.any {
+        val recordingVideo = visibleState.recording && encoders.values.any {
             it.outputFrames > 0 && it.lastOutputElapsedMs > 0 && now - it.lastOutputElapsedMs <= 3_000L
         }
         GCamHealthReporter.send(
             this,
             GCamHealthReporter.SOURCE_RECORDER,
-            recording = state.recording,
+            recording = visibleState.recording,
             recordingVideo = recordingVideo,
             error = cameras.firstNotNullOfOrNull(CameraRecordingState::error)
         )
     }
 
     private fun createChannel() {
-        getSystemService(NotificationManager::class.java).createNotificationChannel(
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "Видеорегистратор", NotificationManager.IMPORTANCE_LOW)
         )
+        manager.createNotificationChannel(
+            NotificationChannel(ERROR_CHANNEL_ID, "Сбои записи", NotificationManager.IMPORTANCE_HIGH)
+        )
+    }
+
+    private fun postRecoveryNotice(message: String, recovered: Boolean = false) {
+        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val notification = NotificationCompat.Builder(this, ERROR_CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle(if (recovered) "gCam — запись восстановлена" else "gCam — сбой записи")
+            .setContentText(message)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(message))
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build()
+        runCatching { getSystemService(NotificationManager::class.java).notify(ERROR_NOTIFICATION_ID, notification) }
+            .onFailure { RecorderDiagnostics.record(this,
+                "recovery_notification_failed type=${it.javaClass.simpleName} message=${it.message}") }
     }
 
     private fun notification(text: String): Notification {
@@ -461,7 +631,18 @@ class DashcamService : Service() {
 
     companion object {
         private const val CHANNEL_ID = "dashcam_recording"
+        private const val ERROR_CHANNEL_ID = "dashcam_recording_errors"
         private const val NOTIFICATION_ID = 360
+        private const val ERROR_NOTIFICATION_ID = 361
+        private const val RECOVERY_PREFS = "recorder_recovery"
+        private const val RECOVERY_EVENTS = "events"
+        private const val RECOVERY_WARNING_UNTIL = "warning_until"
+        private const val RECOVERY_FREQUENT_UNTIL = "frequent_until"
+        private const val RECOVERY_WINDOW_MS = 15 * 60_000L
+        private const val RECOVERY_WARNING_LIFETIME_MS = 6 * 60 * 60_000L
+        private const val FREQUENT_RECOVERY_THRESHOLD = 5
+        private const val RECOVERY_FRAME_TIMEOUT_MS = 15_000L
+        private val RECOVERY_DELAYS_MS = longArrayOf(3_000L, 10_000L, 30_000L)
         private const val PERF_TAG = "GCAM_PERF"
         private const val PERF_LOG_INTERVAL_SECONDS = 5
         private const val DIAGNOSTIC_INTERVAL_SECONDS = 5
@@ -473,6 +654,9 @@ class DashcamService : Service() {
         private const val EXTRA_SEGMENT_MINUTES = "segment_minutes"
         private const val EXTRA_STORAGE_LIMIT_GB = "storage_limit_gb"
         private const val EXTRA_STORAGE = "storage"
+        private const val EXTRA_WAIT_FOR_USB = "wait_for_usb"
+        private const val USB_WAIT_TIMEOUT_MS = 5 * 60_000L
+        private const val USB_RETRY_INTERVAL_MS = 3_000L
         private const val EXTRA_STAMP_TIME = "stamp_time"
         private const val EXTRA_STAMP_GPS = "stamp_gps"
         private const val EXTRA_STAMP_SPEED = "stamp_speed"
@@ -483,6 +667,7 @@ class DashcamService : Service() {
         private const val EXTRA_RECORDING = "recording"
         private const val EXTRA_USED_BYTES = "used_bytes"
         private const val EXTRA_STATUS = "status"
+        private const val EXTRA_WARNING = "warning"
         private const val EXTRA_CAMERA_IDS = "camera_ids"
         private const val EXTRA_FRAMES = "frames"
         private const val EXTRA_FPS = "fps"
@@ -493,8 +678,9 @@ class DashcamService : Service() {
         private const val EXTRA_MAX_GAP_MS = "max_gap_ms"
         private const val EXTRA_TIMEOUTS = "timeouts"
 
-        fun start(context: Context, selected: RecorderConfig? = null) = context.startForegroundService(
+        private fun recordingIntent(context: Context, selected: RecorderConfig?, waitForUsb: Boolean) =
             Intent(context, DashcamService::class.java).setAction(ACTION_START).apply {
+                putExtra(EXTRA_WAIT_FOR_USB, waitForUsb)
                 selected?.let { config ->
                     putExtra(EXTRA_SELECTED_CAMERAS, config.cameraIds.sorted().toIntArray())
                     putExtra(EXTRA_WIDTH, config.width)
@@ -508,7 +694,9 @@ class DashcamService : Service() {
                     putExtra(EXTRA_STAMP_SPEED, config.stampSpeed)
                 }
             }
-        )
+
+        fun start(context: Context, selected: RecorderConfig? = null, waitForUsb: Boolean = false) =
+            context.startForegroundService(recordingIntent(context, selected, waitForUsb))
         fun stop(context: Context) = context.startService(
             Intent(context, DashcamService::class.java).setAction(ACTION_STOP)
         )
@@ -542,7 +730,8 @@ class DashcamService : Service() {
             return RecorderState(
                 intent.getBooleanExtra(EXTRA_RECORDING, false), cameras,
                 intent.getLongExtra(EXTRA_USED_BYTES, 0),
-                intent.getStringExtra(EXTRA_STATUS) ?: "Регистратор остановлен"
+                intent.getStringExtra(EXTRA_STATUS) ?: "Регистратор остановлен",
+                intent.getStringExtra(EXTRA_WARNING)
             )
         }
     }

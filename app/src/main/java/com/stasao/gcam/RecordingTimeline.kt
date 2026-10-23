@@ -33,7 +33,7 @@ object RecordingTimelines {
                     val sameSession = sessionId == null && previousSession == null ||
                         sessionId != null && sessionId == previousSession
                     val contiguous = prior != null && prior.durationMs > 0 && start != null &&
-                        sameSession && gap in -2_000L..5_000L
+                        sameSession && gap in -2_000L..15_000L
                     if (!contiguous) {
                         flush()
                         firstStart = start ?: file.modifiedAt

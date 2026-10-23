@@ -16,16 +16,24 @@ object GCamRuntimeController {
         }
         startOverlayIfAllowed(context, config)
         applyCameraOverlaySetting(context, config.cameraOverlay)
-        if (config.recordingAutostart) DashcamService.start(context)
+        applyRecordOverlaySetting(context, config.recordOverlay)
+        // Recorder runs in a different process; pass the saved destination explicitly so its
+        // SharedPreferences cache cannot revive a previously selected USB target.
+        if (config.recordingAutostart) DashcamService.start(
+            context, selected = RecorderSettings.load(context), waitForUsb = true
+        )
     }
 
     fun startAfterManualLaunch(context: Context) {
         startCameraBridge(context)
         startOverlayIfAllowed(context, GCamRuntimeSettings.load(context))
         applyCameraOverlaySetting(context, GCamRuntimeSettings.load(context).cameraOverlay)
+        applyRecordOverlaySetting(context, GCamRuntimeSettings.load(context).recordOverlay)
     }
 
-    fun applyOverlaySetting(context: Context, enabled: Boolean) {
+    fun applyOverlaySetting(context: Context) {
+        val config = GCamRuntimeSettings.load(context)
+        val enabled = config.statusOverlay || config.blindStatusOverlay || config.hudStatusOverlay
         if (enabled && Settings.canDrawOverlays(context)) {
             startForeground(context, Intent(context, GCamStatusOverlayService::class.java))
         } else {
@@ -37,6 +45,18 @@ object GCamRuntimeController {
         val intent = Intent(context, GCamCameraOverlayService::class.java)
         if (enabled && Settings.canDrawOverlays(context)) startForeground(context, intent)
         else context.stopService(intent)
+    }
+
+    fun applyRecordOverlaySetting(context: Context, enabled: Boolean) {
+        val intent = Intent(context, GCamRecordOverlayService::class.java)
+        if (enabled && Settings.canDrawOverlays(context)) startForeground(context, intent)
+        else context.stopService(intent)
+    }
+
+    fun updateRecordOverlay(context: Context) {
+        if (Settings.canDrawOverlays(context)) startForeground(context,
+            Intent(context, GCamRecordOverlayService::class.java)
+                .setAction(GCamRecordOverlayService.ACTION_UPDATE_LAYOUT))
     }
 
     fun updateOverlayPosition(context: Context, x: Float, y: Float) {
@@ -59,7 +79,7 @@ object GCamRuntimeController {
     }
 
     private fun startOverlayIfAllowed(context: Context, config: GCamRuntimeConfig) {
-        if (config.statusOverlay && Settings.canDrawOverlays(context)) {
+        if ((config.statusOverlay || config.blindStatusOverlay || config.hudStatusOverlay) && Settings.canDrawOverlays(context)) {
             startForeground(context, Intent(context, GCamStatusOverlayService::class.java))
         }
     }

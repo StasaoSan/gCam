@@ -8,9 +8,19 @@ data class GCamRuntimeConfig(
     val autostart: Boolean,
     val recordingAutostart: Boolean,
     val statusOverlay: Boolean,
+    val blindStatusOverlay: Boolean,
+    val hudStatusOverlay: Boolean,
     val cameraOverlay: Boolean,
+    val recordOverlay: Boolean,
+    val recordOverlayX: Float,
+    val recordOverlayY: Float,
+    val recordOverlaySizeDp: Int,
     val statusOverlayX: Float,
-    val statusOverlayY: Float
+    val statusOverlayY: Float,
+    val blindStatusOverlayX: Float,
+    val blindStatusOverlayY: Float,
+    val hudStatusOverlayX: Float,
+    val hudStatusOverlayY: Float
 )
 
 object GCamRuntimeSettings {
@@ -18,9 +28,19 @@ object GCamRuntimeSettings {
     private const val KEY_AUTOSTART = "autostart"
     private const val KEY_RECORDING_AUTOSTART = "recording_autostart"
     private const val KEY_STATUS_OVERLAY = "status_overlay"
+    private const val KEY_BLIND_STATUS_OVERLAY = "blind_status_overlay"
+    private const val KEY_HUD_STATUS_OVERLAY = "hud_status_overlay"
     private const val KEY_CAMERA_OVERLAY = "camera_overlay"
+    private const val KEY_RECORD_OVERLAY = "record_overlay"
+    private const val KEY_RECORD_OVERLAY_X = "record_overlay_x"
+    private const val KEY_RECORD_OVERLAY_Y = "record_overlay_y"
+    private const val KEY_RECORD_OVERLAY_SIZE = "record_overlay_size_dp"
     private const val KEY_STATUS_OVERLAY_X = "status_overlay_x"
     private const val KEY_STATUS_OVERLAY_Y = "status_overlay_y"
+    private const val KEY_BLIND_STATUS_OVERLAY_X = "blind_status_overlay_x"
+    private const val KEY_BLIND_STATUS_OVERLAY_Y = "blind_status_overlay_y"
+    private const val KEY_HUD_STATUS_OVERLAY_X = "hud_status_overlay_x"
+    private const val KEY_HUD_STATUS_OVERLAY_Y = "hud_status_overlay_y"
     private const val KEY_AUTOSTART_SESSION = "autostart_session"
 
     fun load(context: Context): GCamRuntimeConfig {
@@ -31,9 +51,19 @@ object GCamRuntimeSettings {
             autostart = autostart,
             recordingAutostart = autostart && prefs.getBoolean(KEY_RECORDING_AUTOSTART, false),
             statusOverlay = prefs.getBoolean(KEY_STATUS_OVERLAY, false),
+            blindStatusOverlay = prefs.getBoolean(KEY_BLIND_STATUS_OVERLAY, false),
+            hudStatusOverlay = prefs.getBoolean(KEY_HUD_STATUS_OVERLAY, false),
             cameraOverlay = prefs.getBoolean(KEY_CAMERA_OVERLAY, false),
+            recordOverlay = prefs.getBoolean(KEY_RECORD_OVERLAY, false),
+            recordOverlayX = prefs.getFloat(KEY_RECORD_OVERLAY_X, 0.83f).coerceIn(0f, 1f),
+            recordOverlayY = prefs.getFloat(KEY_RECORD_OVERLAY_Y, 0.65f).coerceIn(0f, 1f),
+            recordOverlaySizeDp = prefs.getInt(KEY_RECORD_OVERLAY_SIZE, 112).coerceIn(88, 180),
             statusOverlayX = position.first,
-            statusOverlayY = position.second
+            statusOverlayY = position.second,
+            blindStatusOverlayX = prefs.getFloat(KEY_BLIND_STATUS_OVERLAY_X, 0.82f).coerceIn(0f, 1f),
+            blindStatusOverlayY = prefs.getFloat(KEY_BLIND_STATUS_OVERLAY_Y, 0.33f).coerceIn(0f, 1f),
+            hudStatusOverlayX = prefs.getFloat(KEY_HUD_STATUS_OVERLAY_X, 0.88f).coerceIn(0f, 1f),
+            hudStatusOverlayY = prefs.getFloat(KEY_HUD_STATUS_OVERLAY_Y, 0.33f).coerceIn(0f, 1f)
         )
     }
 
@@ -42,9 +72,19 @@ object GCamRuntimeSettings {
             .putBoolean(KEY_AUTOSTART, config.autostart)
             .putBoolean(KEY_RECORDING_AUTOSTART, config.autostart && config.recordingAutostart)
             .putBoolean(KEY_STATUS_OVERLAY, config.statusOverlay)
+            .putBoolean(KEY_BLIND_STATUS_OVERLAY, config.blindStatusOverlay)
+            .putBoolean(KEY_HUD_STATUS_OVERLAY, config.hudStatusOverlay)
             .putBoolean(KEY_CAMERA_OVERLAY, config.cameraOverlay)
+            .putBoolean(KEY_RECORD_OVERLAY, config.recordOverlay)
+            .putFloat(KEY_RECORD_OVERLAY_X, config.recordOverlayX.coerceIn(0f, 1f))
+            .putFloat(KEY_RECORD_OVERLAY_Y, config.recordOverlayY.coerceIn(0f, 1f))
+            .putInt(KEY_RECORD_OVERLAY_SIZE, config.recordOverlaySizeDp.coerceIn(88, 180))
             .putFloat(KEY_STATUS_OVERLAY_X, config.statusOverlayX.coerceIn(0f, 1f))
             .putFloat(KEY_STATUS_OVERLAY_Y, config.statusOverlayY.coerceIn(0f, 1f))
+            .putFloat(KEY_BLIND_STATUS_OVERLAY_X, config.blindStatusOverlayX.coerceIn(0f, 1f))
+            .putFloat(KEY_BLIND_STATUS_OVERLAY_Y, config.blindStatusOverlayY.coerceIn(0f, 1f))
+            .putFloat(KEY_HUD_STATUS_OVERLAY_X, config.hudStatusOverlayX.coerceIn(0f, 1f))
+            .putFloat(KEY_HUD_STATUS_OVERLAY_Y, config.hudStatusOverlayY.coerceIn(0f, 1f))
             .apply()
     }
 

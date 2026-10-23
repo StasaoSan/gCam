@@ -13,12 +13,16 @@ import java.util.Locale
 /** Small, persistent recorder journal. Never write from the frame/codec hot path. */
 object RecorderDiagnostics {
     private const val TAG = "GCAM_DIAG"
-    private const val MAX_BYTES = 1024 * 1024L
+    private const val MAX_BYTES = 4 * 1024 * 1024L
     private val lock = Any()
 
     private fun directory(context: Context) = File(context.filesDir, "diagnostics")
 
     fun record(context: Context, event: String) = append(context, "recorder", event)
+
+    fun recordException(context: Context, event: String, failure: Throwable) = record(
+        context,
+        "$event stack=${Log.getStackTraceString(failure).replace("\n", "\\n")}")
 
     /** The camera and overlay processes use separate files to avoid cross-process append races. */
     fun recordHud(context: Context, event: String) = append(context, "hud", event)

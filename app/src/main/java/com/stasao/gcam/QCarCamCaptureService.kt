@@ -89,7 +89,7 @@ class QCarCamCaptureService : Service() {
             shape: Int
         ): String {
             checkBlindSlot(slot)
-            if (slot !in 0..9) return "Некорректный HUD slot"
+            if (slot !in 0..11) return "Некорректный HUD slot"
             if (slot < 2) {
                 hudRequested[slot] = true
                 hudInputs[slot] = inputId
@@ -129,7 +129,9 @@ class QCarCamCaptureService : Service() {
             fisheye: Float, shape: Int, quarterTurns: Int
         ): String {
             checkBlindSlot(slot)
-            if (slot !in 0..9) return "Некорректный HUD slot"
+            if (CaptureClientTrust.isZonesCaller(this@QCarCamCaptureService, Binder.getCallingUidOrThrow()) &&
+                inputId != slot - 10) throw SecurityException("gZones: слот должен соответствовать боковой камере")
+            if (slot !in 0..11) return "Некорректный HUD slot"
             if (slot < 2) {
                 hudRequested[slot] = true
                 hudInputs[slot] = inputId
@@ -204,10 +206,15 @@ class QCarCamCaptureService : Service() {
     }
 
     private fun checkBlindSlot(slot: Int) {
-        if (slot >= 6 && Binder.getCallingUidOrThrow() != android.os.Process.myUid()) {
+        val uid = Binder.getCallingUidOrThrow()
+        if (CaptureClientTrust.isZonesCaller(this, uid)) {
+            if (slot !in 10..11) throw SecurityException("gZones может использовать только слоты 10 и 11")
+            return
+        }
+        if (slot >= 6 && uid != android.os.Process.myUid()) {
             throw SecurityException("Плавающие окна gCam доступны только gCam")
         }
-        if (CaptureClientTrust.isBlindCaller(this, Binder.getCallingUidOrThrow()) && slot !in listOf(2, 3, 5)) {
+        if (CaptureClientTrust.isBlindCaller(this, uid) && slot !in listOf(2, 3, 5)) {
             throw SecurityException("gBlind может использовать только слоты приборки 2 и 3 и редактор 5")
         }
     }

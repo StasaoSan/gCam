@@ -17,6 +17,7 @@ object GCamHealthReporter {
     const val SOURCE_HUD = "hud"
     const val SOURCE_RECORDER = "recorder"
     const val SOURCE_BLIND = "blind"
+    const val SOURCE_CAMERA = "camera"
 
     fun send(
         context: Context,

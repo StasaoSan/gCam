@@ -22,10 +22,21 @@ class RecordingTimelinesTest {
     @Test fun gapOrDifferentSessionStartsNewTimeline() {
         val files = listOf(
             file("cam0_20261012_120000_000_s42.mp4", 0),
-            file("cam0_20261012_120310_000_s42.mp4", 0),
-            file("cam0_20261012_120610_000_s43.mp4", 0)
+            file("cam0_20261012_120320_000_s42.mp4", 0),
+            file("cam0_20261012_120620_000_s43.mp4", 0)
         )
         assertEquals(3, RecordingTimelines.group(files).size)
+    }
+
+    @Test fun sameSessionSegmentsWithinFifteenSecondsShareTimeline() {
+        val files = listOf(
+            file("cam2_20261022_093233_656_s776326.mp4", 2, 301_000),
+            file("cam2_20261022_093740_132_s776326.mp4", 2, 295_000)
+        )
+        val groups = RecordingTimelines.group(files)
+        assertEquals(1, groups.size)
+        assertEquals(2, groups.single().parts.size)
+        assertEquals(596_000L, groups.single().durationMs)
     }
 
     @Test fun oldNamesStillGroupByTime() {

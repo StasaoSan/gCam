@@ -96,19 +96,30 @@ class CameraEncoder(
         val segmentUs = config.segmentMinutes * 60L * 1_000_000L
         var eos = false
         var stopDeadline = Long.MAX_VALUE
+        var operation = "waiting_for_output"
 
         fun closeSegment() {
             val active = muxer
             muxer = null
             if (active != null) {
-                runCatching { active.stop() }
-                runCatching { active.release() }
+                operation = "muxer_stop"
+                runCatching { active.stop() }.onFailure {
+                    RecorderDiagnostics.recordException(context,
+                        "segment_muxer_stop_error input=$inputId outputFrames=$outputFrames type=${it.javaClass.name} message=${it.message}", it)
+                }
+                operation = "muxer_release"
+                runCatching { active.release() }.onFailure {
+                    RecorderDiagnostics.recordException(context,
+                        "segment_muxer_release_error input=$inputId type=${it.javaClass.name} message=${it.message}", it)
+                }
                 target?.let { segment ->
                     if (segmentHasSamples) {
+                        operation = "finish_segment"
                         RecordingStore.finishSegment(context, segment)
                         completedSegments++
                         RecorderDiagnostics.record(context, "segment_closed input=$inputId segments=$completedSegments outputFrames=$outputFrames outputBytes=$outputBytes")
                     } else {
+                        operation = "abort_empty_segment"
                         RecordingStore.abortSegment(context, segment)
                         RecorderDiagnostics.record(context, "segment_empty input=$inputId")
                     }
@@ -124,10 +135,12 @@ class CameraEncoder(
         fun openSegment(format: MediaFormat) {
             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
             val name = "cam${inputId}_${stamp}_s${sessionId}.mp4"
+            operation = "create_segment"
             val segment = RecordingStore.createSegment(context, inputId, name, storage = config.storage)
             RecorderDiagnostics.record(context, "segment_open input=$inputId name=$name")
             target = segment
             try {
+                operation = "muxer_create_start"
                 muxer = MediaMuxer(segment.descriptor.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4).also {
                     track = it.addTrack(MediaFormat(format))
                     it.start()
@@ -142,10 +155,15 @@ class CameraEncoder(
         try {
             while (!eos && (running.get() || System.currentTimeMillis() < stopDeadline)) {
                 if (!running.get() && stopDeadline == Long.MAX_VALUE) stopDeadline = System.currentTimeMillis() + 3_000
+                operation = "codec_dequeue_output"
                 when (val index = codec.dequeueOutputBuffer(info, 20_000)) {
                     MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
-                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> outputFormat = codec.outputFormat
+                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        operation = "codec_output_format"
+                        outputFormat = codec.outputFormat
+                    }
                     else -> if (index >= 0) {
+                        operation = "codec_get_output_buffer"
                         val buffer = codec.getOutputBuffer(index)
                         val isConfig = info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
                         val isKey = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
@@ -169,6 +187,7 @@ class CameraEncoder(
                             buffer.limit(info.offset + info.size)
                             writeInfo.set(info.offset, info.size, info.presentationTimeUs - segmentFirstPts, info.flags)
                             val writeStart = System.nanoTime()
+                            operation = "muxer_write_sample"
                             muxer?.writeSampleData(track, buffer, writeInfo)
                             val writeNs = System.nanoTime() - writeStart
                             muxWriteTotalNs += writeNs
@@ -179,16 +198,24 @@ class CameraEncoder(
                             outputBytes += info.size
                             lastOutputElapsedMs = SystemClock.elapsedRealtime()
                         }
+                        operation = "codec_release_output"
                         codec.releaseOutputBuffer(index, false)
                     }
                 }
             }
         } catch (t: Throwable) {
-            RecorderDiagnostics.record(context, "encoder_error input=$inputId type=${t.javaClass.simpleName} message=${t.message}")
+            val codecError = t as? MediaCodec.CodecException
+            RecorderDiagnostics.recordException(context,
+                "encoder_error input=$inputId operation=$operation type=${t.javaClass.name} message=${t.message} " +
+                    "codecDiagnostic=${codecError?.diagnosticInfo} codecErrorCode=${codecError?.errorCode} " +
+                    "codecRecoverable=${codecError?.isRecoverable} codecTransient=${codecError?.isTransient} " +
+                    "outputFrames=$outputFrames segments=$completedSegments lastOutputAgeMs=" +
+                    "${SystemClock.elapsedRealtime() - lastOutputElapsedMs}", t)
             onError("${recorderCameraNames[inputId]}: ${t.message ?: t.javaClass.simpleName}")
         } finally {
             runCatching { closeSegment() }.onFailure {
-                RecorderDiagnostics.record(context, "segment_close_error input=$inputId type=${it.javaClass.simpleName} message=${it.message}")
+                RecorderDiagnostics.recordException(context,
+                    "segment_close_error input=$inputId operation=$operation type=${it.javaClass.name} message=${it.message}", it)
                 onError("${recorderCameraNames[inputId]}: ${it.message ?: it.javaClass.simpleName}")
             }
         }

@@ -5,6 +5,7 @@
     <queries>
         <package android:name="com.g992.anhud" />
         <package android:name="com.stasao.gblind" />
+        <package android:name="com.stasao.gzones" />
     </queries>
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
@@ -68,6 +69,14 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Shows an optional floating preview of the four vehicle cameras" />
+        </service>
+        <service
+            android:name=".GCamRecordOverlayService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Shows an optional floating camera recording control" />
         </service>
         <service
             android:name=".GCamAccessibilityService"

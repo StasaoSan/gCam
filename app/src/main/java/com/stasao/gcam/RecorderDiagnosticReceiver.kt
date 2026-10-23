@@ -30,7 +30,7 @@ class RecorderDiagnosticReceiver : BroadcastReceiver() {
                 RecorderSettings.save(context, config)
                 val command = intent.getStringExtra(EXTRA_COMMAND)?.lowercase()
                 Log.i(TAG, "ADB $command: $config")
-                if (command == "start") DashcamService.start(context)
+                if (command == "start") DashcamService.start(context, selected = config)
             }
             "stop" -> {
                 Log.i(TAG, "ADB stop")
