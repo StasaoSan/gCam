@@ -5,9 +5,12 @@ plugins {
 }
 
 // Generated resources in a synced Desktop folder can acquire invalid " 2" names.
-val checkoutId = rootDir.canonicalPath.hashCode().toUInt().toString(16)
-val localBuildRoot = file("${System.getProperty("user.home")}/.gradle/gcam-build/$checkoutId")
-layout.buildDirectory.set(localBuildRoot.resolve("root"))
-subprojects {
-    layout.buildDirectory.set(localBuildRoot.resolve(name))
+// In CI, keep Gradle's standard build paths expected by the release workflow.
+if (System.getenv("CI") != "true") {
+    val checkoutId = rootDir.canonicalPath.hashCode().toUInt().toString(16)
+    val localBuildRoot = file("${System.getProperty("user.home")}/.gradle/gcam-build/$checkoutId")
+    layout.buildDirectory.set(localBuildRoot.resolve("root"))
+    subprojects {
+        layout.buildDirectory.set(localBuildRoot.resolve(name))
+    }
 }
