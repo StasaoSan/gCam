@@ -89,7 +89,7 @@ class DashcamService : Service() {
     }
 
     private fun startRecording(intent: Intent?) {
-        if (starting || encoders.isNotEmpty()) return
+        if (starting || encoders.isNotEmpty() || recoveryJob?.isActive == true) return
         starting = true
         recordingSessionId = SystemClock.elapsedRealtime()
         config = intent?.takeIf { it.hasExtra(EXTRA_SELECTED_CAMERAS) }?.let { request ->
@@ -309,12 +309,22 @@ class DashcamService : Service() {
                 val active = cameras.values.count(CameraRecordingState::recording)
                 val status = if (cameras.values.none { it.error != null }) "Запись: $active/${config.cameraIds.size} камер"
                     else "Запись с ошибками: $active/${config.cameraIds.size}"
-                val deadEncoder = encoders.values.firstOrNull { !it.drainAlive && it.lastOutputElapsedMs > 0 }
+                val deadEncoder = encoders.values.firstOrNull { !it.drainAlive }
                 if (deadEncoder != null) {
                     val reason = errors[deadEncoder.inputId] ?: "Кодер камеры ${deadEncoder.inputId} остановился"
                     RecorderDiagnostics.record(this@DashcamService,
                         "recording_auto_stop reason=encoder_stopped input=${deadEncoder.inputId} error=$reason")
                     scope.launch(Dispatchers.Main) { recoverFromCameraFailure(reason) }
+                    break
+                }
+                val stalled = encoders.values.firstOrNull {
+                    SystemClock.elapsedRealtime() - (it.lastOutputElapsedMs.takeIf { time -> time > 0 }
+                        ?: recordingSessionId) > 30_000L
+                }
+                if (stalled != null) {
+                    scope.launch(Dispatchers.Main) {
+                        recoverFromCameraFailure("Нет записанных кадров 30 секунд: камера ${stalled.inputId}")
+                    }
                     break
                 }
                 if (recoveryPending) {
@@ -414,9 +424,7 @@ class DashcamService : Service() {
                         RecorderDiagnostics.record(this@DashcamService,
                             "recording_auto_stop reason=low_memory availableBytes=${systemMemory.availMem}")
                         scope.launch(Dispatchers.Main) {
-                            val message = "Запись остановлена: мало свободной ОЗУ. Автоперезапуск отключён для безопасности"
-                            stopRecording(message)
-                            postRecoveryNotice(message)
+                            recoverFromCameraFailure("Мало свободной ОЗУ; ожидаю освобождения памяти")
                         }
                         break
                     }
@@ -447,6 +455,20 @@ class DashcamService : Service() {
             delay(delayMs)
             RecorderDiagnostics.record(this@DashcamService,
                 "recording_recovery_start attempts15m=$attemptsInWindow")
+            var readySamples = 0
+            while (isActive && readySamples < 2) {
+                val memory = ActivityManager.MemoryInfo()
+                getSystemService(ActivityManager::class.java).getMemoryInfo(memory)
+                readySamples = if (!memory.lowMemory && memory.availMem >= 768L * 1024 * 1024)
+                    readySamples + 1 else 0
+                if (readySamples < 2) {
+                    publish(RecorderState(status = "Ожидаю свободную память для восстановления записи…"))
+                    RecorderDiagnostics.record(this@DashcamService,
+                        "recording_recovery_wait availableBytes=${memory.availMem} readySamples=$readySamples")
+                    delay(5_000)
+                }
+            }
+            recoveryJob = null
             startRecording(recordingIntent(this@DashcamService, selected, selected.storage == RecordingStorage.EXTERNAL))
         }
     }
@@ -494,8 +516,9 @@ class DashcamService : Service() {
         starting = false
         publish(RecorderState(status = message))
         if (recoveryPending) {
-            recoveryPending = false
             RecorderDiagnostics.record(this, "recording_recovery_failed message=$message")
+            recoverFromCameraFailure(message)
+            return
         }
         postRecoveryNotice(message)
         stopForeground(STOP_FOREGROUND_REMOVE)
