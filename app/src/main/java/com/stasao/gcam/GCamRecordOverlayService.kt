@@ -114,12 +114,12 @@ class GCamRecordOverlayService : Service() {
         super.onCreate()
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(CHANNEL_ID,
-            "Кнопка записи gCam", NotificationManager.IMPORTANCE_LOW))
+            GCamLanguage.text(this, "Кнопка записи gCam", "gCam record button"), NotificationManager.IMPORTANCE_LOW))
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         startForeground(NOTIFICATION_ID, Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle("gCam — кнопка записи")
+            .setContentTitle(GCamLanguage.text(this, "gCam — кнопка записи", "gCam — record button"))
             .setContentIntent(open)
             .setOngoing(true)
             .build())
@@ -139,6 +139,16 @@ class GCamRecordOverlayService : Service() {
         }
         if (button == null) addButton()
         if (intent?.action == ACTION_UPDATE_LAYOUT) updateLayout()
+        if (intent?.action == ACTION_LANGUAGE) runCatching {
+            getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID,
+                Notification.Builder(this, CHANNEL_ID)
+                    .setSmallIcon(R.mipmap.ic_launcher)
+                    .setContentTitle(GCamLanguage.text(this, "gCam — кнопка записи", "gCam — record button"))
+                    .setContentIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
+                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
+                    .setOngoing(true).build())
+        }
+        if (intent?.action == ACTION_LANGUAGE) render()
         return START_STICKY
     }
 
@@ -233,7 +243,8 @@ class GCamRecordOverlayService : Service() {
         }
         val config = RecorderSettings.load(this)
         if (config.cameraIds.isEmpty()) {
-            Toast.makeText(this, "Выберите камеры для записи в gCam", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, GCamLanguage.text(this, "Выберите камеры для записи в gCam",
+                "Select cameras to record in gCam"), Toast.LENGTH_SHORT).show()
             return
         }
         if (config.storage == RecordingStorage.EXTERNAL && storageError != null) {
@@ -293,7 +304,7 @@ class GCamRecordOverlayService : Service() {
         }
         button?.apply {
             setState(state, launching || recorderRequested)
-            contentDescription = buildString {
+            contentDescription = GCamLanguage.display(this@GCamRecordOverlayService, buildString {
                 append(if (live) "Остановить запись" else "Начать запись")
                 append("; ").append(when (state) {
                     RecordOverlayView.RECORDING -> "запись идёт"
@@ -301,7 +312,7 @@ class GCamRecordOverlayService : Service() {
                     RecordOverlayView.ERROR -> recorderFailure ?: "нет подтверждённого кадра с камер"
                     else -> if (storageMode == RecordingStorage.INTERNAL) "камеры и внутренняя память готовы" else "камеры и USB готовы"
                 })
-            }
+            })
         }
     }
 
@@ -315,6 +326,7 @@ class GCamRecordOverlayService : Service() {
 
     companion object {
         const val ACTION_UPDATE_LAYOUT = "com.stasao.gcam.UPDATE_RECORD_OVERLAY_LAYOUT"
+        const val ACTION_LANGUAGE = "com.stasao.gcam.RECORD_OVERLAY_LANGUAGE"
         private const val CHANNEL_ID = "gcam_record_overlay"
         private const val NOTIFICATION_ID = 7421
         private const val HEALTH_TIMEOUT_MS = 6_000L

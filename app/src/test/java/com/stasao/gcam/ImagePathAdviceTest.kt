@@ -17,4 +17,11 @@ class ImagePathAdviceTest {
     @Test fun healthySignalPointsToDisplaySettings() {
         assertTrue(ImagePathAdvice.explain("ANHUD", ready).contains("положение окна"))
     }
+
+    @Test fun englishAdviceUsesTheSameStateOrder() {
+        assertTrue(ImagePathAdvice.explain("gBlind", ready.copy(access = false), english = true)
+            .contains("no gCam access"))
+        assertTrue(ImagePathAdvice.explain("ANHUD", ready, english = true)
+            .contains("window position"))
+    }
 }

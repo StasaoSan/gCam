@@ -72,6 +72,7 @@ object RecorderDiagnostics {
             putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        context.startActivity(Intent.createChooser(intent, "Отправить диагностику gCam"))
+        context.startActivity(Intent.createChooser(intent,
+            GCamLanguage.text(context, "Отправить диагностику gCam", "Share gCam diagnostics")))
     }
 }

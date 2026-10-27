@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">gCam</string>
+    <string name="accessibility_service_description">Fallback auto-start for gCam and the dashcam after the head unit boots.</string>
+</resources>

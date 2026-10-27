@@ -14,8 +14,8 @@ android {
         applicationId = "com.stasao.gcam"
         minSdk = 30
         targetSdk = 36
-        versionCode = 500200000
-        versionName = "5.2"
+        versionCode = 500200200
+        versionName = "5.2.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

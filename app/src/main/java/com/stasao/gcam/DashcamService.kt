@@ -79,9 +79,17 @@ class DashcamService : Service() {
         when (intent?.action) {
             ACTION_STOP -> stopRecording()
             ACTION_QUERY -> publish(currentState)
+            ACTION_LANGUAGE -> {
+                GCamLanguage.useInProcess(intent.getIntExtra(EXTRA_LANGUAGE, GCamLanguage.SYSTEM))
+                if (currentState.recording) runCatching {
+                    getSystemService(NotificationManager::class.java)
+                        .notify(NOTIFICATION_ID, notification(currentState.status))
+                }
+            }
             else -> startRecording(intent)
         }
-        return if (intent?.action == ACTION_STOP || intent?.action == ACTION_QUERY) {
+        return if (intent?.action == ACTION_STOP || intent?.action == ACTION_QUERY ||
+            (intent?.action == ACTION_LANGUAGE && !currentState.recording)) {
             START_NOT_STICKY
         } else {
             START_STICKY
@@ -118,9 +126,10 @@ class DashcamService : Service() {
             return
         }
         startForeground(NOTIFICATION_ID, notification("Запуск камер…"), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        val waitForUsb = intent?.getBooleanExtra(EXTRA_WAIT_FOR_USB, false) == true
-        publish(RecorderState(recording = true, status = if (waitForUsb && config.storage == RecordingStorage.EXTERNAL)
-            "Ожидаю выбранный USB-накопитель…" else "Освобождаю место для записи…"))
+        val waitForUsb = intent?.getBooleanExtra(EXTRA_WAIT_FOR_USB, false) == true ||
+            (intent == null && config.storage == RecordingStorage.EXTERNAL)
+        publish(RecorderState(recording = true, status = if (config.storage == RecordingStorage.EXTERNAL)
+            "Проверяю выбранный USB-накопитель…" else "Освобождаю место для записи…"))
         startupJob?.cancel()
         startupJob = scope.launch(Dispatchers.IO) {
             val preflight = runCatching { prepareArchive(waitForUsb) }
@@ -130,6 +139,8 @@ class DashcamService : Service() {
                 val maintenance = preflight.getOrElse { failure ->
                     RecorderDiagnostics.recordException(this@DashcamService,
                         "recording_rejected reason=archive_preflight type=${failure.javaClass.name} message=${failure.message}", failure)
+                    // Retrying codecs or waiting for USB cannot grant MediaStore delete access.
+                    if (failure is ArchiveAccessRequiredException) recoveryPending = false
                     startupFailed("Запись не запущена: ${failure.message ?: "ошибка накопителя"}")
                     return@withContext
                 }
@@ -156,36 +167,54 @@ class DashcamService : Service() {
     }
 
     private suspend fun prepareArchive(waitForUsb: Boolean): ArchiveMaintenance {
-        if (!waitForUsb || config.storage != RecordingStorage.EXTERNAL) {
-            if (config.storage == RecordingStorage.EXTERNAL)
-                RecordingStore.validateExternal(this)?.let { error(it) }
+        if (config.storage != RecordingStorage.EXTERNAL) {
             RecordingStore.removeInterrupted(this, config.storage)
             return RecordingStore.enforceLimit(this, config)
         }
-        val deadline = SystemClock.elapsedRealtime() + USB_WAIT_TIMEOUT_MS
+        val tracker = UsbReadinessTracker(USB_STABLE_MS, USB_STABLE_SAMPLES)
+        val startedAt = SystemClock.elapsedRealtime()
+        var nextWaitReport = startedAt + USB_WAIT_REPORT_MS
         var lastReason: String? = null
+        var lastLoggedUsbReason: String? = null
         while (true) {
-            val attempt = runCatching {
-                RecordingStore.validateExternal(this)?.let { error(it) }
-                RecordingStore.removeInterrupted(this, config.storage)
-                RecordingStore.enforceLimit(this, config)
+            val now = SystemClock.elapsedRealtime()
+            val validation = runCatching { RecordingStore.validateExternal(this)?.let { error(it) } }
+            val stable = tracker.observe(now, validation.isSuccess)
+            if (stable) {
+                val attempt = runCatching {
+                    RecordingStore.probeExternalWritable(this)
+                    RecordingStore.removeInterrupted(this, config.storage)
+                    RecordingStore.enforceLimit(this, config)
+                }
+                attempt.getOrNull()?.let {
+                    RecorderDiagnostics.record(this, "autostart_usb_ready stableMs=${now - startedAt} writeProbe=ok")
+                    return it
+                }
+                attempt.exceptionOrNull()?.let { if (it is ArchiveAccessRequiredException) throw it }
+                tracker.observe(now, false)
+                lastReason = attempt.exceptionOrNull()?.message ?: "Ошибка записи на USB"
+            } else if (validation.isFailure) {
+                lastReason = validation.exceptionOrNull()?.message ?: "USB не подключён"
+            } else {
+                lastReason = "Проверяю стабильность USB"
             }
-            attempt.getOrNull()?.let {
-                RecorderDiagnostics.record(this, "autostart_usb_ready")
-                return it
-            }
-            val reason = attempt.exceptionOrNull()?.message ?: "Ошибка USB"
-            if (reason != lastReason) {
+            val reason = lastReason ?: "Ошибка USB"
+            if (reason != lastLoggedUsbReason) {
                 RecorderDiagnostics.record(this, "autostart_usb_wait reason=${reason.replace(' ', '_')}")
-                lastReason = reason
+                lastLoggedUsbReason = reason
             }
-            val remaining = deadline - SystemClock.elapsedRealtime()
-            if (remaining <= 0) error("USB не появился за 5 минут: $reason")
+            if (!waitForUsb && validation.isFailure) error(reason)
+            if (!waitForUsb && now - startedAt >= USB_MANUAL_STABILITY_TIMEOUT_MS)
+                error("USB не подтвердил стабильную запись: $reason")
+            if (waitForUsb && now >= nextWaitReport) {
+                RecorderDiagnostics.record(this, "autostart_usb_still_waiting elapsedMs=${now - startedAt} reason=${reason.replace(' ', '_')}")
+                nextWaitReport = now + USB_WAIT_REPORT_MS
+            }
             withContext(Dispatchers.Main) {
                 if (starting) publish(RecorderState(recording = true,
-                    status = "Ожидаю выбранный USB (${(remaining / 1_000).coerceAtLeast(1)} с)…"))
+                    status = "Ожидаю выбранный USB: $reason"))
             }
-            delay(minOf(USB_RETRY_INTERVAL_MS, remaining))
+            delay(USB_RETRY_INTERVAL_MS)
         }
     }
 
@@ -249,6 +278,7 @@ class DashcamService : Service() {
             var previousRecorderCpu = Process.getElapsedCpuTime()
             var previousCaptureCpu = runCatching { remote.runtimeStats().getOrElse(0) { 0 } }.getOrDefault(0)
             var consecutiveLowMemorySamples = 0
+            var missingUsbSamples = 0
             var previousStamp: String? = null
             while (isActive && encoders.isNotEmpty()) {
                 val stamp = stampSource?.currentText().orEmpty()
@@ -309,6 +339,17 @@ class DashcamService : Service() {
                 val active = cameras.values.count(CameraRecordingState::recording)
                 val status = if (cameras.values.none { it.error != null }) "Запись: $active/${config.cameraIds.size} камер"
                     else "Запись с ошибками: $active/${config.cameraIds.size}"
+                if (config.storage == RecordingStorage.EXTERNAL && tick % USB_RECORDING_CHECK_INTERVAL_SECONDS == 0) {
+                    val usbError = runCatching { RecordingStore.validateExternal(this@DashcamService) }
+                        .getOrElse { "Проверка USB: ${it.message ?: it.javaClass.simpleName}" }
+                    missingUsbSamples = if (usbError == null) 0 else missingUsbSamples + 1
+                    if (usbError != null && missingUsbSamples >= USB_MISSING_SAMPLES_TO_RECOVER) {
+                        RecorderDiagnostics.record(this@DashcamService,
+                            "recording_usb_disconnected samples=$missingUsbSamples reason=$usbError")
+                        scope.launch(Dispatchers.Main) { recoverFromStorageFailure(usbError) }
+                        break
+                    }
+                }
                 val deadEncoder = encoders.values.firstOrNull { !it.drainAlive }
                 if (deadEncoder != null) {
                     val reason = errors[deadEncoder.inputId] ?: "Кодер камеры ${deadEncoder.inputId} остановился"
@@ -345,9 +386,26 @@ class DashcamService : Service() {
                 }
                 if (tick % 60 == 0 && maintenanceJob?.isActive != true) {
                     maintenanceJob = scope.launch(Dispatchers.IO) {
-                        runCatching { RecordingStore.enforceLimit(this@DashcamService, config) }
-                            .onFailure { RecorderDiagnostics.record(this@DashcamService,
-                                "archive_maintenance_error type=${it.javaClass.simpleName} message=${it.message}") }
+                        val result = runCatching { RecordingStore.enforceLimit(this@DashcamService, config) }
+                        val failure = result.exceptionOrNull()
+                        val maintenance = result.getOrNull()
+                        if (failure != null) RecorderDiagnostics.recordException(this@DashcamService,
+                            "archive_maintenance_error type=${failure.javaClass.simpleName} message=${failure.message}", failure)
+                        if (maintenance != null) RecorderDiagnostics.record(this@DashcamService,
+                            "archive_maintenance deleted=${maintenance.deletedFiles} usedBytes=${maintenance.usedBytes} " +
+                                "freeBytes=${maintenance.freeBytes} ready=${maintenance.ready}")
+                        val reason = when {
+                            failure is ArchiveAccessRequiredException -> ArchiveAccessRequiredException.MESSAGE
+                            maintenance?.ready == false -> "Недостаточно места в лимите архива или все старые файлы защищены"
+                            else -> null
+                        }
+                        if (reason != null) withContext(Dispatchers.Main) {
+                            if (encoders.isNotEmpty() && !recoveryPending) {
+                                val message = "Запись остановлена: $reason"
+                                postRecoveryNotice(message)
+                                stopRecording(message)
+                            }
+                        }
                     }
                 }
                 if (tick % DIAGNOSTIC_INTERVAL_SECONDS == 0) {
@@ -438,6 +496,14 @@ class DashcamService : Service() {
 
     private fun recoverFromCameraFailure(reason: String) {
         if (recoveryJob?.isActive == true) return
+        val usbError = if (config.storage == RecordingStorage.EXTERNAL)
+            runCatching { RecordingStore.validateExternal(this) }
+                .getOrElse { "Проверка USB: ${it.message ?: it.javaClass.simpleName}" }
+        else null
+        if (config.storage == RecordingStorage.EXTERNAL && (usbError != null || isUsbFailure(reason))) {
+            recoverFromStorageFailure(reason)
+            return
+        }
         val attemptsInWindow = noteRecoveryFailure()
         val delayMs = RECOVERY_DELAYS_MS[(attemptsInWindow - 1).coerceIn(0, RECOVERY_DELAYS_MS.lastIndex)]
         val selected = config
@@ -472,6 +538,26 @@ class DashcamService : Service() {
             startRecording(recordingIntent(this@DashcamService, selected, selected.storage == RecordingStorage.EXTERNAL))
         }
     }
+
+    private fun recoverFromStorageFailure(reason: String) {
+        if (recoveryJob?.isActive == true) return
+        val selected = config
+        val message = "USB-накопитель недоступен. Запись возобновится после его подключения."
+        lastRecoveryReason = reason
+        recoveryPending = true
+        RecorderDiagnostics.record(this,
+            "recording_usb_lost cameras=${selected.cameraIds.sorted()} reason=$reason")
+        stopRecording(message, keepServiceAlive = true)
+        recoveryJob = scope.launch(Dispatchers.Main) {
+            delay(USB_RETRY_INTERVAL_MS)
+            recoveryJob = null
+            startRecording(recordingIntent(this@DashcamService, selected, waitForUsb = true))
+        }
+    }
+
+    private fun isUsbFailure(reason: String): Boolean = listOf(
+        "usb", "volume", "накопител", "media store", "mediastore", "storage/", "no such file"
+    ).any { reason.contains(it, ignoreCase = true) }
 
     private fun noteRecoveryFailure(): Int {
         val now = System.currentTimeMillis()
@@ -612,10 +698,12 @@ class DashcamService : Service() {
     private fun createChannel() {
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, "Видеорегистратор", NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(CHANNEL_ID,
+                GCamLanguage.text(this, "Видеорегистратор", "Dashcam"), NotificationManager.IMPORTANCE_LOW)
         )
         manager.createNotificationChannel(
-            NotificationChannel(ERROR_CHANNEL_ID, "Сбои записи", NotificationManager.IMPORTANCE_HIGH)
+            NotificationChannel(ERROR_CHANNEL_ID,
+                GCamLanguage.text(this, "Сбои записи", "Recording failures"), NotificationManager.IMPORTANCE_HIGH)
         )
     }
 
@@ -624,9 +712,11 @@ class DashcamService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val notification = NotificationCompat.Builder(this, ERROR_CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle(if (recovered) "gCam — запись восстановлена" else "gCam — сбой записи")
-            .setContentText(message)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(message))
+            .setContentTitle(if (recovered)
+                GCamLanguage.text(this, "gCam — запись восстановлена", "gCam — recording recovered")
+                else GCamLanguage.text(this, "gCam — сбой записи", "gCam — recording failure"))
+            .setContentText(GCamLanguage.display(this, message))
+            .setStyle(NotificationCompat.BigTextStyle().bigText(GCamLanguage.display(this, message)))
             .setContentIntent(open)
             .setAutoCancel(true)
             .setOnlyAlertOnce(true)
@@ -644,11 +734,11 @@ class DashcamService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle("gCam — камеры 360°")
-            .setContentText(text)
+            .setContentTitle(GCamLanguage.text(this, "gCam — камеры 360°", "gCam — 360° cameras"))
+            .setContentText(GCamLanguage.display(this, text))
             .setOngoing(true)
             .setContentIntent(open)
-            .addAction(0, "Остановить", stop)
+            .addAction(0, GCamLanguage.text(this, "Остановить", "Stop"), stop)
             .build()
     }
 
@@ -678,7 +768,12 @@ class DashcamService : Service() {
         private const val EXTRA_STORAGE_LIMIT_GB = "storage_limit_gb"
         private const val EXTRA_STORAGE = "storage"
         private const val EXTRA_WAIT_FOR_USB = "wait_for_usb"
-        private const val USB_WAIT_TIMEOUT_MS = 5 * 60_000L
+        private const val USB_WAIT_REPORT_MS = 5 * 60_000L
+        private const val USB_STABLE_MS = 6_000L
+        private const val USB_STABLE_SAMPLES = 3
+        private const val USB_MANUAL_STABILITY_TIMEOUT_MS = 15_000L
+        private const val USB_RECORDING_CHECK_INTERVAL_SECONDS = 3
+        private const val USB_MISSING_SAMPLES_TO_RECOVER = 2
         private const val USB_RETRY_INTERVAL_MS = 3_000L
         private const val EXTRA_STAMP_TIME = "stamp_time"
         private const val EXTRA_STAMP_GPS = "stamp_gps"
@@ -686,6 +781,8 @@ class DashcamService : Service() {
         const val ACTION_START = "com.stasao.gcam.START_RECORDING"
         const val ACTION_STOP = "com.stasao.gcam.STOP_RECORDING"
         const val ACTION_QUERY = "com.stasao.gcam.QUERY_RECORDING"
+        private const val ACTION_LANGUAGE = "com.stasao.gcam.RECORDER_LANGUAGE"
+        private const val EXTRA_LANGUAGE = "language"
         const val ACTION_STATE = "com.stasao.gcam.RECORDING_STATE"
         private const val EXTRA_RECORDING = "recording"
         private const val EXTRA_USED_BYTES = "used_bytes"
@@ -726,6 +823,11 @@ class DashcamService : Service() {
 
         fun query(context: Context) = context.startService(
             Intent(context, DashcamService::class.java).setAction(ACTION_QUERY)
+        )
+
+        fun updateLanguage(context: Context, language: Int) = context.startService(
+            Intent(context, DashcamService::class.java).setAction(ACTION_LANGUAGE)
+                .putExtra(EXTRA_LANGUAGE, language)
         )
 
         fun stateFrom(intent: Intent): RecorderState {

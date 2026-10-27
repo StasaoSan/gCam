@@ -59,15 +59,36 @@ object GCamRuntimeController {
                 .setAction(GCamRecordOverlayService.ACTION_UPDATE_LAYOUT))
     }
 
-    fun updateOverlayPosition(context: Context, x: Float, y: Float) {
+    fun updateAllOverlayPositions(context: Context) {
         if (!Settings.canDrawOverlays(context)) return
-        startForeground(
-            context,
+        val config = GCamRuntimeSettings.load(context)
+        if (!config.statusOverlay && !config.blindStatusOverlay && !config.hudStatusOverlay) return
+        startForeground(context,
             Intent(context, GCamStatusOverlayService::class.java)
-                .setAction(GCamStatusOverlayService.ACTION_UPDATE_POSITION)
-                .putExtra(GCamStatusOverlayService.EXTRA_X, x.coerceIn(0f, 1f))
-                .putExtra(GCamStatusOverlayService.EXTRA_Y, y.coerceIn(0f, 1f))
-        )
+                .setAction(GCamStatusOverlayService.ACTION_UPDATE_ALL_POSITIONS))
+    }
+
+    fun updateBridgeLanguage(context: Context, language: Int) {
+        startForeground(context, Intent(context, QCarCamCaptureService::class.java)
+            .setAction(QCarCamCaptureService.ACTION_LANGUAGE)
+            .putExtra(QCarCamCaptureService.EXTRA_LANGUAGE, language))
+    }
+
+    fun updateFloatingLanguage(context: Context) {
+        if (!GCamRuntimeSettings.load(context).cameraOverlay || !Settings.canDrawOverlays(context)) return
+        startForeground(context, Intent(context, GCamCameraOverlayService::class.java)
+            .setAction(GCamCameraOverlayService.ACTION_LANGUAGE))
+    }
+
+    fun updateIndicatorLanguage(context: Context) {
+        if (!Settings.canDrawOverlays(context)) return
+        val config = GCamRuntimeSettings.load(context)
+        if (config.statusOverlay || config.blindStatusOverlay || config.hudStatusOverlay)
+            startForeground(context, Intent(context, GCamStatusOverlayService::class.java)
+                .setAction(GCamStatusOverlayService.ACTION_LANGUAGE))
+        if (config.recordOverlay)
+            startForeground(context, Intent(context, GCamRecordOverlayService::class.java)
+                .setAction(GCamRecordOverlayService.ACTION_LANGUAGE))
     }
 
     private fun startCameraBridge(context: Context): Boolean {

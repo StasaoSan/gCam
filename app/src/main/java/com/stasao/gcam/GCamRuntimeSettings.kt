@@ -60,12 +60,21 @@ object GCamRuntimeSettings {
             recordOverlaySizeDp = prefs.getInt(KEY_RECORD_OVERLAY_SIZE, 112).coerceIn(88, 180),
             statusOverlayX = position.first,
             statusOverlayY = position.second,
-            blindStatusOverlayX = prefs.getFloat(KEY_BLIND_STATUS_OVERLAY_X, 0.82f).coerceIn(0f, 1f),
-            blindStatusOverlayY = prefs.getFloat(KEY_BLIND_STATUS_OVERLAY_Y, 0.33f).coerceIn(0f, 1f),
-            hudStatusOverlayX = prefs.getFloat(KEY_HUD_STATUS_OVERLAY_X, 0.88f).coerceIn(0f, 1f),
-            hudStatusOverlayY = prefs.getFloat(KEY_HUD_STATUS_OVERLAY_Y, 0.33f).coerceIn(0f, 1f)
+            blindStatusOverlayX = prefs.getFloat(KEY_BLIND_STATUS_OVERLAY_X, DEFAULT_BLIND_OVERLAY_X).coerceIn(0f, 1f),
+            blindStatusOverlayY = prefs.getFloat(KEY_BLIND_STATUS_OVERLAY_Y, DEFAULT_BLIND_OVERLAY_Y).coerceIn(0f, 1f),
+            hudStatusOverlayX = prefs.getFloat(KEY_HUD_STATUS_OVERLAY_X, DEFAULT_HUD_OVERLAY_X).coerceIn(0f, 1f),
+            hudStatusOverlayY = prefs.getFloat(KEY_HUD_STATUS_OVERLAY_Y, DEFAULT_HUD_OVERLAY_Y).coerceIn(0f, 1f)
         )
     }
+
+    fun withDefaultStatusOverlayPositions(config: GCamRuntimeConfig): GCamRuntimeConfig = config.copy(
+        statusOverlayX = DEFAULT_OVERLAY_X,
+        statusOverlayY = DEFAULT_OVERLAY_Y,
+        blindStatusOverlayX = DEFAULT_BLIND_OVERLAY_X,
+        blindStatusOverlayY = DEFAULT_BLIND_OVERLAY_Y,
+        hudStatusOverlayX = DEFAULT_HUD_OVERLAY_X,
+        hudStatusOverlayY = DEFAULT_HUD_OVERLAY_Y
+    )
 
     fun save(context: Context, config: GCamRuntimeConfig) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
@@ -126,4 +135,8 @@ object GCamRuntimeSettings {
 
     private const val DEFAULT_OVERLAY_X = 0.95f
     private const val DEFAULT_OVERLAY_Y = 0.33f
+    private const val DEFAULT_BLIND_OVERLAY_X = 0.82f
+    private const val DEFAULT_BLIND_OVERLAY_Y = 0.33f
+    private const val DEFAULT_HUD_OVERLAY_X = 0.88f
+    private const val DEFAULT_HUD_OVERLAY_Y = 0.33f
 }

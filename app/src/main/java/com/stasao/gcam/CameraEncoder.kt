@@ -103,9 +103,11 @@ class CameraEncoder(
             muxer = null
             if (active != null) {
                 operation = "muxer_stop"
-                runCatching { active.stop() }.onFailure {
+                val stopFailure = runCatching { active.stop() }.exceptionOrNull()
+                if (stopFailure != null) {
                     RecorderDiagnostics.recordException(context,
-                        "segment_muxer_stop_error input=$inputId outputFrames=$outputFrames type=${it.javaClass.name} message=${it.message}", it)
+                        "segment_muxer_stop_error input=$inputId outputFrames=$outputFrames " +
+                            "type=${stopFailure.javaClass.name} message=${stopFailure.message}", stopFailure)
                 }
                 operation = "muxer_release"
                 runCatching { active.release() }.onFailure {
@@ -113,17 +115,22 @@ class CameraEncoder(
                         "segment_muxer_release_error input=$inputId type=${it.javaClass.name} message=${it.message}", it)
                 }
                 target?.let { segment ->
-                    if (segmentHasSamples) {
+                    if (segmentHasSamples && stopFailure == null) {
                         operation = "finish_segment"
                         RecordingStore.finishSegment(context, segment)
                         completedSegments++
                         RecorderDiagnostics.record(context, "segment_closed input=$inputId segments=$completedSegments outputFrames=$outputFrames outputBytes=$outputBytes")
                     } else {
-                        operation = "abort_empty_segment"
-                        RecordingStore.abortSegment(context, segment)
-                        RecorderDiagnostics.record(context, "segment_empty input=$inputId")
+                        operation = if (stopFailure == null) "abort_empty_segment" else "abort_incomplete_segment"
+                        runCatching { RecordingStore.abortSegment(context, segment) }.onFailure {
+                            RecorderDiagnostics.recordException(context,
+                                "segment_abort_error input=$inputId type=${it.javaClass.name} message=${it.message}", it)
+                        }
+                        RecorderDiagnostics.record(context,
+                            "segment_discarded input=$inputId reason=${if (stopFailure == null) "empty" else "muxer_stop_failed"}")
                     }
                 }
+                if (stopFailure != null) throw stopFailure
             }
             target = null
             segmentHasSamples = false
@@ -139,14 +146,17 @@ class CameraEncoder(
             val segment = RecordingStore.createSegment(context, inputId, name, storage = config.storage)
             RecorderDiagnostics.record(context, "segment_open input=$inputId name=$name")
             target = segment
+            var createdMuxer: MediaMuxer? = null
             try {
                 operation = "muxer_create_start"
-                muxer = MediaMuxer(segment.descriptor.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4).also {
-                    track = it.addTrack(MediaFormat(format))
-                    it.start()
-                }
+                val newMuxer = MediaMuxer(segment.descriptor.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                createdMuxer = newMuxer
+                track = newMuxer.addTrack(MediaFormat(format))
+                newMuxer.start()
+                muxer = newMuxer
             } catch (t: Throwable) {
-                RecordingStore.abortSegment(context, segment)
+                runCatching { createdMuxer?.release() }
+                runCatching { RecordingStore.abortSegment(context, segment) }
                 target = null
                 throw t
             }

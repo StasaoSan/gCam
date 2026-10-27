@@ -108,12 +108,12 @@ class GCamStatusOverlayService : Service() {
         super.onCreate()
         val notifications = getSystemService(NotificationManager::class.java)
         notifications.createNotificationChannel(NotificationChannel(CHANNEL_ID,
-            "Индикаторы gCam", NotificationManager.IMPORTANCE_LOW))
+            GCamLanguage.text(this, "Индикаторы gCam", "gCam indicators"), NotificationManager.IMPORTANCE_LOW))
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         startForeground(NOTIFICATION_ID, NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle("gCam · индикаторы")
+            .setContentTitle(GCamLanguage.text(this, "gCam · индикаторы", "gCam · indicators"))
             .setContentIntent(open)
             .setOngoing(true)
             .build())
@@ -136,8 +136,21 @@ class GCamStatusOverlayService : Service() {
             return START_NOT_STICKY
         }
         syncDots(config)
-        if (intent?.action == ACTION_UPDATE_POSITION) positionDot(Kind.COMBINED,
-            config.statusOverlayX, config.statusOverlayY)
+        when (intent?.action) {
+            ACTION_UPDATE_ALL_POSITIONS -> Kind.entries.forEach { kind ->
+                val (x, y) = position(config, kind)
+                positionDot(kind, x, y)
+            }
+            ACTION_LANGUAGE -> runCatching {
+                getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID,
+                    NotificationCompat.Builder(this, CHANNEL_ID)
+                        .setSmallIcon(R.mipmap.ic_launcher)
+                        .setContentTitle(GCamLanguage.text(this, "gCam · индикаторы", "gCam · indicators"))
+                        .setContentIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
+                            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
+                        .setOngoing(true).build())
+            }
+        }
         render()
         return START_STICKY
     }
@@ -240,15 +253,18 @@ class GCamStatusOverlayService : Service() {
         val blindColor = statusColor(blindReady, recording, expected)
         dots[Kind.HUD]?.view?.apply {
             setStatus(hudColor)
-            contentDescription = "ANHUD: ${statusText(hudColor)}"
+            contentDescription = "ANHUD: ${GCamLanguage.display(this@GCamStatusOverlayService, statusText(hudColor))}"
         }
         dots[Kind.BLIND]?.view?.apply {
             setStatus(blindColor)
-            contentDescription = "gBlind: ${statusText(blindColor)}"
+            contentDescription = "gBlind: ${GCamLanguage.display(this@GCamStatusOverlayService, statusText(blindColor))}"
         }
         dots[Kind.COMBINED]?.view?.apply {
             setStatus(hudColor, blindColor)
-            contentDescription = "Слева ANHUD: ${statusText(hudColor)}; справа gBlind: ${statusText(blindColor)}"
+            contentDescription = GCamLanguage.text(this@GCamStatusOverlayService,
+                "Слева ANHUD: ${statusText(hudColor)}; справа gBlind: ${statusText(blindColor)}",
+                "ANHUD left: ${GCamLanguage.display(this@GCamStatusOverlayService, statusText(hudColor))}; " +
+                    "gBlind right: ${GCamLanguage.display(this@GCamStatusOverlayService, statusText(blindColor))}")
         }
         val signature = listOf(hudColor, blindColor, expected, recording).hashCode()
         if (signature != lastStatusSignature || now - lastStatusLogAt >= STATUS_LOG_INTERVAL_MS) {
@@ -315,9 +331,8 @@ class GCamStatusOverlayService : Service() {
     private fun Int.dp() = (this * resources.displayMetrics.density + 0.5f).toInt()
 
     companion object {
-        const val ACTION_UPDATE_POSITION = "com.stasao.gcam.UPDATE_STATUS_OVERLAY_POSITION"
-        const val EXTRA_X = "x_fraction"
-        const val EXTRA_Y = "y_fraction"
+        const val ACTION_UPDATE_ALL_POSITIONS = "com.stasao.gcam.UPDATE_ALL_STATUS_OVERLAY_POSITIONS"
+        const val ACTION_LANGUAGE = "com.stasao.gcam.STATUS_OVERLAY_LANGUAGE"
         const val TOUCH_SIZE_DP = 36
         const val HEALTH_TIMEOUT_MS = 5_000L
         const val STATUS_LOG_INTERVAL_MS = 5_000L

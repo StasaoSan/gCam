@@ -12,7 +12,15 @@ internal object ImagePathAdvice {
         val error: String?,
     )
 
-    fun explain(app: String, state: State): String = when {
+    fun explain(app: String, state: State, english: Boolean = false): String = when {
+        english && !state.installed -> "$app is not installed. Install and open it."
+        english && !state.access -> "$app has no gCam access. Approve it in the access section below."
+        english && !state.reportFresh -> "$app is not reporting camera activity. Open $app and enable camera display in its settings."
+        english && !state.enabled -> "Camera display is disabled in $app. Enable it in that app's settings."
+        english && !state.error.isNullOrBlank() -> "$app reports an error: ${EnglishUi.translate(state.error.orEmpty())}"
+        english && !state.connected -> "$app is running, but is not connected to the camera or display. Open its status screen."
+        english && !state.video -> "$app is connected, but no frames have been confirmed. Use a turn signal or open its preview."
+        english -> "$app receives frames. If nothing appears on the display, check its display mode and window position."
         !state.installed -> "$app не установлен. Установите приложение и откройте его."
         !state.access -> "Доступ $app к gCam не разрешён. Подтвердите его в разделе доступа ниже."
         !state.reportFresh -> "$app не сообщает о работе камер. Откройте $app и включите вывод камер в его настройках."

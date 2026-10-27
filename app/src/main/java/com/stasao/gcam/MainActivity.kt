@@ -20,6 +20,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -31,7 +33,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -53,6 +57,7 @@ private data class LinkHealth(val receivedAt: Long = 0, val enabled: Boolean = f
                               val connected: Boolean = false, val video: Boolean = false,
                               val error: String? = null)
 private val cameraInputs = listOf(CameraInput(0, "Левая"), CameraInput(1, "Правая"), CameraInput(2, "Перед"), CameraInput(3, "Зад"))
+private val LocalGCamEnglish = compositionLocalOf { false }
 
 class MainActivity : ComponentActivity() {
     private var permissionsRequested = false
@@ -123,27 +128,57 @@ class MainActivity : ComponentActivity() {
     val baseDensity = LocalDensity.current
     val appVersion = remember(context) { GCamUpdater.installedVersion(context) }
     var uiScale by remember { mutableFloatStateOf(RecorderSettings.loadUiScale(context)) }
+    var language by remember { mutableIntStateOf(GCamLanguage.load(context)) }
+    var languageMenuExpanded by remember { mutableStateOf(false) }
     var tab by remember { mutableIntStateOf(0) }
     var updateAvailable by remember { mutableStateOf(false) }
     val recorder by RecorderRepository.state.collectAsState()
+    fun chooseLanguage(value: Int) {
+        language = value
+        GCamLanguage.save(context, value)
+        if (recorder.recording) DashcamService.updateLanguage(context, value)
+        GCamRuntimeController.updateBridgeLanguage(context, value)
+        GCamRuntimeController.updateFloatingLanguage(context)
+        GCamRuntimeController.updateIndicatorLanguage(context)
+    }
     LaunchedEffect(Unit) {
         if (GCamUpdater.supportsUpdates(context)) {
             runCatching { GCamUpdater.latestRelease(context) }
                 .onSuccess { updateAvailable = it != null }
         }
     }
-    CompositionLocalProvider(LocalDensity provides Density(baseDensity.density * uiScale, baseDensity.fontScale)) {
+    CompositionLocalProvider(
+        LocalDensity provides Density(baseDensity.density * uiScale, baseDensity.fontScale),
+        LocalGCamEnglish provides GCamLanguage.isEnglish(context, language)
+    ) {
     Scaffold(topBar = { Column {
-        TopAppBar(title = { Text("Камеры 360° · v$appVersion") }, colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primaryContainer))
+        TopAppBar(title = { Text("Камеры 360° · v$appVersion") },
+            actions = {
+                Box {
+                    TextButton(onClick = { languageMenuExpanded = true }) {
+                        Text(if (LocalGCamEnglish.current) "EN" else "RU")
+                    }
+                    DropdownMenu(expanded = languageMenuExpanded,
+                        onDismissRequest = { languageMenuExpanded = false }) {
+                        listOf(0 to "Системный", 1 to "Русский", 2 to "English").forEach { (value, label) ->
+                            DropdownMenuItem(text = { Text(label) }, onClick = {
+                                languageMenuExpanded = false
+                                chooseLanguage(value)
+                            })
+                        }
+                    }
+                }
+            }, colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primaryContainer))
         PrimaryTabRow(selectedTabIndex = tab) { listOf("Камеры и запись", "Записи", if (updateAvailable) "Обновление ●" else "Обновление").forEachIndexed { i, title ->
             Tab(selected = tab == i, onClick = { tab = i }, text = { Text(title) })
         } }
     } }) { padding -> Box(Modifier.fillMaxSize().padding(padding)) {
         when (tab) {
-            0 -> RecorderScreen(recorder, uiScale) {
-                uiScale = it
-                RecorderSettings.saveUiScale(context, it)
-            }
+            0 -> RecorderScreen(recorder, uiScale, language,
+                onUiScaleChange = {
+                    uiScale = it
+                    RecorderSettings.saveUiScale(context, it)
+                }, onLanguageChange = ::chooseLanguage)
             1 -> RecordingsScreen(recorder.recording, recorder.warning,
                 recorder.recording && recorder.cameras.values.any { it.recording })
             else -> UpdateScreen(recorder.recording)
@@ -234,7 +269,8 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@Composable private fun RecorderScreen(state: RecorderState, uiScale: Float, onUiScaleChange: (Float) -> Unit) {
+@Composable private fun RecorderScreen(state: RecorderState, uiScale: Float, language: Int,
+                                       onUiScaleChange: (Float) -> Unit, onLanguageChange: (Int) -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var preparing by remember { mutableStateOf(false) }
@@ -305,9 +341,9 @@ class MainActivity : ComponentActivity() {
             config = config.copy(storageLimitGb = maxArchiveGb)
     }
     var runtimeConfig by remember { mutableStateOf(GCamRuntimeSettings.load(context)) }
+    var selectedOverlayPosition by remember { mutableIntStateOf(0) }
     var anhudAccess by remember { mutableStateOf(CaptureClientTrust.status(context)) }
     var blindAccess by remember { mutableStateOf(CaptureClientTrust.blindStatus(context)) }
-    var zonesAccess by remember { mutableStateOf(CaptureClientTrust.zonesStatus(context)) }
     var anhudAccessMessage by remember { mutableStateOf<String?>(null) }
     var overlayAllowed by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
     var locationAllowed by remember { mutableStateOf(context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) }
@@ -331,7 +367,6 @@ class MainActivity : ComponentActivity() {
             locationAllowed = context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
             anhudAccess = CaptureClientTrust.status(context)
             blindAccess = CaptureClientTrust.blindStatus(context)
-            zonesAccess = CaptureClientTrust.zonesStatus(context)
             delay(1_000)
         }
     }
@@ -417,8 +452,8 @@ class MainActivity : ComponentActivity() {
                 Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Почему нет изображения?", style = MaterialTheme.typography.titleMedium)
                     Text("Штатное 360° работает отдельно. Проверьте живые боковые камеры в превью выше, затем путь до нужного экрана.", fontSize = 13.sp)
-                    Text("Проекция: ${ImagePathAdvice.explain("ANHUD", adviceState(anhudAccess, hudHealth))}", fontSize = 13.sp)
-                    Text("Приборка: ${ImagePathAdvice.explain("gBlind", adviceState(blindAccess, blindHealth))}", fontSize = 13.sp)
+                    Text("Проекция: ${ImagePathAdvice.explain("ANHUD", adviceState(anhudAccess, hudHealth), LocalGCamEnglish.current)}", fontSize = 13.sp)
+                    Text("Приборка: ${ImagePathAdvice.explain("gBlind", adviceState(blindAccess, blindHealth), LocalGCamEnglish.current)}", fontSize = 13.sp)
                 }
             }
         }
@@ -514,6 +549,9 @@ class MainActivity : ComponentActivity() {
             Text("Ориентировочно ${"%.1f".format(Locale.US, hours)} ч записи", fontSize = 13.sp)
         }
         item {
+            ArchiveAccessCard()
+        }
+        item {
             SectionTitle("Метки на видео")
             RuntimeSwitchRow("Дата и время", "Поверх кадра, без перекодирования на CPU", config.stampTime, enabled) {
                 config = config.copy(stampTime = it)
@@ -535,6 +573,11 @@ class MainActivity : ComponentActivity() {
         }
         item { SectionTitle("Размер интерфейса: ${(uiScale * 100).toInt()}%")
             Slider(uiScale, onUiScaleChange, valueRange = 1.3f..1.8f, steps = 9)
+        }
+        item {
+            SectionTitle("Язык приложения")
+            ChoiceRow(listOf(0 to "Системный", 1 to "Русский", 2 to "English"),
+                language, true, onLanguageChange)
         }
         item {
             SectionTitle("Автозапуск и индикатор")
@@ -632,41 +675,56 @@ class MainActivity : ComponentActivity() {
                 valueRange = 88f..180f,
                 enabled = runtimeConfig.recordOverlay && overlayAllowed
             )
-            Text("Позиция по горизонтали: ${(runtimeConfig.statusOverlayX * 100).toInt()}%", fontSize = 13.sp)
-            Slider(
-                value = runtimeConfig.statusOverlayX,
-                onValueChange = { value ->
-                    runtimeConfig = runtimeConfig.copy(statusOverlayX = value)
-                    GCamRuntimeSettings.save(context, runtimeConfig)
-                    if (runtimeConfig.statusOverlay) {
-                        GCamRuntimeController.updateOverlayPosition(
-                            context,
-                            runtimeConfig.statusOverlayX,
-                            runtimeConfig.statusOverlayY
-                        )
-                    }
-                },
-                valueRange = 0f..1f,
-                enabled = runtimeConfig.statusOverlay && overlayAllowed
+            TextButton(onClick = {
+                runtimeConfig = GCamRuntimeSettings.withDefaultStatusOverlayPositions(runtimeConfig)
+                GCamRuntimeSettings.save(context, runtimeConfig)
+                GCamRuntimeController.updateAllOverlayPositions(context)
+            }) {
+                Text("Сбросить положение всех точек")
+            }
+            Text("Вернёт три индикатора на исходные места, не меняя их включение.", fontSize = 12.sp)
+            Text("Положение плавающего элемента", fontSize = 13.sp)
+            ChoiceRow(
+                options = listOf(0 to "gBlind", 1 to "ANHUD", 2 to "Обе", 3 to "Запись"),
+                selected = selectedOverlayPosition,
+                enabled = true,
+                onSelect = { selectedOverlayPosition = it }
             )
-            Text("Позиция по вертикали: ${(runtimeConfig.statusOverlayY * 100).toInt()}%", fontSize = 13.sp)
+            fun selectedPosition(): Pair<Float, Float> = when (selectedOverlayPosition) {
+                0 -> runtimeConfig.blindStatusOverlayX to runtimeConfig.blindStatusOverlayY
+                1 -> runtimeConfig.hudStatusOverlayX to runtimeConfig.hudStatusOverlayY
+                2 -> runtimeConfig.statusOverlayX to runtimeConfig.statusOverlayY
+                else -> runtimeConfig.recordOverlayX to runtimeConfig.recordOverlayY
+            }
+            val (overlayX, overlayY) = selectedPosition()
+            fun saveOverlayPosition(x: Float? = null, y: Float? = null) {
+                val (currentX, currentY) = selectedPosition()
+                val nextX = x ?: currentX
+                val nextY = y ?: currentY
+                runtimeConfig = when (selectedOverlayPosition) {
+                    0 -> runtimeConfig.copy(blindStatusOverlayX = nextX, blindStatusOverlayY = nextY)
+                    1 -> runtimeConfig.copy(hudStatusOverlayX = nextX, hudStatusOverlayY = nextY)
+                    2 -> runtimeConfig.copy(statusOverlayX = nextX, statusOverlayY = nextY)
+                    else -> runtimeConfig.copy(recordOverlayX = nextX, recordOverlayY = nextY)
+                }
+                GCamRuntimeSettings.save(context, runtimeConfig)
+                if (selectedOverlayPosition == 3) {
+                    if (runtimeConfig.recordOverlay) GCamRuntimeController.updateRecordOverlay(context)
+                } else GCamRuntimeController.updateAllOverlayPositions(context)
+            }
+            Text("Горизонталь: ${(overlayX * 100).toInt()}%", fontSize = 13.sp)
             Slider(
-                value = runtimeConfig.statusOverlayY,
-                onValueChange = { value ->
-                    runtimeConfig = runtimeConfig.copy(statusOverlayY = value)
-                    GCamRuntimeSettings.save(context, runtimeConfig)
-                    if (runtimeConfig.statusOverlay) {
-                        GCamRuntimeController.updateOverlayPosition(
-                            context,
-                            runtimeConfig.statusOverlayX,
-                            runtimeConfig.statusOverlayY
-                        )
-                    }
-                },
-                valueRange = 0f..1f,
-                enabled = runtimeConfig.statusOverlay && overlayAllowed
+                value = overlayX,
+                onValueChange = { saveOverlayPosition(x = it) },
+                valueRange = 0f..1f
             )
-            Text("Точки можно перетаскивать независимо; короткое нажатие открывает gCam.", fontSize = 12.sp)
+            Text("Вертикаль: ${(overlayY * 100).toInt()}%", fontSize = 13.sp)
+            Slider(
+                value = overlayY,
+                onValueChange = { saveOverlayPosition(y = it) },
+                valueRange = 0f..1f
+            )
+            Text("Положение можно задать даже для выключенного элемента; включённый перемещается сразу. Точки также можно перетаскивать пальцем.", fontSize = 12.sp)
             Text("● красный — нет связи или сигнала", color = Color(0xFFF44336), fontSize = 12.sp)
             Text("● синий — сигнал получен, запись не запланирована", color = Color(0xFF2196F3), fontSize = 12.sp)
             Text("● оранжевый — сигнал получен, но ожидаемая запись не идёт", color = Color(0xFFFF9800), fontSize = 12.sp)
@@ -726,23 +784,6 @@ class MainActivity : ComponentActivity() {
                     else CaptureClientTrust.approveBlind(context)
                     blindAccess = CaptureClientTrust.blindStatus(context)
                 }) { Text(if (blindAccess.approved) "Отозвать доступ" else "Разрешить gBlind") }
-            }
-        }
-        item {
-            SectionTitle("Доступ gZones к боковым камерам")
-            Text(when {
-                !zonesAccess.installed -> "gZones не установлен"
-                zonesAccess.sameSigner -> "Доступ выдан автоматически: приложения подписаны одним ключом."
-                zonesAccess.approved -> "Доступ к двум потокам анализа разрешён"
-                zonesAccess.signerChanged -> "Подпись gZones изменилась. Проверьте сборку и подтвердите доступ снова."
-                else -> "Проверьте установленный gZones и разрешите доступ к камерам."
-            }, fontSize = 13.sp)
-            if (zonesAccess.installed && !zonesAccess.sameSigner) {
-                OutlinedButton(onClick = {
-                    if (zonesAccess.approved) CaptureClientTrust.revokeZones(context)
-                    else CaptureClientTrust.approveZones(context)
-                    zonesAccess = CaptureClientTrust.zonesStatus(context)
-                }) { Text(if (zonesAccess.approved) "Отозвать доступ" else "Разрешить gZones") }
             }
         }
         item { Button(onClick = {
@@ -888,7 +929,44 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@Composable private fun Text(text: String, modifier: Modifier = Modifier,
+                             color: Color = Color.Unspecified,
+                             fontSize: TextUnit = TextUnit.Unspecified,
+                             style: TextStyle = LocalTextStyle.current,
+                             maxLines: Int = Int.MAX_VALUE) {
+    val english = LocalGCamEnglish.current
+    androidx.compose.material3.Text(
+        text = if (english) EnglishUi.translate(text) else text,
+        modifier = modifier, color = color, fontSize = fontSize,
+        style = style, maxLines = maxLines
+    )
+}
+
 @Composable private fun SectionTitle(text: String) = Text(text, style = MaterialTheme.typography.titleMedium)
+
+@Composable private fun ArchiveAccessCard() {
+    val context = LocalContext.current
+    var granted by remember { mutableStateOf(ArchiveAccess.isGranted()) }
+    var settingsUnavailable by remember { mutableStateOf(false) }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        granted = ArchiveAccess.isGranted()
+        if (granted) settingsUnavailable = false
+        RecorderDiagnostics.record(context, "archive_access allFilesAccess=$granted package=${context.packageName}")
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        SectionTitle("Автоматическая очистка архива")
+        Text(if (granted) "Доступ выдан: старые записи удаляются автоматически по лимиту."
+            else "Для удаления записей от предыдущих установок нужен однократный доступ ко всем файлам.", fontSize = 13.sp)
+        Text("Android выдаёт доступ ко всему общему хранилищу. gCam удаляет по лимиту только свои записи в Movies/gCam выбранного накопителя; защищённые файлы сохраняются.", fontSize = 12.sp)
+        if (!granted) OutlinedButton(onClick = {
+            settingsUnavailable = !ArchiveAccess.openSettings(context)
+        }) { Text("Разрешить автоматическую очистку") }
+        if (settingsUnavailable) Text(
+            "На этом ГУ нет окна выдачи доступа. Разрешение можно выдать через ADB: adb shell appops set --uid ${context.packageName} MANAGE_EXTERNAL_STORAGE allow",
+            fontSize = 12.sp)
+    }
+}
+
 @Composable private fun ChoiceRow(options: List<Pair<Int, String>>, selected: Int, enabled: Boolean, onSelect: (Int) -> Unit) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { options.forEach { (v, title) -> FilterChip(selected = selected == v, enabled = enabled, onClick = { onSelect(v) }, label = { Text(title) }, modifier = Modifier.weight(1f)) } }
 }
@@ -935,6 +1013,7 @@ class MainActivity : ComponentActivity() {
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         warning?.let { message -> item { RecorderWarningBanner(message, recordingActive) } }
+        item { ArchiveAccessCard() }
         item {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("USB/gCam и Movies/gCam · ${timelines.size} записей / ${recordings.size} файлов · ${formatBytes(recordings.sumOf { it.sizeBytes })}", style = MaterialTheme.typography.titleMedium)
@@ -977,7 +1056,7 @@ class MainActivity : ComponentActivity() {
                             }, enabled = !deleting)
                         Column(Modifier.weight(1f)) {
                             Text(recorderCameraNames[timeline.inputId] ?: "Камера ${timeline.inputId}")
-                            Text("${DateFormat.getDateTimeInstance().format(Date(timeline.startedAt))} · ${formatDuration(timeline.durationMs)} · ${timeline.parts.size} фрагм. · ${formatBytes(timeline.sizeBytes)}", fontSize = 12.sp)
+                            Text("${DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT, if (LocalGCamEnglish.current) Locale.ENGLISH else Locale.forLanguageTag("ru")).format(Date(timeline.startedAt))} · ${formatDuration(timeline.durationMs)} · ${timeline.parts.size} фрагм. · ${formatBytes(timeline.sizeBytes)}", fontSize = 12.sp)
                         }
                         TextButton(onClick = { playing = timeline }) { Text("Смотреть") }
                     }
@@ -990,10 +1069,21 @@ class MainActivity : ComponentActivity() {
                                 onCheckedChange = { checked ->
                                     selectedUris = if (checked) selectedUris + r.uri else selectedUris - r.uri
                                 }, enabled = !deleting)
-                            Text("${DateFormat.getTimeInstance().format(Date(r.modifiedAt))} · ${formatDuration(r.durationMs)} · ${if (r.storage == RecordingStorage.EXTERNAL) "USB" else "внутренняя"}${if (r.protected) " · защищено" else ""}", modifier = Modifier.weight(1f), fontSize = 12.sp)
+                            Text("${DateFormat.getTimeInstance(DateFormat.SHORT, if (LocalGCamEnglish.current) Locale.ENGLISH else Locale.forLanguageTag("ru")).format(Date(r.modifiedAt))} · ${formatDuration(r.durationMs)} · ${if (r.storage == RecordingStorage.EXTERNAL) "USB" else "внутренняя"}${if (r.protected) " · защищено" else ""}", modifier = Modifier.weight(1f), fontSize = 12.sp)
                             if (!selecting) {
-                                TextButton(onClick = { RecordingStore.setProtected(context, r, !r.protected); revision++ }) { Text(if (r.protected) "Снять защиту" else "Защитить") }
-                                TextButton(onClick = { RecordingStore.delete(context, r); revision++ }) { Text("Удалить") }
+                                TextButton(onClick = {
+                                    scope.launch {
+                                        val result = withContext(Dispatchers.IO) {
+                                            runCatching { RecordingStore.setProtected(context, r, !r.protected) }
+                                        }
+                                        result.exceptionOrNull()?.let {
+                                            deletionMessage = if (it is SecurityException) ArchiveAccessRequiredException.MESSAGE
+                                                else "Не удалось изменить защиту: ${it.message}"
+                                        }
+                                        revision++
+                                    }
+                                }) { Text(if (r.protected) "Снять защиту" else "Защитить") }
+                                TextButton(onClick = { confirmDelete = listOf(r) }, enabled = !recording && !deleting) { Text("Удалить") }
                             }
                         }
                     }
@@ -1015,16 +1105,24 @@ class MainActivity : ComponentActivity() {
                     confirmDelete = null
                     deleting = true
                     scope.launch {
-                        val failed = withContext(Dispatchers.IO) {
-                            targets.filter { file ->
+                        val (failed, accessDenied) = withContext(Dispatchers.IO) {
+                            var denied = false
+                            val remaining = targets.filter { file ->
                                 RecorderRepository.state.value.recording ||
-                                    !runCatching { RecordingStore.delete(context, file) }.getOrDefault(false)
+                                    !runCatching { RecordingStore.delete(context, file) }.onFailure {
+                                        if (it is SecurityException) denied = true
+                                        RecorderDiagnostics.record(context,
+                                            "archive_manual_delete_error uri=${file.uri} type=${it.javaClass.simpleName} " +
+                                                "allFilesAccess=${ArchiveAccess.isGranted()} message=${it.message}")
+                                    }.getOrDefault(false)
                             }
+                            remaining to denied
                         }
                         deleting = false
                         selectedUris = failed.mapTo(HashSet()) { it.uri }
                         if (failed.isEmpty()) selecting = false
-                        deletionMessage = "Удалено ${targets.size - failed.size} из ${targets.size} файлов" +
+                        deletionMessage = if (accessDenied) ArchiveAccessRequiredException.MESSAGE
+                        else "Удалено ${targets.size - failed.size} из ${targets.size} файлов" +
                             if (failed.isNotEmpty()) ". Не удалось удалить ${failed.size}; они остались выделены." else "."
                         revision++
                     }
@@ -1035,7 +1133,7 @@ class MainActivity : ComponentActivity() {
     }
     deletionMessage?.let { message ->
         AlertDialog(onDismissRequest = { deletionMessage = null },
-            title = { Text("Удаление завершено") }, text = { Text(message) },
+            title = { Text("Архив записей") }, text = { Text(message) },
             confirmButton = { TextButton(onClick = { deletionMessage = null }) { Text("ОК") } })
     }
     playing?.let { VideoPlayer(it) { playing = null } }

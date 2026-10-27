@@ -89,7 +89,7 @@ class QCarCamCaptureService : Service() {
             shape: Int
         ): String {
             checkBlindSlot(slot)
-            if (slot !in 0..11) return "Некорректный HUD slot"
+            if (slot !in 0..9) return "Некорректный HUD slot"
             if (slot < 2) {
                 hudRequested[slot] = true
                 hudInputs[slot] = inputId
@@ -129,9 +129,7 @@ class QCarCamCaptureService : Service() {
             fisheye: Float, shape: Int, quarterTurns: Int
         ): String {
             checkBlindSlot(slot)
-            if (CaptureClientTrust.isZonesCaller(this@QCarCamCaptureService, Binder.getCallingUidOrThrow()) &&
-                inputId != slot - 10) throw SecurityException("gZones: слот должен соответствовать боковой камере")
-            if (slot !in 0..11) return "Некорректный HUD slot"
+            if (slot !in 0..9) return "Некорректный HUD slot"
             if (slot < 2) {
                 hudRequested[slot] = true
                 hudInputs[slot] = inputId
@@ -207,10 +205,6 @@ class QCarCamCaptureService : Service() {
 
     private fun checkBlindSlot(slot: Int) {
         val uid = Binder.getCallingUidOrThrow()
-        if (CaptureClientTrust.isZonesCaller(this, uid)) {
-            if (slot !in 10..11) throw SecurityException("gZones может использовать только слоты 10 и 11")
-            return
-        }
         if (slot >= 6 && uid != android.os.Process.myUid()) {
             throw SecurityException("Плавающие окна gCam доступны только gCam")
         }
@@ -228,16 +222,19 @@ class QCarCamCaptureService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_LANGUAGE)
+            GCamLanguage.useInProcess(intent.getIntExtra(EXTRA_LANGUAGE, GCamLanguage.SYSTEM))
         val notifications = getSystemService(NotificationManager::class.java)
         notifications.createNotificationChannel(
-            NotificationChannel(HEALTH_CHANNEL_ID, "Связь gCam с ANHUD", NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(HEALTH_CHANNEL_ID,
+                GCamLanguage.text(this, "Связь gCam с ANHUD", "gCam–ANHUD connection"), NotificationManager.IMPORTANCE_LOW)
         )
         startForeground(
             HEALTH_NOTIFICATION_ID,
             NotificationCompat.Builder(this, HEALTH_CHANNEL_ID)
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentTitle("gCam")
-                .setContentText("Камеры готовы для ANHUD")
+                .setContentText(GCamLanguage.text(this, "Камеры готовы для ANHUD", "Cameras ready for ANHUD"))
                 .setOngoing(true)
                 .build()
         )
@@ -354,6 +351,8 @@ class QCarCamCaptureService : Service() {
 
     companion object {
         const val ACTION_KEEP_ALIVE = "com.stasao.gcam.KEEP_ALIVE"
+        const val ACTION_LANGUAGE = "com.stasao.gcam.CAMERA_LANGUAGE"
+        const val EXTRA_LANGUAGE = "language"
         const val HEALTH_INTERVAL_MS = 1_000L
         const val HUD_LOG_INTERVAL_MS = 5_000L
         const val ACTIVE_SWITCH_GRACE_MS = 2_500L

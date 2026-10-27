@@ -31,7 +31,7 @@
 #define STRIDE_BYTES (W * 2u)
 #define BYTES (W * H * 2u)
 #define NBUF 3u
-#define HUD_STREAMS 12 /* 0/1: projection, 2/3: cluster, 4/5: editors, 6..9: gCam preview, 10/11: gZones */
+#define HUD_STREAMS 10 /* 0/1: projection, 2/3: cluster, 4/5: editors, 6..9: gCam preview */
 #define UYVY8 0x07080102u
 #define FOURCC_CODE(a,b,c,d) ((uint32_t)(a)|((uint32_t)(b)<<8)|((uint32_t)(c)<<16)|((uint32_t)(d)<<24))
 #define DRM_FORMAT_ABGR8888 FOURCC_CODE('A','B','2','4')

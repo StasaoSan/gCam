@@ -30,16 +30,20 @@ class GCamCameraOverlayService : Service() {
     private lateinit var windows: WindowManager
     private var panel: View? = null
     private var capture: FloatingCameraCapture? = null
+    private var titleView: TextView? = null
+    private var closeView: TextView? = null
+    private val cameraLabels = arrayOfNulls<TextView>(4)
 
     override fun onCreate() {
         super.onCreate()
         val notifications = getSystemService(NotificationManager::class.java)
         notifications.createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, "Плавающие камеры", NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(CHANNEL_ID,
+                GCamLanguage.text(this, "Плавающие камеры", "Floating cameras"), NotificationManager.IMPORTANCE_LOW)
         )
         startForeground(NOTIFICATION_ID, Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setContentTitle("gCam: камеры поверх окон")
+            .setContentTitle(GCamLanguage.text(this, "gCam: камеры поверх окон", "gCam: floating cameras"))
             .setOngoing(true)
             .build())
         windows = getSystemService(WINDOW_SERVICE) as WindowManager
@@ -51,12 +55,16 @@ class GCamCameraOverlayService : Service() {
             return START_NOT_STICKY
         }
         if (panel == null) showPanel()
+        if (intent?.action == ACTION_LANGUAGE) updateLanguage()
         return START_STICKY
     }
 
     override fun onDestroy() {
         panel?.let { runCatching { windows.removeView(it) } }
         panel = null
+        titleView = null
+        closeView = null
+        cameraLabels.fill(null)
         capture?.close()
         capture = null
         super.onDestroy()
@@ -88,7 +96,9 @@ class GCamCameraOverlayService : Service() {
             setBackgroundColor(Color.rgb(38, 48, 67))
         }
         val title = TextView(this).apply {
-            text = "⋮⋮  Камеры 360°"
+            titleView = this
+            text = GCamLanguage.text(this@GCamCameraOverlayService,
+                "⋮⋮  Камеры 360°", "⋮⋮  360° Cameras")
             setTextColor(Color.WHITE)
             textSize = 14f
             gravity = Gravity.CENTER_VERTICAL
@@ -96,8 +106,10 @@ class GCamCameraOverlayService : Service() {
         }
         header.addView(title, LinearLayout.LayoutParams(0, dp(40), 1f))
         val close = TextView(this).apply {
+            closeView = this
             text = "✕"
-            contentDescription = "Закрыть плавающие камеры"
+            contentDescription = GCamLanguage.text(this@GCamCameraOverlayService,
+                "Закрыть плавающие камеры", "Close floating cameras")
             setTextColor(Color.WHITE)
             textSize = 19f
             gravity = Gravity.CENTER
@@ -110,7 +122,8 @@ class GCamCameraOverlayService : Service() {
         header.addView(close, LinearLayout.LayoutParams(dp(44), dp(40)))
         setupDrag(title, root, params, dm.widthPixels, dm.heightPixels)
         root.addView(header)
-        val labels = listOf("Левая", "Правая", "Перед", "Зад")
+        val labels = if (GCamLanguage.isEnglish(this)) listOf("Left", "Right", "Front", "Rear")
+            else listOf("Левая", "Правая", "Перед", "Зад")
         repeat(2) { rowIndex ->
             val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
             repeat(2) { columnIndex ->
@@ -131,6 +144,7 @@ class GCamCameraOverlayService : Service() {
                 }
                 tile.addView(texture, FrameLayout.LayoutParams(-1, -1))
                 tile.addView(TextView(this).apply {
+                    cameraLabels[input] = this
                     text = labels[input]
                     setTextColor(Color.WHITE)
                     textSize = 11f
@@ -150,6 +164,22 @@ class GCamCameraOverlayService : Service() {
             cameraCapture.close()
             capture = null
             stopSelf()
+        }
+    }
+
+    private fun updateLanguage() {
+        titleView?.text = GCamLanguage.text(this, "⋮⋮  Камеры 360°", "⋮⋮  360° Cameras")
+        closeView?.contentDescription = GCamLanguage.text(this,
+            "Закрыть плавающие камеры", "Close floating cameras")
+        val labels = if (GCamLanguage.isEnglish(this)) listOf("Left", "Right", "Front", "Rear")
+            else listOf("Левая", "Правая", "Перед", "Зад")
+        cameraLabels.forEachIndexed { index, label -> label?.text = labels[index] }
+        runCatching {
+            getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID,
+                Notification.Builder(this, CHANNEL_ID)
+                    .setSmallIcon(android.R.drawable.ic_menu_camera)
+                    .setContentTitle(GCamLanguage.text(this, "gCam: камеры поверх окон", "gCam: floating cameras"))
+                    .setOngoing(true).build())
         }
     }
 
@@ -179,7 +209,8 @@ class GCamCameraOverlayService : Service() {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
-    private companion object {
+    companion object {
+        const val ACTION_LANGUAGE = "com.stasao.gcam.FLOATING_CAMERA_LANGUAGE"
         const val CHANNEL_ID = "gcam_camera_overlay"
         const val NOTIFICATION_ID = 7412
     }

@@ -13,6 +13,10 @@ import android.provider.DocumentsContract
 import android.os.storage.StorageManager
 import android.os.storage.StorageVolume
 import java.io.File
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 data class RecordingTarget(val uri: Uri, val descriptor: ParcelFileDescriptor, val storage: RecordingStorage)
 data class StorageStats(val totalBytes: Long, val freeBytes: Long, val recordingBytes: Long)
@@ -61,11 +65,18 @@ object RecordingStore {
     }
 
     fun finishSegment(context: Context, target: RecordingTarget) {
-        runCatching { target.descriptor.close() }
-        context.contentResolver.update(target.uri, ContentValues().apply {
+        val size = runCatching { target.descriptor.statSize }.getOrDefault(-1L)
+        runCatching { target.descriptor.fileDescriptor.sync() }.onFailure {
+            RecorderDiagnostics.record(context,
+                "segment_sync_error uri=${target.uri} type=${it.javaClass.simpleName} message=${it.message}")
+        }
+        target.descriptor.close()
+        val updated = context.contentResolver.update(target.uri, ContentValues().apply {
             put(MediaStore.MediaColumns.IS_PENDING, 0)
             put(MediaStore.MediaColumns.DATE_MODIFIED, System.currentTimeMillis() / 1000)
         }, null, null)
+        check(updated > 0) { "Не удалось опубликовать завершённый MP4" }
+        RecorderDiagnostics.record(context, "segment_published uri=${target.uri} bytes=$size")
     }
 
     fun abortSegment(context: Context, target: RecordingTarget) {
@@ -101,7 +112,9 @@ object RecordingStore {
                 val pathIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.RELATIVE_PATH)
                 while (cursor.moveToNext()) {
                     val name = cursor.getString(nameIndex)
-                    if (storage == RecordingStorage.EXTERNAL && !name.matches(RECORDING_NAME)) continue
+                    // Special storage access also sees files belonging to other apps.
+                    // Only recognized gCam clips inside our archive may enter retention.
+                    if (!name.matches(RECORDING_NAME)) continue
                     val path = cursor.getString(pathIndex).orEmpty()
                     add(RecordingFile(
                         ContentUris.withAppendedId(destination, cursor.getLong(idIndex)).toString(),
@@ -155,26 +168,29 @@ object RecordingStore {
     }
 
     @Synchronized fun enforceLimit(context: Context, config: RecorderConfig): ArchiveMaintenance {
-        val limit = config.storageLimitGb * GB
-        val segmentBudget = (config.bitrateMbps.toLong() * 1_000_000L / 8L *
-            config.cameraIds.size.coerceAtLeast(1) * config.segmentMinutes * 60L * 12L / 10L)
-            .coerceAtLeast(32L * 1024 * 1024)
-        val deletable = listForStorage(context, config.storage).filterNot(RecordingFile::protected)
-            .sortedBy(RecordingFile::modifiedAt)
+        val files = listForStorage(context, config.storage)
         val stats = storageStats(context, config.storage)
-        var used = stats.recordingBytes
-        var available = stats.freeBytes
-        var deleted = 0
-        for (recording in deletable) {
-            if (used + segmentBudget <= limit && available >= RESERVED_FREE_BYTES + segmentBudget) break
-            if (delete(context, recording)) {
-                used -= recording.sizeBytes
-                if (available >= 0) available += recording.sizeBytes
-                deleted++
+        return ArchiveRetention.enforce(files, config, stats.recordingBytes, stats.freeBytes) { recording ->
+            val removed = try {
+                delete(context, recording)
+            } catch (denied: SecurityException) {
+                val owner = runCatching {
+                    context.contentResolver.query(Uri.parse(recording.uri),
+                        arrayOf(MediaStore.MediaColumns.OWNER_PACKAGE_NAME), null, null, null)?.use {
+                        if (it.moveToFirst()) it.getString(0) else null
+                    }
+                }.getOrNull()
+                RecorderDiagnostics.record(context,
+                    "archive_delete_denied uri=${recording.uri} name=${recording.name} owner=$owner " +
+                        "storage=${config.storage} initialUsedBytes=${stats.recordingBytes} " +
+                        "initialFreeBytes=${stats.freeBytes} limitGb=${config.storageLimitGb} " +
+                        "allFilesAccess=${ArchiveAccess.isGranted()} type=${denied.javaClass.simpleName}")
+                throw ArchiveAccessRequiredException(denied)
             }
+            RecorderDiagnostics.record(context,
+                "archive_delete uri=${recording.uri} bytes=${recording.sizeBytes} deleted=$removed")
+            removed
         }
-        return ArchiveMaintenance(deleted, used, available,
-            used + segmentBudget <= limit && available >= RESERVED_FREE_BYTES + segmentBudget)
     }
 
     @Synchronized fun setProtected(context: Context, recording: RecordingFile, protect: Boolean): Boolean {
@@ -205,12 +221,21 @@ object RecordingStore {
         val destination = if (storage == RecordingStorage.EXTERNAL) externalCollection(context) else collection
         context.contentResolver.query(
             destination, arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME),
-            "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? AND ${MediaStore.MediaColumns.IS_PENDING}=1",
-            arrayOf("$rootPath%"), null
+            "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? AND ${MediaStore.MediaColumns.IS_PENDING}=1 " +
+                "AND ${MediaStore.MediaColumns.OWNER_PACKAGE_NAME}=?",
+            arrayOf("$rootPath%", context.packageName), null
         )?.use { cursor ->
             while (cursor.moveToNext()) {
                 if (!cursor.getString(1).orEmpty().matches(RECORDING_NAME)) continue
-                context.contentResolver.delete(ContentUris.withAppendedId(destination, cursor.getLong(0)), null, null)
+                val uri = ContentUris.withAppendedId(destination, cursor.getLong(0))
+                try {
+                    context.contentResolver.delete(uri, null, null)
+                } catch (denied: SecurityException) {
+                    // Orphaned pending files from another installation are not active segments.
+                    // Their ownership must not block recording new files.
+                    RecorderDiagnostics.record(context,
+                        "archive_interrupted_delete_denied uri=$uri type=${denied.javaClass.simpleName} message=${denied.message}")
+                }
             }
         }
     }
@@ -243,6 +268,18 @@ object RecordingStore {
         if (mediaVolumeName(context, drive) == null)
             return "USB-накопитель ${drive.name} не доступен через медиахранилище Android"
         return null
+    }
+
+    /** Checks the actual MediaStore write path, not just the mount flag. */
+    fun probeExternalWritable(context: Context) {
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        val target = createMediaSegment(context, externalCollection(context), 0,
+            "cam0_${stamp}_s0.mp4", false, RecordingStorage.EXTERNAL)
+        try {
+            FileOutputStream(target.descriptor.fileDescriptor).use { it.write(0) }
+        } finally {
+            abortSegment(context, target)
+        }
     }
 
     fun treeVolumeId(tree: Uri): String? = runCatching {
