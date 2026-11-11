@@ -21,4 +21,23 @@ class UsbReadinessTrackerTest {
         assertFalse(tracker.observe(19_000, true))
         assertTrue(tracker.observe(22_000, true))
     }
+
+    @Test fun anotherDriveCannotCompleteThePreviousDrivesWindow() {
+        val tracker = UsbReadinessTracker(6_000, 3)
+        assertFalse(tracker.observe(0, true, "A"))
+        assertFalse(tracker.observe(3_000, true, "A"))
+        assertFalse(tracker.observe(6_000, true, "B"))
+        assertFalse(tracker.observe(9_000, true, "B"))
+        assertTrue(tracker.observe(12_000, true, "B"))
+    }
+
+    @Test fun failedWriteProbeRestartsRecoveryStabilityWindow() {
+        val tracker = UsbReadinessTracker(15_000, 3)
+        assertFalse(tracker.observe(0, true, "A"))
+        assertFalse(tracker.observe(12_000, true, "A"))
+        assertFalse(tracker.observe(15_000, false, "A"))
+        assertFalse(tracker.observe(18_000, true, "A"))
+        assertFalse(tracker.observe(30_000, true, "A"))
+        assertTrue(tracker.observe(33_000, true, "A"))
+    }
 }

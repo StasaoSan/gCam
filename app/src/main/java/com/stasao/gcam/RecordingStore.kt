@@ -64,11 +64,30 @@ object RecordingStore {
         }
     }
 
+    internal fun usbTestCollection(context: Context): Uri = externalCollection(context)
+
+    internal fun createUsbTestTarget(context: Context, destination: Uri, name: String): RecordingTarget =
+        createMediaSegment(context, destination, 0, name, false, RecordingStorage.EXTERNAL)
+
+    internal fun removeUsbTestOrphans(context: Context, destination: Uri) {
+        context.contentResolver.query(destination, arrayOf(MediaStore.MediaColumns._ID),
+            "${MediaStore.MediaColumns.RELATIVE_PATH}=? AND ${MediaStore.MediaColumns.IS_PENDING}=1 " +
+                "AND ${MediaStore.MediaColumns.OWNER_PACKAGE_NAME}=? " +
+                "AND ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?",
+            arrayOf(cameraPath(0), context.packageName, "gcam-usb-test-%"), null)?.use { cursor ->
+            while (cursor.moveToNext()) context.contentResolver.delete(
+                ContentUris.withAppendedId(destination, cursor.getLong(0)), null, null)
+        }
+    }
+
     fun finishSegment(context: Context, target: RecordingTarget) {
         val size = runCatching { target.descriptor.statSize }.getOrDefault(-1L)
         runCatching { target.descriptor.fileDescriptor.sync() }.onFailure {
             RecorderDiagnostics.record(context,
                 "segment_sync_error uri=${target.uri} type=${it.javaClass.simpleName} message=${it.message}")
+            runCatching { target.descriptor.close() }
+            // Keep IS_PENDING=1. An incomplete/unsynced file must not enter the playable archive.
+            throw it
         }
         target.descriptor.close()
         val updated = context.contentResolver.update(target.uri, ContentValues().apply {
@@ -161,10 +180,11 @@ object RecordingStore {
     }
 
     fun maxArchiveGb(context: Context, storage: RecordingStorage = RecorderSettings.load(context).storage): Int? {
-        val stats = storageStats(context, storage)
-        if (stats.freeBytes < 0) return null
-        val available = (stats.freeBytes / GB) + (stats.recordingBytes / GB) - (RESERVED_FREE_BYTES / GB)
-        return available.coerceAtLeast(1).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        return maxArchiveGb(storageStats(context, storage))
+    }
+
+    fun maxArchiveGb(stats: StorageStats): Int? {
+        return ArchiveRetention.maxArchiveGb(stats.freeBytes, stats.recordingBytes)
     }
 
     @Synchronized fun enforceLimit(context: Context, config: RecorderConfig): ArchiveMaintenance {
@@ -275,10 +295,41 @@ object RecordingStore {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
         val target = createMediaSegment(context, externalCollection(context), 0,
             "cam0_${stamp}_s0.mp4", false, RecordingStorage.EXTERNAL)
+        var failure: Throwable? = null
         try {
-            FileOutputStream(target.descriptor.fileDescriptor).use { it.write(0) }
+            val expected = ByteArray(64 * 1024).also { java.security.SecureRandom().nextBytes(it) }
+            // Own a duplicate: closing a FileOutputStream on the original fd used to
+            // invalidate the descriptor before it could be synced or checked.
+            ParcelFileDescriptor.AutoCloseOutputStream(
+                ParcelFileDescriptor.dup(target.descriptor.fileDescriptor)
+            ).use { output ->
+                output.write(expected)
+                output.flush()
+                target.descriptor.fileDescriptor.sync()
+            }
+            requireNotNull(context.contentResolver.openInputStream(target.uri)).use { input ->
+                val actual = ByteArray(expected.size)
+                var offset = 0
+                while (offset < actual.size) {
+                    val count = input.read(actual, offset, actual.size - offset)
+                    check(count > 0) { "USB: неполное чтение проверочного файла" }
+                    offset += count
+                }
+                check(actual.contentEquals(expected)) { "USB: записанные данные не совпали при чтении" }
+            }
+        } catch (t: Throwable) {
+            failure = t
+            throw t
         } finally {
-            abortSegment(context, target)
+            val cleanup = runCatching {
+                target.descriptor.close()
+                check(context.contentResolver.delete(target.uri, null, null) > 0) {
+                    "USB: не удалось удалить проверочный файл"
+                }
+            }.exceptionOrNull()
+            if (cleanup != null) {
+                if (failure != null) failure.addSuppressed(cleanup) else throw cleanup
+            }
         }
     }
 

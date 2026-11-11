@@ -8,6 +8,7 @@ import android.app.Service
 import android.app.ActivityManager
 import android.Manifest
 import android.content.ComponentName
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
@@ -21,6 +22,7 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -32,10 +34,22 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 import java.util.Locale
+import java.util.concurrent.Executors
+import android.os.Handler
+import android.os.Looper
 
 class DashcamService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val encoders = linkedMapOf<Int, CameraEncoder>()
+    private val encoders = ConcurrentHashMap<Int, CameraEncoder>()
+    // Native stop, MediaCodec drain and USB finalization must never block the UI.
+    // One worker also prevents a replacement session starting before release completes.
+    private val encoderWorker = Executors.newSingleThreadExecutor { r -> Thread(r, "gcam-lifecycle") }
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile private var stopping = false
+    @Volatile private var destroyed = false
+    private var stopCompletion = CompletableDeferred<Unit>().apply { complete(Unit) }
+    private var stopKeepsService = false
+    private var stopReason: String? = null
     private val errors = ConcurrentHashMap<Int, String>()
     private var statsJob: Job? = null
     private var maintenanceJob: Job? = null
@@ -52,11 +66,13 @@ class DashcamService : Service() {
     @Volatile private var starting = false
     private var currentState = RecorderState()
     private var recordingSessionId = 0L
+    @Volatile private var lastCaptureSnapshot = "not_sampled"
+    private var storageReceiver: BroadcastReceiver? = null
     private val captureConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             capture = IQCarCamCapture.Stub.asInterface(service)
             captureBound = true
-            scope.launch { startEncoders() }
+            if (starting && !destroyed) encoderWorker.execute { startEncoders() }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -73,6 +89,9 @@ class DashcamService : Service() {
         super.onCreate()
         createChannel()
         recoveryWarning = savedRecoveryWarning()
+        storageReceiver = runCatching { StorageDiagnostics.observe(this) }.onFailure {
+            RecorderDiagnostics.record(this, "storage_observer_unavailable error=$it")
+        }.getOrNull()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -97,9 +116,12 @@ class DashcamService : Service() {
     }
 
     private fun startRecording(intent: Intent?) {
-        if (starting || encoders.isNotEmpty() || recoveryJob?.isActive == true) return
+        if (destroyed || stopping || starting || encoders.isNotEmpty() || recoveryJob?.isActive == true) return
         starting = true
+        UsbConnectionTest.recorderBusy = true
         recordingSessionId = SystemClock.elapsedRealtime()
+        lastCaptureSnapshot = "not_sampled"
+        RecorderDiagnostics.record(this, "recording_environment session=$recordingSessionId ${RecorderDiagnostics.environment(this)}")
         config = intent?.takeIf { it.hasExtra(EXTRA_SELECTED_CAMERAS) }?.let { request ->
             val saved = RecorderSettings.load(this)
             val width = request.getIntExtra(EXTRA_WIDTH, saved.width).takeIf { it in setOf(640, 960, 1280) } ?: saved.width
@@ -167,30 +189,49 @@ class DashcamService : Service() {
     }
 
     private suspend fun prepareArchive(waitForUsb: Boolean): ArchiveMaintenance {
+        ArchiveAccess.tryGrantWithRoot(this)
         if (config.storage != RecordingStorage.EXTERNAL) {
             RecordingStore.removeInterrupted(this, config.storage)
             return RecordingStore.enforceLimit(this, config)
         }
-        val tracker = UsbReadinessTracker(USB_STABLE_MS, USB_STABLE_SAMPLES)
+        val tracker = UsbReadinessTracker(
+            if (recoveryPending) 15_000L else USB_STABLE_MS, USB_STABLE_SAMPLES)
         val startedAt = SystemClock.elapsedRealtime()
         var nextWaitReport = startedAt + USB_WAIT_REPORT_MS
         var lastReason: String? = null
         var lastLoggedUsbReason: String? = null
         while (true) {
             val now = SystemClock.elapsedRealtime()
-            val validation = runCatching { RecordingStore.validateExternal(this)?.let { error(it) } }
-            val stable = tracker.observe(now, validation.isSuccess)
+            val validation = runCatching {
+                RecordingStore.validateExternal(this)?.let { error(it) }
+                val identity = requireNotNull(RecordingStore.selectedDrive(this)).id
+                RecordingStore.probeExternalWritable(this)
+                check(RecordingStore.selectedDrive(this)?.id == identity) { "USB изменился во время проверки" }
+                identity
+            }
+            val stable = tracker.observe(SystemClock.elapsedRealtime(), validation.isSuccess, validation.getOrNull())
             if (stable) {
                 val attempt = runCatching {
-                    RecordingStore.probeExternalWritable(this)
                     RecordingStore.removeInterrupted(this, config.storage)
-                    RecordingStore.enforceLimit(this, config)
+                    val maintenance = RecordingStore.enforceLimit(this, config)
+                    if (maintenance.ready) {
+                        UsbConnectionTest.ensure(this, config) { status ->
+                            mainHandler.post { if (starting) publish(RecorderState(recording = true, status = status)) }
+                        }
+                    }
+                    maintenance
                 }
                 attempt.getOrNull()?.let {
-                    RecorderDiagnostics.record(this, "autostart_usb_ready stableMs=${now - startedAt} writeProbe=ok")
+                    RecorderDiagnostics.record(this,
+                        "autostart_usb_ready waitMs=${SystemClock.elapsedRealtime() - startedAt} " +
+                            "volume=${validation.getOrNull()} writeReadSyncDeleteProbe=ok " +
+                            "stressTest=${if (it.ready) "passed" else "skipped_archive_not_ready"}")
                     return it
                 }
-                attempt.exceptionOrNull()?.let { if (it is ArchiveAccessRequiredException) throw it }
+                attempt.exceptionOrNull()?.let {
+                    if (it is ArchiveAccessRequiredException || it is kotlinx.coroutines.CancellationException ||
+                        (it is UsbTestFailure && !waitForUsb)) throw it
+                }
                 tracker.observe(now, false)
                 lastReason = attempt.exceptionOrNull()?.message ?: "Ошибка записи на USB"
             } else if (validation.isFailure) {
@@ -201,6 +242,7 @@ class DashcamService : Service() {
             val reason = lastReason ?: "Ошибка USB"
             if (reason != lastLoggedUsbReason) {
                 RecorderDiagnostics.record(this, "autostart_usb_wait reason=${reason.replace(' ', '_')}")
+                if (validation.isFailure) StorageDiagnostics.capture(this, "usb_preflight:$reason")
                 lastLoggedUsbReason = reason
             }
             if (!waitForUsb && validation.isFailure) error(reason)
@@ -235,6 +277,7 @@ class DashcamService : Service() {
             }.getOrDefault(false)
         stampSource = RecorderStampSource(this, config).also { if (locationReady) it.start() }
         config.cameraIds.sorted().forEach { id ->
+            if (!starting || destroyed) return@forEach
             runCatching {
                 remote.setRecorderOverlay(id, stampSource?.currentText().orEmpty())
                 CameraEncoder(this, id, config, recordingSessionId) { message -> errors[id] = message }.also {
@@ -246,6 +289,7 @@ class DashcamService : Service() {
                     "encoder_start_error input=$id type=${it.javaClass.name} message=${it.message}", it)
             }
         }
+        if (!starting || destroyed) return
         starting = false
         if (encoders.isEmpty()) {
             stampSource?.stop(); stampSource = null
@@ -265,6 +309,7 @@ class DashcamService : Service() {
         statsJob?.cancel()
         statsJob = scope.launch {
             val previous = mutableMapOf<Int, Pair<Long, Long>>()
+            val stoppedCaptures = config.cameraIds.associateWith { CaptureStopTracker() }
             val previousTiming = mutableMapOf<Int, LongArray>()
             val previousMux = mutableMapOf<Int, Pair<Long, Long>>()
             fun stageUs(current: LongArray, old: LongArray?, index: Int): Long {
@@ -272,7 +317,14 @@ class DashcamService : Service() {
                 val count = (current.getOrElse(index + 1) { 0 } - (old?.getOrElse(index + 1) { 0 } ?: 0)).coerceAtLeast(0)
                 return if (count > 0) total / count / 1_000 else 0
             }
-            var usedBytes = RecordingStore.usedBytes(this@DashcamService)
+            fun readArchiveBytes(previous: Long): Long = runCatching {
+                RecordingStore.usedBytes(this@DashcamService, config.storage)
+            }.getOrElse {
+                RecorderDiagnostics.record(this@DashcamService, "archive_size_unavailable error=$it")
+                StorageDiagnostics.capture(this@DashcamService, "archive_size:$it")
+                previous
+            }
+            var usedBytes = readArchiveBytes(currentState.usedBytes)
             var tick = 0
             var previousSampleElapsed = SystemClock.elapsedRealtime()
             var previousRecorderCpu = Process.getElapsedCpuTime()
@@ -280,7 +332,7 @@ class DashcamService : Service() {
             var consecutiveLowMemorySamples = 0
             var missingUsbSamples = 0
             var previousStamp: String? = null
-            while (isActive && encoders.isNotEmpty()) {
+            while (isActive && !stopping && !destroyed && encoders.isNotEmpty()) {
                 val stamp = stampSource?.currentText().orEmpty()
                 if (stamp != previousStamp) {
                     config.cameraIds.forEach { id -> runCatching { remote.setRecorderOverlay(id, stamp) } }
@@ -336,9 +388,19 @@ class DashcamService : Service() {
                         timeouts = stats.getOrElse(2) { 0 }
                     )
                 }
+                lastCaptureSnapshot = "sampleElapsedMs=${SystemClock.elapsedRealtime()} " +
+                    cameras.values.sortedBy { it.inputId }.joinToString("; ") {
+                        "input=${it.inputId} running=${it.recording} qFrames=${it.frames} error=${it.error}"
+                    }
                 val active = cameras.values.count(CameraRecordingState::recording)
                 val status = if (cameras.values.none { it.error != null }) "Запись: $active/${config.cameraIds.size} камер"
                     else "Запись с ошибками: $active/${config.cameraIds.size}"
+                val failedStorage = encoders.values.firstOrNull { it.storageFailed }
+                if (failedStorage != null) {
+                    val reason = errors[failedStorage.inputId] ?: "Ошибка записи файла на USB"
+                    scope.launch(Dispatchers.Main) { recoverFromStorageFailure(reason) }
+                    break
+                }
                 if (config.storage == RecordingStorage.EXTERNAL && tick % USB_RECORDING_CHECK_INTERVAL_SECONDS == 0) {
                     val usbError = runCatching { RecordingStore.validateExternal(this@DashcamService) }
                         .getOrElse { "Проверка USB: ${it.message ?: it.javaClass.simpleName}" }
@@ -358,6 +420,21 @@ class DashcamService : Service() {
                     scope.launch(Dispatchers.Main) { recoverFromCameraFailure(reason) }
                     break
                 }
+                val captureStopped = encoders.values.firstOrNull { encoder ->
+                    stoppedCaptures.getValue(encoder.inputId).observe(
+                        SystemClock.elapsedRealtime(),
+                        rawStats[encoder.inputId]?.getOrNull(0)?.let { it != 0L },
+                        encoder.outputFrames,
+                        SystemClock.elapsedRealtime() - encoder.lastOutputElapsedMs)
+                }
+                if (captureStopped != null) {
+                    RecorderDiagnostics.record(this@DashcamService,
+                        "recording_capture_stopped input=${captureStopped.inputId} confirmationMs=3000")
+                    scope.launch(Dispatchers.Main) {
+                        recoverFromCameraFailure("Поток камеры ${captureStopped.inputId} остановлен, кадры не поступают")
+                    }
+                    break
+                }
                 val stalled = encoders.values.firstOrNull {
                     SystemClock.elapsedRealtime() - (it.lastOutputElapsedMs.takeIf { time -> time > 0 }
                         ?: recordingSessionId) > 30_000L
@@ -369,7 +446,9 @@ class DashcamService : Service() {
                     break
                 }
                 if (recoveryPending) {
-                    if (encoders.values.all { it.outputFrames > 0 }) {
+                    if (SystemClock.elapsedRealtime() - recoveryStartedElapsedMs >= 5_000L &&
+                        encoders.values.all { it.outputFrames > 0 && it.drainAlive &&
+                            SystemClock.elapsedRealtime() - it.lastOutputElapsedMs < 2_000L }) {
                         recoveryPending = false
                         RecorderDiagnostics.record(this@DashcamService,
                             "recording_recovered cameras=${encoders.keys.sorted()} outputFrames=${encoders.mapValues { it.value.outputFrames }}")
@@ -382,7 +461,7 @@ class DashcamService : Service() {
                     }
                 }
                 if (tick++ % (if (config.storage == RecordingStorage.EXTERNAL) 60 else 10) == 0) {
-                    usedBytes = RecordingStore.usedBytes(this@DashcamService)
+                    usedBytes = readArchiveBytes(usedBytes)
                 }
                 if (tick % 60 == 0 && maintenanceJob?.isActive != true) {
                     maintenanceJob = scope.launch(Dispatchers.IO) {
@@ -435,7 +514,9 @@ class DashcamService : Service() {
                         append(" systemAvailableBytes=").append(systemMemory.availMem)
                         append(" systemLowMemory=").append(systemMemory.lowMemory)
                         append(" thermalStatus=").append(getSystemService(PowerManager::class.java)?.currentThermalStatus ?: -1)
-                        append(" freeStorageBytes=").append(filesDir.usableSpace)
+                        append(" internalFreeBytes=").append(filesDir.usableSpace)
+                        append(" recorderFpsCap=").append(captureRuntime.getOrElse(5) { -1 })
+                        append(" visibleOutputMask=").append(captureRuntime.getOrElse(6) { -1 })
                         append(" archiveBytes=").append(usedBytes)
                         config.cameraIds.sorted().forEach { id ->
                             val c = cameras[id]
@@ -451,6 +532,8 @@ class DashcamService : Service() {
                             append(" outAgeMs=").append(encoder?.lastOutputElapsedMs?.let { elapsed - it } ?: -1)
                             append(" segments=").append(encoder?.completedSegments ?: 0)
                             append(" drainAlive=").append(encoder?.drainAlive ?: false)
+                            append(" operation=").append(encoder?.operation ?: "none")
+                            append(" operationAgeMs=").append(encoder?.let { elapsed - it.operationStartedElapsedMs } ?: -1)
                             append(" error=").append(c?.error?.replace(' ', '_') ?: "none")
                             if (stages.size >= 46) {
                                 append(" stageUs[get/copy/upload/draw/swap/hold/sync/pboWait/map/tex/makeCurrent/release/unmap]=")
@@ -495,15 +578,15 @@ class DashcamService : Service() {
     }
 
     private fun recoverFromCameraFailure(reason: String) {
-        if (recoveryJob?.isActive == true) return
-        val usbError = if (config.storage == RecordingStorage.EXTERNAL)
-            runCatching { RecordingStore.validateExternal(this) }
-                .getOrElse { "Проверка USB: ${it.message ?: it.javaClass.simpleName}" }
-        else null
-        if (config.storage == RecordingStorage.EXTERNAL && (usbError != null || isUsbFailure(reason))) {
+        if (destroyed || stopping || recoveryJob?.isActive == true) return
+        // Do not query MediaProvider on the main thread during a possible USB hang.
+        if (config.storage == RecordingStorage.EXTERNAL &&
+            (encoders.values.any { it.storageFailed } || StorageRecoveryPolicy.isStorageFailure(reason))) {
             recoverFromStorageFailure(reason)
             return
         }
+        recordRecoverySnapshot("camera", reason)
+        StorageDiagnostics.capture(this, "camera_recovery:$reason")
         val attemptsInWindow = noteRecoveryFailure()
         val delayMs = RECOVERY_DELAYS_MS[(attemptsInWindow - 1).coerceIn(0, RECOVERY_DELAYS_MS.lastIndex)]
         val selected = config
@@ -515,9 +598,10 @@ class DashcamService : Service() {
             "recording_recovery_scheduled attempts15m=$attemptsInWindow delayMs=$delayMs " +
                 "cameras=${selected.cameraIds.sorted()} storage=${selected.storage} reason=$reason")
         recoveryPending = true
-        stopRecording(message, keepServiceAlive = true)
+        val closed = stopRecording(message, keepServiceAlive = true)
         postRecoveryNotice(message)
         recoveryJob = scope.launch(Dispatchers.Main) {
+            closed.await()
             delay(delayMs)
             RecorderDiagnostics.record(this@DashcamService,
                 "recording_recovery_start attempts15m=$attemptsInWindow")
@@ -540,24 +624,42 @@ class DashcamService : Service() {
     }
 
     private fun recoverFromStorageFailure(reason: String) {
-        if (recoveryJob?.isActive == true) return
+        if (destroyed || stopping || recoveryJob?.isActive == true) return
         val selected = config
+        val attempts = noteRecoveryFailure()
+        val delayMs = StorageRecoveryPolicy.delayMs(attempts)
         val message = "USB-накопитель недоступен. Запись возобновится после его подключения."
         lastRecoveryReason = reason
         recoveryPending = true
         RecorderDiagnostics.record(this,
-            "recording_usb_lost cameras=${selected.cameraIds.sorted()} reason=$reason")
-        stopRecording(message, keepServiceAlive = true)
+            "recording_usb_lost cameras=${selected.cameraIds.sorted()} attempts15m=$attempts " +
+                "delayMs=$delayMs reason=$reason")
+        recordRecoverySnapshot("usb", reason)
+        StorageDiagnostics.capture(this, "usb_recovery:$reason")
+        val closed = stopRecording(message, keepServiceAlive = true)
+        postRecoveryNotice(message)
         recoveryJob = scope.launch(Dispatchers.Main) {
-            delay(USB_RETRY_INTERVAL_MS)
+            closed.await()
+            delay(delayMs)
             recoveryJob = null
             startRecording(recordingIntent(this@DashcamService, selected, waitForUsb = true))
         }
     }
 
-    private fun isUsbFailure(reason: String): Boolean = listOf(
-        "usb", "volume", "накопител", "media store", "mediastore", "storage/", "no such file"
-    ).any { reason.contains(it, ignoreCase = true) }
+    private fun recordRecoverySnapshot(kind: String, reason: String) {
+        val now = SystemClock.elapsedRealtime()
+        RecorderDiagnostics.record(this, buildString {
+            append("recording_recovery_snapshot kind=$kind session=$recordingSessionId reason=$reason")
+            append(" capture=[$lastCaptureSnapshot]")
+            encoders.toSortedMap().forEach { (id, encoder) ->
+                append(" | input=$id operation=${encoder.operation}")
+                append(" operationAgeMs=${now - encoder.operationStartedElapsedMs}")
+                append(" uri=${encoder.segmentUri} outFrames=${encoder.outputFrames}")
+                append(" outAgeMs=${now - encoder.lastOutputElapsedMs}")
+                append(" drainAlive=${encoder.drainAlive} storageFailed=${encoder.storageFailed}")
+            }
+        })
+    }
 
     private fun noteRecoveryFailure(): Int {
         val now = System.currentTimeMillis()
@@ -600,6 +702,7 @@ class DashcamService : Service() {
 
     private fun startupFailed(message: String) {
         starting = false
+        UsbConnectionTest.recorderBusy = false
         publish(RecorderState(status = message))
         if (recoveryPending) {
             RecorderDiagnostics.record(this, "recording_recovery_failed message=$message")
@@ -611,40 +714,75 @@ class DashcamService : Service() {
         stopSelf()
     }
 
-    private fun stopRecording(reason: String? = null, keepServiceAlive: Boolean = false) {
-        RecorderDiagnostics.record(this, "recording_stop requested cameras=${encoders.keys.sorted()}")
+    private fun stopRecording(reason: String? = null, keepServiceAlive: Boolean = false): CompletableDeferred<Unit> {
         if (!keepServiceAlive) {
             recoveryJob?.cancel(); recoveryJob = null
             recoveryPending = false
         }
+        if (stopping) {
+            // A user stop wins over an already queued automatic restart.
+            if (!keepServiceAlive) { stopKeepsService = false; stopReason = reason }
+            return stopCompletion
+        }
+        stopping = true
+        starting = false
+        stopKeepsService = keepServiceAlive
+        stopReason = reason
+        val completed = CompletableDeferred<Unit>()
+        stopCompletion = completed
+        RecorderDiagnostics.record(this, "recording_stop requested cameras=${encoders.keys.sorted()}")
         startupJob?.cancel(); startupJob = null
         statsJob?.cancel(); statsJob = null
-        stampSource?.stop(); stampSource = null
         maintenanceJob?.cancel(); maintenanceJob = null
-        encoders.values.toList().forEach { encoder ->
-            runCatching { encoder.stop() }.onFailure {
-                RecorderDiagnostics.recordException(this,
-                    "encoder_stop_error input=${encoder.inputId} type=${it.javaClass.name} message=${it.message}", it)
+        publish(RecorderState(usedBytes = currentState.usedBytes, status = "Завершаю запись…"))
+        mainHandler.postDelayed({
+            if (!completed.isCompleted && !destroyed) {
+                StorageDiagnostics.capture(this, "recording_stop_waiting")
+                publish(RecorderState(
+                usedBytes = currentState.usedBytes,
+                status = "Ожидаю завершения кодировщика или USB. Повторный запуск пока отложен."))
+            }
+        }, 8_000)
+        encoderWorker.execute {
+            stampSource?.stop(); stampSource = null
+            val closing = encoders.values.toList()
+            closing.forEach { it.requestStop() }
+            closing.forEach { encoder ->
+                runCatching { encoder.stop() }.onFailure {
+                    RecorderDiagnostics.recordException(this,
+                        "encoder_stop_error input=${encoder.inputId} type=${it.javaClass.name} message=${it.message}", it)
+                }
+            }
+            encoders.clear()
+            RecorderDiagnostics.record(this, "recording_stopped")
+            mainHandler.post {
+                unbindCapture()
+                stopping = false
+                UsbConnectionTest.recorderBusy = false
+                if (!destroyed) {
+                    publish(RecorderState(usedBytes = currentState.usedBytes,
+                        status = stopReason ?: "Регистратор остановлен"))
+                    if (stopKeepsService) {
+                        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID,
+                            notification(stopReason ?: "Перезапуск камер…"))
+                    } else {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    }
+                }
+                completed.complete(Unit)
             }
         }
-        encoders.clear()
-        RecorderDiagnostics.record(this, "recording_stopped")
-        starting = false
-        unbindCapture()
-        publish(RecorderState(usedBytes = currentState.usedBytes,
-            status = reason ?: "Регистратор остановлен"))
-        if (keepServiceAlive) {
-            getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID,
-                notification(reason ?: "Перезапуск камер…"))
-        } else {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-        }
+        return completed
     }
 
     override fun onDestroy() {
-        if (encoders.isNotEmpty()) stopRecording()
+        destroyed = true
+        storageReceiver?.let { runCatching { unregisterReceiver(it) } }
+        storageReceiver = null
+        if (!stopping && (starting || encoders.isNotEmpty() || captureBound)) stopRecording()
         scope.cancel()
+        encoderWorker.shutdown() // Queued finalization survives coroutine cancellation.
         super.onDestroy()
     }
 

@@ -68,12 +68,14 @@ class QCarCamCaptureService : Service() {
         override fun runtimeStats(): LongArray {
             val runtime = Runtime.getRuntime()
             val memory = android.os.Debug.MemoryInfo().also(android.os.Debug::getMemoryInfo)
+            val load = NativeQCarCam.recorderLoad()
             return longArrayOf(
                 android.os.Process.getElapsedCpuTime(),
                 android.os.Debug.getNativeHeapAllocatedSize(),
                 runtime.totalMemory() - runtime.freeMemory(),
                 memory.totalPss.toLong(),
-                memory.getMemoryStat("summary.graphics")?.toLongOrNull() ?: -1L
+                memory.getMemoryStat("summary.graphics")?.toLongOrNull() ?: -1L,
+                load.getOrElse(0) { 25 }, load.getOrElse(1) { 0 }
             )
         }
 
@@ -89,7 +91,7 @@ class QCarCamCaptureService : Service() {
             shape: Int
         ): String {
             checkBlindSlot(slot)
-            if (slot !in 0..9) return "Некорректный HUD slot"
+            if (slot !in 0..12) return "Некорректный HUD slot"
             if (slot < 2) {
                 hudRequested[slot] = true
                 hudInputs[slot] = inputId
@@ -129,7 +131,7 @@ class QCarCamCaptureService : Service() {
             fisheye: Float, shape: Int, quarterTurns: Int
         ): String {
             checkBlindSlot(slot)
-            if (slot !in 0..9) return "Некорректный HUD slot"
+            if (slot !in 0..12) return "Некорректный HUD slot"
             if (slot < 2) {
                 hudRequested[slot] = true
                 hudInputs[slot] = inputId
@@ -163,7 +165,7 @@ class QCarCamCaptureService : Service() {
 
         override fun stopHud(slot: Int) {
             checkBlindSlot(slot)
-            if (slot !in 0..9) return
+            if (slot !in 0..12) return
             NativeQCarCam.hudStop(slot)
             if (slot < 2) {
                 hudRequested[slot] = false
@@ -205,11 +207,21 @@ class QCarCamCaptureService : Service() {
 
     private fun checkBlindSlot(slot: Int) {
         val uid = Binder.getCallingUidOrThrow()
-        if (slot >= 6 && uid != android.os.Process.myUid()) {
+        if (slot in 10..11 && uid != android.os.Process.myUid() &&
+            !CaptureClientTrust.isBlindCaller(this, uid) && !CaptureClientTrust.isZonesCaller(this, uid)) {
+            throw SecurityException("Большой просмотр доступен только разрешённым клиентам камер")
+        }
+        if (slot == 12 && uid != android.os.Process.myUid() && !CaptureClientTrust.isZonesCaller(this, uid)) {
+            throw SecurityException("Дополнительный поток доступен только разрешённому клиенту камер")
+        }
+        if (CaptureClientTrust.isZonesCaller(this, uid) && slot !in listOf(10, 11, 12)) {
+            throw SecurityException("Клиент камер может использовать только слоты 10, 11 и 12")
+        }
+        if (slot in 6..9 && uid != android.os.Process.myUid()) {
             throw SecurityException("Плавающие окна gCam доступны только gCam")
         }
-        if (CaptureClientTrust.isBlindCaller(this, uid) && slot !in listOf(2, 3, 5)) {
-            throw SecurityException("gBlind может использовать только слоты приборки 2 и 3 и редактор 5")
+        if (CaptureClientTrust.isBlindCaller(this, uid) && slot !in listOf(2, 3, 5, 10, 11)) {
+            throw SecurityException("gBlind может использовать только слоты приборки 2/3, редактор 5 и большой просмотр 10/11")
         }
     }
 

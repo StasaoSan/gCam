@@ -39,6 +39,18 @@ class CameraEncoder(
     @Volatile var muxWriteMaxNs: Long = 0
         private set
     val drainAlive: Boolean get() = drainThread?.isAlive == true
+    @Volatile var storageFailed: Boolean = false
+        private set
+
+    @Volatile var operation: String = "not_started"
+        private set(value) {
+            operationStartedElapsedMs = SystemClock.elapsedRealtime()
+            field = value
+        }
+    @Volatile var operationStartedElapsedMs: Long = 0
+        private set
+    @Volatile var segmentUri: String? = null
+        private set
 
     private lateinit var capture: IQCarCamCapture
 
@@ -51,7 +63,7 @@ class CameraEncoder(
                 setInteger(MediaFormat.KEY_BIT_RATE, config.bitrateMbps * 1_000_000)
                 setInteger(MediaFormat.KEY_FRAME_RATE, config.fps)
                 setInteger(MediaFormat.KEY_OPERATING_RATE, config.fps)
-                setInteger(MediaFormat.KEY_PRIORITY, 0)
+                setInteger(MediaFormat.KEY_PRIORITY, 1) // Background recording yields to live camera/video playback.
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
                 setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
@@ -74,11 +86,19 @@ class CameraEncoder(
         }
     }
 
+    fun requestStop() { running.set(false) }
+
     fun stop() {
-        if (!running.getAndSet(false)) return
+        running.set(false)
         if (::capture.isInitialized) runCatching { capture.stop(inputId) }
         runCatching { codec.signalEndOfInputStream() }
         drainThread?.join(5_000)
+        if (drainThread?.isAlive == true) {
+            // Never release/restart a codec while its drain thread still uses it.
+            // This runs on the serialized lifecycle worker, not the Android main thread.
+            RecorderDiagnostics.record(context, "encoder_stop_wait input=$inputId reason=drain_still_active")
+            drainThread?.join()
+        }
         drainThread = null
         releaseCodec()
     }
@@ -91,12 +111,13 @@ class CameraEncoder(
         var track = -1
         var target: RecordingTarget? = null
         var segmentHasSamples = false
+        var segmentDamaged = false
         var segmentFirstPts = -1L
         var syncRequested = false
         val segmentUs = config.segmentMinutes * 60L * 1_000_000L
         var eos = false
         var stopDeadline = Long.MAX_VALUE
-        var operation = "waiting_for_output"
+        operation = "waiting_for_output"
 
         fun closeSegment() {
             val active = muxer
@@ -105,8 +126,9 @@ class CameraEncoder(
                 operation = "muxer_stop"
                 val stopFailure = runCatching { active.stop() }.exceptionOrNull()
                 if (stopFailure != null) {
+                    noteStorageFailure("muxer_stop", stopFailure)
                     RecorderDiagnostics.recordException(context,
-                        "segment_muxer_stop_error input=$inputId outputFrames=$outputFrames " +
+                        "segment_muxer_stop_error input=$inputId uri=$segmentUri outputFrames=$outputFrames " +
                             "type=${stopFailure.javaClass.name} message=${stopFailure.message}", stopFailure)
                 }
                 operation = "muxer_release"
@@ -115,7 +137,7 @@ class CameraEncoder(
                         "segment_muxer_release_error input=$inputId type=${it.javaClass.name} message=${it.message}", it)
                 }
                 target?.let { segment ->
-                    if (segmentHasSamples && stopFailure == null) {
+                    if (segmentHasSamples && stopFailure == null && !segmentDamaged) {
                         operation = "finish_segment"
                         RecordingStore.finishSegment(context, segment)
                         completedSegments++
@@ -127,13 +149,15 @@ class CameraEncoder(
                                 "segment_abort_error input=$inputId type=${it.javaClass.name} message=${it.message}", it)
                         }
                         RecorderDiagnostics.record(context,
-                            "segment_discarded input=$inputId reason=${if (stopFailure == null) "empty" else "muxer_stop_failed"}")
+                            "segment_discarded input=$inputId reason=${if (segmentDamaged) "muxer_write_failed" else if (stopFailure == null) "empty" else "muxer_stop_failed"}")
                     }
                 }
                 if (stopFailure != null) throw stopFailure
             }
             target = null
+            segmentUri = null
             segmentHasSamples = false
+            segmentDamaged = false
             track = -1
             segmentFirstPts = -1L
             syncRequested = false
@@ -144,7 +168,8 @@ class CameraEncoder(
             val name = "cam${inputId}_${stamp}_s${sessionId}.mp4"
             operation = "create_segment"
             val segment = RecordingStore.createSegment(context, inputId, name, storage = config.storage)
-            RecorderDiagnostics.record(context, "segment_open input=$inputId name=$name")
+            segmentUri = segment.uri.toString()
+            RecorderDiagnostics.record(context, "segment_open input=$inputId name=$name uri=$segmentUri storage=${config.storage}")
             target = segment
             var createdMuxer: MediaMuxer? = null
             try {
@@ -214,9 +239,11 @@ class CameraEncoder(
                 }
             }
         } catch (t: Throwable) {
+            if (operation == "muxer_write_sample") segmentDamaged = true
+            noteStorageFailure(operation, t)
             val codecError = t as? MediaCodec.CodecException
             RecorderDiagnostics.recordException(context,
-                "encoder_error input=$inputId operation=$operation type=${t.javaClass.name} message=${t.message} " +
+                "encoder_error input=$inputId operation=$operation uri=$segmentUri operationAgeMs=${SystemClock.elapsedRealtime() - operationStartedElapsedMs} type=${t.javaClass.name} message=${t.message} " +
                     "codecDiagnostic=${codecError?.diagnosticInfo} codecErrorCode=${codecError?.errorCode} " +
                     "codecRecoverable=${codecError?.isRecoverable} codecTransient=${codecError?.isTransient} " +
                     "outputFrames=$outputFrames segments=$completedSegments lastOutputAgeMs=" +
@@ -224,10 +251,29 @@ class CameraEncoder(
             onError("${recorderCameraNames[inputId]}: ${t.message ?: t.javaClass.simpleName}")
         } finally {
             runCatching { closeSegment() }.onFailure {
+                noteStorageFailure(operation, it)
                 RecorderDiagnostics.recordException(context,
-                    "segment_close_error input=$inputId operation=$operation type=${it.javaClass.name} message=${it.message}", it)
+                    "segment_close_error input=$inputId operation=$operation uri=$segmentUri type=${it.javaClass.name} message=${it.message}", it)
                 onError("${recorderCameraNames[inputId]}: ${it.message ?: it.javaClass.simpleName}")
             }
+        }
+    }
+
+    private fun noteStorageFailure(operation: String, failure: Throwable) {
+        if (config.storage != RecordingStorage.EXTERNAL) return
+        if (operation in setOf("create_segment", "muxer_write_sample", "muxer_stop", "finish_segment") ||
+            StorageRecoveryPolicy.isStorageFailure(failure.toString())) {
+            if (!storageFailed) {
+                // A passed connection test is no longer evidence after a real write/finalization failure.
+                // Use the actual file's volume; do not query a potentially blocked MediaProvider here.
+                val volume = segmentUri?.let { android.net.Uri.parse(it).pathSegments.firstOrNull() }
+                    ?: RecorderSettings.externalDriveId(context)
+                if (volume != null) UsbConnectionTest.invalidate(volume)
+                RecorderDiagnostics.record(context,
+                    "usb_test_invalidated input=$inputId volume=$volume reason=$operation")
+            }
+            storageFailed = true
+            StorageDiagnostics.capture(context, "encoder input=$inputId operation=$operation error=$failure")
         }
     }
 

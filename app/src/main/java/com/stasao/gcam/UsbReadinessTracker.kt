@@ -7,16 +7,19 @@ internal class UsbReadinessTracker(
 ) {
     private var firstReadyMs = -1L
     private var readySamples = 0
+    private var readyIdentity: String? = null
 
-    fun observe(nowMs: Long, ready: Boolean): Boolean {
+    fun observe(nowMs: Long, ready: Boolean, identity: String? = null): Boolean {
         if (!ready) {
             firstReadyMs = -1L
             readySamples = 0
+            readyIdentity = null
             return false
         }
-        if (firstReadyMs < 0L || nowMs < firstReadyMs) {
+        if (firstReadyMs < 0L || nowMs < firstReadyMs || readyIdentity != identity) {
             firstReadyMs = nowMs
             readySamples = 0
+            readyIdentity = identity
         }
         readySamples++
         return readySamples >= minimumSamples && nowMs - firstReadyMs >= minimumStableMs

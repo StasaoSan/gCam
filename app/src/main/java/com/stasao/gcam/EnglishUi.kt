@@ -10,6 +10,14 @@ internal object EnglishUi {
         "Камеры и запись" to "Cameras & recording",
         "Записи" to "Recordings",
         "Автоматическая очистка архива" to "Automatic archive cleanup",
+        "АРХИВ • ТРЕБУЕТ ВНИМАНИЯ" to "ARCHIVE • ACTION REQUIRED",
+        "Разрешите автоматическую очистку" to "Allow automatic cleanup",
+        "Без доступа к старым файлам запись может остановиться, когда архив заполнится." to
+            "Without access to older files, recording may stop when the archive fills up.",
+        "Проверяем доступ…" to "Checking access…",
+        "Выдать доступ" to "Grant access",
+        "Данные о свободном месте пока недоступны. Сохранённый лимит остаётся выбранным; объём обновится после подключения накопителя и выдачи доступа." to
+            "Free-space information is unavailable. Your saved limit is retained. Capacity will update when the drive is connected and access is granted.",
         "Архив записей" to "Recording archive",
         "Доступ выдан: старые записи удаляются автоматически по лимиту." to
             "Access granted: old recordings are deleted automatically to stay within the limit.",
@@ -134,6 +142,9 @@ internal object EnglishUi {
         "Плавающее окно с четырьмя камерами; его можно перемещать" to "Movable floating view with all four cameras",
         "Нужно разрешение на показ поверх окон" to "Display over other apps permission is required",
         "Плавающая кнопка записи" to "Floating record button",
+        "Монохромная кнопка записи" to "Monochrome record button",
+        "Белые значки: треугольник — запись идёт; квадрат — готово; пауза — USB не готов; восклицательный знак — ошибка" to
+            "White icons: triangle — recording; square — ready; pause — USB not ready; exclamation mark — error",
         "Отдельная кнопка: красный — ошибка камер; синий — готово, запись выключена; оранжевый — USB не готов; зелёный — запись идёт. Нажмите для старта/остановки, перетащите для перемещения" to
             "Separate button: red — camera error; blue — ready, not recording; orange — USB not ready; green — recording. Tap to start or stop, drag to move.",
         "Сбросить положение всех точек" to "Reset all dot positions",

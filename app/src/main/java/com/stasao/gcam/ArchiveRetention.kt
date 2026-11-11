@@ -5,6 +5,15 @@ internal object ArchiveRetention {
     private const val GB = 1024L * 1024 * 1024
     private const val RESERVE_BYTES = 2 * GB
 
+    fun maxArchiveGb(freeBytes: Long, recordingBytes: Long): Int? {
+        if (freeBytes < 0) return null
+        return ((freeBytes + recordingBytes - RESERVE_BYTES) / GB)
+            .coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+    }
+
+    fun sliderMaxGb(savedLimitGb: Int, availableGb: Int?): Int =
+        maxOf(savedLimitGb, availableGb ?: savedLimitGb, 2)
+
     fun bytesToFree(config: RecorderConfig, usedBytes: Long, freeBytes: Long): Long? {
         // An unavailable volume must not cause the entire archive to be deleted.
         if (freeBytes < 0) return null

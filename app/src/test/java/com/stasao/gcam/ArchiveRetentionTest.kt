@@ -5,6 +5,18 @@ import org.junit.Test
 
 class ArchiveRetentionTest {
     private val gb = 1024L * 1024 * 1024
+
+    @Test fun capacityUsesCombinedBytesBeforeRounding() {
+        assertEquals(26, ArchiveRetention.maxArchiveGb(20 * gb + gb / 2, 7 * gb + gb / 2))
+        assertNull(ArchiveRetention.maxArchiveGb(-1, 25 * gb))
+    }
+
+    @Test fun savedQuotaStaysEditableUntilDriveAndArchiveAreAvailable() {
+        assertEquals(25, ArchiveRetention.sliderMaxGb(25, null))
+        assertEquals(25, ArchiveRetention.sliderMaxGb(25, 1))
+        assertEquals(80, ArchiveRetention.sliderMaxGb(25, 80))
+        assertEquals(2, ArchiveRetention.sliderMaxGb(1, 1))
+    }
     private val config = RecorderConfig(storage = RecordingStorage.INTERNAL, storageLimitGb = 10,
         cameraIds = setOf(2, 3), bitrateMbps = 3, segmentMinutes = 1)
 

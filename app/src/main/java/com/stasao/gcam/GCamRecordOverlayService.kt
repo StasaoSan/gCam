@@ -148,7 +148,7 @@ class GCamRecordOverlayService : Service() {
                         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
                     .setOngoing(true).build())
         }
-        if (intent?.action == ACTION_LANGUAGE) render()
+        render()
         return START_STICKY
     }
 
@@ -303,6 +303,7 @@ class GCamRecordOverlayService : Service() {
             else -> RecordOverlayView.IDLE
         }
         button?.apply {
+            setMonochrome(GCamRuntimeSettings.load(this@GCamRecordOverlayService).recordOverlayMonochrome)
             setState(state, launching || recorderRequested)
             contentDescription = GCamLanguage.display(this@GCamRecordOverlayService, buildString {
                 append(if (live) "Остановить запись" else "Начать запись")
@@ -337,10 +338,17 @@ class GCamRecordOverlayService : Service() {
 private class RecordOverlayView(context: Context) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val triangle = Path().apply {
-        moveTo(54f, 36f); lineTo(54f, 63f); lineTo(76f, 49.5f); close()
+        moveTo(48f, 45f); lineTo(48f, 75f); lineTo(72f, 60f); close()
     }
     private var state = ERROR
     private var starting = false
+    private var monochrome = false
+
+    fun setMonochrome(enabled: Boolean) {
+        if (monochrome == enabled) return
+        monochrome = enabled
+        invalidate()
+    }
 
     fun setState(state: Int, starting: Boolean) {
         this.state = state; this.starting = starting
@@ -352,14 +360,14 @@ private class RecordOverlayView(context: Context) : View(context) {
         canvas.save()
         canvas.scale(width / 120f, height / 120f)
         paint.style = Paint.Style.FILL
-        paint.color = Color.argb(225, 15, 23, 35)
+        paint.color = if (monochrome) Color.argb(225, 20, 20, 20) else Color.argb(225, 15, 23, 35)
         canvas.drawCircle(60f, 60f, 59f, paint)
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = 2.5f
         paint.color = Color.WHITE
         canvas.drawCircle(60f, 60f, 57f, paint)
         paint.style = Paint.Style.FILL
-        paint.color = state
+        paint.color = if (monochrome) Color.rgb(48, 48, 48) else state
         canvas.drawCircle(60f, 60f, 49f, paint)
         paint.color = Color.WHITE
         if (state == RECORDING) canvas.drawPath(triangle, paint)
@@ -367,7 +375,14 @@ private class RecordOverlayView(context: Context) : View(context) {
             paint.textAlign = Paint.Align.CENTER
             paint.textSize = 27f
             paint.isFakeBoldText = true
-            canvas.drawText("…", 60f, 68f, paint)
+            val metrics = paint.fontMetrics
+            canvas.drawText("…", 60f, 60f - (metrics.ascent + metrics.descent) / 2f, paint)
+        } else if (monochrome && state == USB_UNAVAILABLE) {
+            canvas.drawRoundRect(48f, 46f, 56f, 74f, 2f, 2f, paint)
+            canvas.drawRoundRect(64f, 46f, 72f, 74f, 2f, 2f, paint)
+        } else if (monochrome && state == ERROR) {
+            canvas.drawRoundRect(57f, 44f, 63f, 64f, 2f, 2f, paint)
+            canvas.drawCircle(60f, 73f, 3f, paint)
         } else canvas.drawRoundRect(49f, 49f, 71f, 71f, 3f, 3f, paint)
         canvas.restore()
     }

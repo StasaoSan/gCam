@@ -31,7 +31,7 @@
 #define STRIDE_BYTES (W * 2u)
 #define BYTES (W * H * 2u)
 #define NBUF 3u
-#define HUD_STREAMS 10 /* 0/1: projection, 2/3: cluster, 4/5: editors, 6..9: gCam preview */
+#define HUD_STREAMS 13 /* 0/1: projection, 2/3: cluster, 4/5: editors, 6..9: gCam preview, 10/11: side, 12: rear */
 #define UYVY8 0x07080102u
 #define FOURCC_CODE(a,b,c,d) ((uint32_t)(a)|((uint32_t)(b)<<8)|((uint32_t)(c)<<16)|((uint32_t)(d)<<24))
 #define DRM_FORMAT_ABGR8888 FOURCC_CODE('A','B','2','4')
@@ -614,6 +614,18 @@ static jlongArray state_stats(JNIEnv *e,state_t *state){
  * encoder are independent consumers of the same current texture. The service's
  * Binder methods only change desired outputs; EGL objects stay on this thread. */
 #define SHARED_OUTPUTS (HUD_STREAMS + 1)
+#include "recorder_load_policy.h"
+/* Shared across inputs: showing any camera gives every background recorder less GPU work. */
+static _Atomic uint64_t visible_output_mask, recorder_slow_until, recorder_severe_until;
+static void extend_pressure(_Atomic uint64_t *value,uint64_t now,uint64_t cost,uint64_t threshold){
+    uint64_t old=atomic_load(value),next;
+    do {next=recorder_pressure_deadline(now,cost,threshold,old);if(next==old)return;}
+    while(!atomic_compare_exchange_weak(value,&old,next));
+}
+static int recorder_budget(int requested,uint64_t now){
+    return recorder_fps_budget(requested,atomic_load(&visible_output_mask)!=0,now,
+        atomic_load(&recorder_slow_until),atomic_load(&recorder_severe_until));
+}
 typedef struct {
     state_t *stats;
     ANativeWindow *pending, *window;
@@ -833,14 +845,17 @@ static void *shared_stream_thread(void *argument){
             shared_output_t *out=&camera->outputs[i];draw_metrics_t timing={0};
             if(shared_draw(&r,out,timestamp,&timing)){
                 statusf(out->stats,"Ошибка EGL вывода; поток остановлен");
+                if(i<HUD_STREAMS)atomic_fetch_and(&visible_output_mask,~(1ull<<(camera->input*HUD_STREAMS+i)));
                 out->wanted=0;atomic_store(&out->stats->running,false);continue;
             }
             state_t *stats=out->stats;
-            uint64_t interval=stats->target_fps>0?1000000000ull/(uint64_t)stats->target_fps:0;
-            if(!interval)out->next_due_ns=timestamp;
-            else if(!out->next_due_ns||timestamp>out->next_due_ns+interval)
-                out->next_due_ns=timestamp+interval;
-            else out->next_due_ns+=interval;
+            uint64_t completed_ns=now_ns(),cost=upload.upload_ns+timing.draw_ns+timing.swap_ns;
+            extend_pressure(&recorder_slow_until,completed_ns,cost,60000000ull);
+            extend_pressure(&recorder_severe_until,completed_ns,cost,120000000ull);
+            int fps=stats->recordable?recorder_budget(stats->target_fps,completed_ns):stats->target_fps;
+            uint64_t interval=fps>0?1000000000ull/(uint64_t)fps:0;
+            /* A late frame must not schedule an immediate catch-up burst. */
+            out->next_due_ns=(stats->recordable?completed_ns:timestamp)+interval;
             metric_add(&stats->get_total_ns,&stats->get_max_ns,get_ns);atomic_fetch_add(&stats->get_count,1);
             if(upload.memcpy_ns){metric_add(&stats->memcpy_total_ns,&stats->memcpy_max_ns,upload.memcpy_ns);atomic_fetch_add(&stats->memcpy_count,1);}
             metric_add(&stats->upload_total_ns,&stats->upload_max_ns,upload.upload_ns);atomic_fetch_add(&stats->upload_count,1);
@@ -889,6 +904,7 @@ fail:
         atomic_store(&out->stats->running,false);
         if(error[0]&&out->wanted)statusf(out->stats,"QCarCam: %s",error);
     }
+    atomic_fetch_and(&visible_output_mask,~(((1ull<<HUD_STREAMS)-1)<<(camera->input*HUD_STREAMS)));
     camera->exited=1;
     pthread_mutex_unlock(&camera->mutex);
     if(started)api.stop(cam);if(cam)api.close(cam);
@@ -912,11 +928,13 @@ static jstring shared_start(JNIEnv *env,jobject surface,int input,int output,int
     shared_output_t *out=&camera->outputs[output];
     if(out->pending)ANativeWindow_release(out->pending);
     out->pending=window;out->wanted=1;out->requested_ns=now_ns();
+    if(output<HUD_STREAMS)atomic_fetch_or(&visible_output_mask,1ull<<(input*HUD_STREAMS+output));
     reset_output_stats(out->stats,input,output==HUD_STREAMS,fps);
     if(!camera->created){
         camera->stop=0;camera->exited=0;
         if(pthread_create(&camera->thread,NULL,shared_stream_thread,camera)){
             out->wanted=0;out->pending=NULL;ANativeWindow_release(window);
+            if(output<HUD_STREAMS)atomic_fetch_and(&visible_output_mask,~(1ull<<(input*HUD_STREAMS+output)));
             pthread_mutex_unlock(&camera->mutex);
             pthread_mutex_unlock(&camera->lifecycle_mutex);
             return (*env)->NewStringUTF(env,"Не удалось создать поток захвата");
@@ -934,6 +952,7 @@ static void shared_stop(int input,int output){
     pthread_mutex_lock(&camera->lifecycle_mutex);
     pthread_mutex_lock(&camera->mutex);
     shared_output_t *out=&camera->outputs[output];out->wanted=0;
+    if(output<HUD_STREAMS)atomic_fetch_and(&visible_output_mask,~(1ull<<(input*HUD_STREAMS+output)));
     atomic_store(&out->stats->running,false);
     int join=camera->created&&!camera->warm&&!camera_has_outputs(camera);
     if(join)camera->stop=1;
@@ -1007,6 +1026,10 @@ JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_status(JNIEnv *e,jc
 JNIEXPORT jlongArray JNICALL Java_com_stasao_gcam_NativeQCarCam_stats(JNIEnv *e,jclass c){(void)c;return state_stats(e,&s);}
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStart(JNIEnv *e,jclass c,jobject surface,jint input,jint target_fps){(void)c;pthread_once(&shared_once,init_shared);if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");if(target_fps<1)target_fps=1;if(target_fps>25)target_fps=25;return shared_start(e,surface,input,HUD_STREAMS,target_fps);}
 JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStop(JNIEnv *e,jclass c,jint input){(void)e;(void)c;shared_stop(input,HUD_STREAMS);}
+JNIEXPORT jlongArray JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderLoad(JNIEnv *e,jclass c){
+    (void)c;jlong values[]={recorder_budget(25,now_ns()),(jlong)atomic_load(&visible_output_mask)};
+    jlongArray result=(*e)->NewLongArray(e,2);if(result)(*e)->SetLongArrayRegion(e,result,0,2,values);return result;
+}
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStatus(JNIEnv *e,jclass c,jint input){(void)c;pthread_once(&recorders_once,init_recorders);if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");char x[512];pthread_mutex_lock(&recorders[input].mutex);snprintf(x,sizeof(x),"%s",recorders[input].status);pthread_mutex_unlock(&recorders[input].mutex);return (*e)->NewStringUTF(e,x);}
 JNIEXPORT jlongArray JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStats(JNIEnv *e,jclass c,jint input){(void)c;pthread_once(&recorders_once,init_recorders);if(input<0||input>3){state_t empty={0};return state_stats(e,&empty);}return state_stats(e,&recorders[input]);}
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_probe(JNIEnv *e,jclass c){(void)c;qapi_t a;char err[384]={0},out[800];if(acquire_api(&a,err,sizeof(err))){snprintf(out,sizeof(out),"QCarCam HIDL client: недоступен\n%s",err);return (*e)->NewStringUTF(e,out);}int query=-1;unsigned count=0;if(a.query)query=a.query(NULL,0,&count);release_api();snprintf(out,sizeof(out),"QCarCam HIDL client: загружен\nquery=%d inputs=%u",query,count);return (*e)->NewStringUTF(e,out);}

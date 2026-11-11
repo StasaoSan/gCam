@@ -10,6 +10,14 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class ExternalRecordingStoreTest {
+    @Test fun usbProbeWritesSyncsReadsAndDeletesWithoutLeavingArchiveEntries() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        assumeTrue("USB-накопитель не подключён", RecordingStore.selectedDrive(context) != null)
+        val before = RecordingStore.list(context).map { it.uri }.toSet()
+        RecordingStore.probeExternalWritable(context)
+        org.junit.Assert.assertEquals(before, RecordingStore.list(context).map { it.uri }.toSet())
+    }
+
     @Test fun removableMediaStoreCanCreateAndRemoveSegment() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         assumeTrue("USB-накопитель не подключён", RecordingStore.selectedDrive(context) != null)

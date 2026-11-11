@@ -15,3 +15,13 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Local packages and diagnostic workspaces.
+*.apk
+*.aab
+*.apks
+*.idsig
+/artifacts/
+/dist/
+/maintenance-check/
+/.idea/deploymentTargetSelector.xml

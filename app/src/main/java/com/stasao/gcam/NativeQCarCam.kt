@@ -64,4 +64,5 @@ object NativeQCarCam {
     @JvmStatic external fun recorderStats(inputId: Int): LongArray
     @JvmStatic external fun warmInput(inputId: Int, enabled: Boolean)
     @JvmStatic external fun recorderOverlay(inputId: Int, text: String)
+    @JvmStatic external fun recorderLoad(): LongArray
 }

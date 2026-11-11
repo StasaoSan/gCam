@@ -22,6 +22,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -327,19 +330,28 @@ class MainActivity : ComponentActivity() {
         externalFolderRevision++
         folderError = RecordingStore.validateExternal(context)
     }
-    val storage = remember(state.usedBytes, config.storage, externalFolderRevision) {
-        RecordingStore.storageStats(context, config.storage)
+    var storage by remember(config.storage, externalFolderRevision) {
+        mutableStateOf(StorageStats(-1L, -1L, 0L))
+    }
+    var storageRevision by remember { mutableIntStateOf(0) }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { storageRevision++ }
+    LaunchedEffect(config.storage, externalFolderRevision, driveListRevision, storageRevision) {
+        while (true) {
+            val snapshot = withContext(Dispatchers.IO) {
+                runCatching { RecordingStore.storageStats(context, config.storage) }.getOrNull()
+            }
+            if (snapshot != null) storage = snapshot
+            delay(5_000)
+        }
     }
     val externalError = remember(config.storage, externalFolderRevision) {
         if (config.storage == RecordingStorage.EXTERNAL) RecordingStore.validateExternal(context) else null
     }
-    val maxArchiveGb = remember(storage, config.storage) { RecordingStore.maxArchiveGb(context, config.storage) }
-    val sliderMaxGb = maxArchiveGb ?: config.storageLimitGb.coerceAtLeast(40)
-    val minArchiveGb = if (sliderMaxGb >= 5) 5 else 1
-    LaunchedEffect(maxArchiveGb) {
-        if (maxArchiveGb != null && config.storageLimitGb > maxArchiveGb)
-            config = config.copy(storageLimitGb = maxArchiveGb)
-    }
+    val maxArchiveGb = RecordingStore.maxArchiveGb(storage)
+    // Keep the saved quota editable while USB mounts or access to old clips is being restored.
+    // Missing archive entries must never silently overwrite the user's selected limit.
+    val sliderMaxGb = ArchiveRetention.sliderMaxGb(config.storageLimitGb, maxArchiveGb)
+    val minArchiveGb = 1
     var runtimeConfig by remember { mutableStateOf(GCamRuntimeSettings.load(context)) }
     var selectedOverlayPosition by remember { mutableIntStateOf(0) }
     var anhudAccess by remember { mutableStateOf(CaptureClientTrust.status(context)) }
@@ -419,6 +431,7 @@ class MainActivity : ComponentActivity() {
         contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 120.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        item { ArchiveAccessCard(onlyWarning = true) }
         state.warning?.let { warning ->
             item { RecorderWarningBanner(warning,
                 state.recording && state.cameras.values.any { it.recording }) }
@@ -512,6 +525,7 @@ class MainActivity : ComponentActivity() {
                     RecordingStore.selectedDrive(context)?.id ?: RecorderSettings.externalDriveId(context)
                 }
                 Text("Флешка для записи", fontSize = 14.sp)
+                UsbTestStatusCard(selectedId)
                 if (removableDrives.isEmpty()) Text("Подключённые USB-накопители не найдены", fontSize = 12.sp)
                 removableDrives.forEach { drive ->
                     val selected = selectedId.equals(drive.id, ignoreCase = true)
@@ -545,7 +559,7 @@ class MainActivity : ComponentActivity() {
                 if (storage.totalBytes >= 0) Text("Выбранный накопитель: занято ${formatBytes(storage.totalBytes - storage.freeBytes)} из ${formatBytes(storage.totalBytes)} · свободно ${formatBytes(storage.freeBytes)}", fontSize = 13.sp)
                 else Text("Выбранный накопитель: свободно ${formatBytes(storage.freeBytes)}; полный объём система не сообщает", fontSize = 13.sp)
                 Text("Записи gCam: ${formatBytes(storage.recordingBytes)} · максимум = свободно + записи − резерв 2 ГБ", fontSize = 13.sp)
-            } else Text("Свободное место накопителя недоступно от системы. 512 ГБ не подставляются; лимит можно выставить после выбора доступной флешки.", fontSize = 12.sp)
+            } else Text("Данные о свободном месте пока недоступны. Сохранённый лимит остаётся выбранным; объём обновится после подключения накопителя и выдачи доступа.", fontSize = 12.sp)
             Text("Ориентировочно ${"%.1f".format(Locale.US, hours)} ч записи", fontSize = 13.sp)
         }
         item {
@@ -672,9 +686,19 @@ class MainActivity : ComponentActivity() {
                     GCamRuntimeSettings.save(context, runtimeConfig)
                     GCamRuntimeController.updateRecordOverlay(context)
                 },
-                valueRange = 88f..180f,
+                valueRange = GCamRuntimeSettings.MIN_RECORD_OVERLAY_SIZE_DP.toFloat()..
+                    GCamRuntimeSettings.MAX_RECORD_OVERLAY_SIZE_DP.toFloat(),
                 enabled = runtimeConfig.recordOverlay && overlayAllowed
             )
+            RuntimeSwitchRow(
+                title = "Монохромная кнопка записи",
+                subtitle = "Белые значки: треугольник — запись идёт; квадрат — готово; пауза — USB не готов; восклицательный знак — ошибка",
+                checked = runtimeConfig.recordOverlayMonochrome
+            ) { checked ->
+                runtimeConfig = runtimeConfig.copy(recordOverlayMonochrome = checked)
+                GCamRuntimeSettings.save(context, runtimeConfig)
+                if (runtimeConfig.recordOverlay) GCamRuntimeController.updateRecordOverlay(context)
+            }
             TextButton(onClick = {
                 runtimeConfig = GCamRuntimeSettings.withDefaultStatusOverlayPositions(runtimeConfig)
                 GCamRuntimeSettings.save(context, runtimeConfig)
@@ -944,26 +968,69 @@ class MainActivity : ComponentActivity() {
 
 @Composable private fun SectionTitle(text: String) = Text(text, style = MaterialTheme.typography.titleMedium)
 
-@Composable private fun ArchiveAccessCard() {
+@Composable private fun ArchiveAccessCard(onlyWarning: Boolean = false) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var granted by remember { mutableStateOf(ArchiveAccess.isGranted()) }
+    var checking by remember { mutableStateOf(false) }
     var settingsUnavailable by remember { mutableStateOf(false) }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         granted = ArchiveAccess.isGranted()
         if (granted) settingsUnavailable = false
         RecorderDiagnostics.record(context, "archive_access allFilesAccess=$granted package=${context.packageName}")
     }
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        SectionTitle("Автоматическая очистка архива")
-        Text(if (granted) "Доступ выдан: старые записи удаляются автоматически по лимиту."
-            else "Для удаления записей от предыдущих установок нужен однократный доступ ко всем файлам.", fontSize = 13.sp)
-        Text("Android выдаёт доступ ко всему общему хранилищу. gCam удаляет по лимиту только свои записи в Movies/gCam выбранного накопителя; защищённые файлы сохраняются.", fontSize = 12.sp)
-        if (!granted) OutlinedButton(onClick = {
-            settingsUnavailable = !ArchiveAccess.openSettings(context)
-        }) { Text("Разрешить автоматическую очистку") }
-        if (settingsUnavailable) Text(
-            "На этом ГУ нет окна выдачи доступа. Разрешение можно выдать через ADB: adb shell appops set --uid ${context.packageName} MANAGE_EXTERNAL_STORAGE allow",
-            fontSize = 12.sp)
+    LaunchedEffect(Unit) {
+        checking = !granted
+        granted = withContext(Dispatchers.IO) { ArchiveAccess.tryGrantWithRoot(context) }
+        checking = false
+        while (true) {
+            delay(2_000)
+            granted = ArchiveAccess.isGranted()
+        }
+    }
+    if (granted) {
+        if (!onlyWarning) Surface(color = MaterialTheme.colorScheme.surfaceVariant,
+            shape = RoundedCornerShape(18.dp)) {
+            Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                SectionTitle("Автоматическая очистка архива")
+                Text("Доступ выдан: старые записи удаляются автоматически по лимиту.", fontSize = 13.sp)
+            }
+        }
+        return
+    }
+    val accent = Color(0xFFFFC978)
+    Surface(color = Color(0xFF241E32), contentColor = Color(0xFFF4EDF9),
+        shape = RoundedCornerShape(22.dp), border = BorderStroke(1.dp, accent.copy(alpha = .55f))) {
+        Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                Box(Modifier.size(48.dp).background(accent.copy(alpha = .14f), CircleShape),
+                    contentAlignment = Alignment.Center) {
+                    Text("↻", fontSize = 30.sp, color = accent)
+                }
+                Column(Modifier.weight(1f)) {
+                    Text("АРХИВ • ТРЕБУЕТ ВНИМАНИЯ", fontSize = 11.sp, color = accent)
+                    Text("Разрешите автоматическую очистку", style = MaterialTheme.typography.titleLarge)
+                }
+            }
+            Text("Без доступа к старым файлам запись может остановиться, когда архив заполнится.", fontSize = 14.sp)
+            Text("Android выдаёт доступ ко всему общему хранилищу. gCam удаляет по лимиту только свои записи в Movies/gCam выбранного накопителя; защищённые файлы сохраняются.",
+                fontSize = 12.sp, color = Color(0xFFCEC4D9))
+            Button(enabled = !checking, colors = ButtonDefaults.buttonColors(
+                containerColor = accent, contentColor = Color(0xFF241E32)),
+                shape = RoundedCornerShape(12.dp), onClick = {
+                    checking = true
+                    scope.launch {
+                        granted = withContext(Dispatchers.IO) { ArchiveAccess.tryGrantWithRoot(context, retry = true) }
+                        checking = false
+                        if (!granted) settingsUnavailable = !ArchiveAccess.openSettings(context)
+                    }
+                }) {
+                Text(if (checking) "Проверяем доступ…" else "Выдать доступ")
+            }
+            if (settingsUnavailable) Text(
+                "На этом ГУ нет окна выдачи доступа. Разрешение можно выдать через ADB: adb shell appops set --uid ${context.packageName} MANAGE_EXTERNAL_STORAGE allow",
+                fontSize = 12.sp, color = accent)
+        }
     }
 }
 

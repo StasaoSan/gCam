@@ -11,8 +11,10 @@ import java.security.MessageDigest
 internal object CaptureClientTrust {
     private const val ANHUD_PACKAGE = "com.g992.anhud"
     private const val BLIND_PACKAGE = "com.stasao.gblind"
+    private const val ZONES_PACKAGE = "com.stasao.gzones"
     private const val TRUST_FILE = "anhud_camera_signer.sha256"
     private const val BLIND_TRUST_FILE = "gblind_camera_signer.sha256"
+    private const val ZONES_TRUST_FILE = "gzones_camera_signer.sha256"
 
     data class Status(
         val installed: Boolean,
@@ -55,6 +57,9 @@ internal object CaptureClientTrust {
     fun isBlindCaller(context: Context, uid: Int): Boolean =
         context.packageManager.getPackagesForUid(uid)?.contains(BLIND_PACKAGE) == true
 
+    fun isZonesCaller(context: Context, uid: Int): Boolean =
+        context.packageManager.getPackagesForUid(uid)?.contains(ZONES_PACKAGE) == true
+
     fun enforceCaller(context: Context, callingUid: Int, transactionCode: Int) {
         if (callingUid == Process.myUid()) return
         val externalHudCall = when (transactionCode) {
@@ -74,11 +79,12 @@ internal object CaptureClientTrust {
         val manager = context.packageManager
         // Check the actual Binder UID first; an Intent extra or a claimed package name is forgeable.
         val blind = isBlindCaller(context, callingUid)
-        val appPackage = if (blind) BLIND_PACKAGE else ANHUD_PACKAGE
-        val fileName = if (blind) BLIND_TRUST_FILE else TRUST_FILE
+        val zones = isZonesCaller(context, callingUid)
+        val appPackage = if (blind) BLIND_PACKAGE else if (zones) ZONES_PACKAGE else ANHUD_PACKAGE
+        val fileName = if (blind) BLIND_TRUST_FILE else if (zones) ZONES_TRUST_FILE else TRUST_FILE
         if (manager.getPackagesForUid(callingUid)?.contains(appPackage) != true ||
             (blindReport && !blind)) {
-            throw SecurityException("Доступ к камерам gCam разрешён только ANHUD или gBlind")
+            throw SecurityException("Доступ к камерам gCam разрешён только доверенным приложениям")
         }
         if (blind && !blindReport && transactionCode !in setOf(
                 IQCarCamCapture.Stub.TRANSACTION_startHudV2,
@@ -88,12 +94,20 @@ internal object CaptureClientTrust {
                 IQCarCamCapture.Stub.TRANSACTION_hudStats)) {
             throw SecurityException("gBlind не может управлять проекцией")
         }
+        if (zones && transactionCode !in setOf(
+                IQCarCamCapture.Stub.TRANSACTION_startHudV2,
+                IQCarCamCapture.Stub.TRANSACTION_configureHudV2,
+                IQCarCamCapture.Stub.TRANSACTION_stopHud,
+                IQCarCamCapture.Stub.TRANSACTION_hudStatus,
+                IQCarCamCapture.Stub.TRANSACTION_hudStats)) {
+            throw SecurityException("Внешнему клиенту доступен только видеопросмотр")
+        }
         if (manager.checkSignatures(callingUid, Process.myUid()) == PackageManager.SIGNATURE_MATCH) {
             return // Existing debug builds signed by the same Android debug key.
         }
         val signer = currentSigner(context, appPackage)
         if (signer == null || signer != savedSigner(context, fileName)) {
-            throw SecurityException("Откройте gCam и подтвердите доступ $appPackage к камерам")
+            throw SecurityException("Откройте gCam и подтвердите доступ приложения к камерам")
         }
     }
 

@@ -18,6 +18,13 @@ object RecorderDiagnostics {
 
     private fun directory(context: Context) = File(context.filesDir, "diagnostics")
 
+    fun environment(context: Context): String {
+        val info = runCatching { context.packageManager.getPackageInfo(context.packageName, 0) }.getOrNull()
+        return "package=${context.packageName} version=${info?.versionName} versionCode=${info?.longVersionCode} " +
+            "manufacturer=${android.os.Build.MANUFACTURER} model=${android.os.Build.MODEL} " +
+            "sdk=${android.os.Build.VERSION.SDK_INT} diagnosticSchema=2"
+    }
+
     fun record(context: Context, event: String) = append(context, "recorder", event)
 
     fun recordException(context: Context, event: String, failure: Throwable) = record(
@@ -29,13 +36,16 @@ object RecorderDiagnostics {
 
     fun recordStatus(context: Context, event: String) = append(context, "status", event)
 
+    fun recordStorage(context: Context, event: String) = append(context, "storage-system", event)
+
     private fun append(context: Context, source: String, event: String) {
         Log.i(TAG, event)
         runCatching {
             synchronized(lock) {
                 val dir = directory(context).apply { mkdirs() }
                 val current = File(dir, "$source.log")
-                if (current.length() >= MAX_BYTES) {
+                val limit = if (source == "storage-system") 1024 * 1024L else MAX_BYTES
+                if (current.length() + event.toByteArray(Charsets.UTF_8).size >= limit) {
                     val previous = File(dir, "$source-previous.log")
                     if (previous.exists()) previous.delete()
                     current.renameTo(previous)
@@ -52,10 +62,13 @@ object RecorderDiagnostics {
             val outDir = File(context.cacheDir, "diagnostics").apply { mkdirs() }
             val file = File(outDir, "gCam-recorder-diagnostics.txt")
             file.outputStream().buffered().use { output ->
+                output.write(("# Export environment (historical sessions may use older builds)\n" +
+                    environment(context) + "\n").toByteArray(Charsets.UTF_8))
                 listOf(
                     "recorder-previous.log", "recorder.log",
                     "hud-previous.log", "hud.log",
-                    "status-previous.log", "status.log"
+                    "status-previous.log", "status.log",
+                    "storage-system-previous.log", "storage-system.log"
                 ).forEach { name ->
                     val source = File(dir, name)
                     if (source.isFile) {

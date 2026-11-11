@@ -20,7 +20,8 @@ data class GCamRuntimeConfig(
     val blindStatusOverlayX: Float,
     val blindStatusOverlayY: Float,
     val hudStatusOverlayX: Float,
-    val hudStatusOverlayY: Float
+    val hudStatusOverlayY: Float,
+    val recordOverlayMonochrome: Boolean = false
 )
 
 object GCamRuntimeSettings {
@@ -35,6 +36,9 @@ object GCamRuntimeSettings {
     private const val KEY_RECORD_OVERLAY_X = "record_overlay_x"
     private const val KEY_RECORD_OVERLAY_Y = "record_overlay_y"
     private const val KEY_RECORD_OVERLAY_SIZE = "record_overlay_size_dp"
+    private const val KEY_RECORD_OVERLAY_MONOCHROME = "record_overlay_monochrome"
+    const val MIN_RECORD_OVERLAY_SIZE_DP = 32
+    const val MAX_RECORD_OVERLAY_SIZE_DP = 180
     private const val KEY_STATUS_OVERLAY_X = "status_overlay_x"
     private const val KEY_STATUS_OVERLAY_Y = "status_overlay_y"
     private const val KEY_BLIND_STATUS_OVERLAY_X = "blind_status_overlay_x"
@@ -57,7 +61,9 @@ object GCamRuntimeSettings {
             recordOverlay = prefs.getBoolean(KEY_RECORD_OVERLAY, false),
             recordOverlayX = prefs.getFloat(KEY_RECORD_OVERLAY_X, 0.83f).coerceIn(0f, 1f),
             recordOverlayY = prefs.getFloat(KEY_RECORD_OVERLAY_Y, 0.65f).coerceIn(0f, 1f),
-            recordOverlaySizeDp = prefs.getInt(KEY_RECORD_OVERLAY_SIZE, 112).coerceIn(88, 180),
+            recordOverlaySizeDp = prefs.getInt(KEY_RECORD_OVERLAY_SIZE, 112)
+                .coerceIn(MIN_RECORD_OVERLAY_SIZE_DP, MAX_RECORD_OVERLAY_SIZE_DP),
+            recordOverlayMonochrome = prefs.getBoolean(KEY_RECORD_OVERLAY_MONOCHROME, false),
             statusOverlayX = position.first,
             statusOverlayY = position.second,
             blindStatusOverlayX = prefs.getFloat(KEY_BLIND_STATUS_OVERLAY_X, DEFAULT_BLIND_OVERLAY_X).coerceIn(0f, 1f),
@@ -87,7 +93,9 @@ object GCamRuntimeSettings {
             .putBoolean(KEY_RECORD_OVERLAY, config.recordOverlay)
             .putFloat(KEY_RECORD_OVERLAY_X, config.recordOverlayX.coerceIn(0f, 1f))
             .putFloat(KEY_RECORD_OVERLAY_Y, config.recordOverlayY.coerceIn(0f, 1f))
-            .putInt(KEY_RECORD_OVERLAY_SIZE, config.recordOverlaySizeDp.coerceIn(88, 180))
+            .putInt(KEY_RECORD_OVERLAY_SIZE, config.recordOverlaySizeDp
+                .coerceIn(MIN_RECORD_OVERLAY_SIZE_DP, MAX_RECORD_OVERLAY_SIZE_DP))
+            .putBoolean(KEY_RECORD_OVERLAY_MONOCHROME, config.recordOverlayMonochrome)
             .putFloat(KEY_STATUS_OVERLAY_X, config.statusOverlayX.coerceIn(0f, 1f))
             .putFloat(KEY_STATUS_OVERLAY_Y, config.statusOverlayY.coerceIn(0f, 1f))
             .putFloat(KEY_BLIND_STATUS_OVERLAY_X, config.blindStatusOverlayX.coerceIn(0f, 1f))

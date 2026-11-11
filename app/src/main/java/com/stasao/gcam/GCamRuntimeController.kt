@@ -25,6 +25,7 @@ object GCamRuntimeController {
     }
 
     fun startAfterManualLaunch(context: Context) {
+        UsbTestService.request(context)
         startCameraBridge(context)
         startOverlayIfAllowed(context, GCamRuntimeSettings.load(context))
         applyCameraOverlaySetting(context, GCamRuntimeSettings.load(context).cameraOverlay)
