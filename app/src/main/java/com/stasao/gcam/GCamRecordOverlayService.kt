@@ -114,12 +114,12 @@ class GCamRecordOverlayService : Service() {
         super.onCreate()
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(CHANNEL_ID,
-            GCamLanguage.text(this, "Кнопка записи gCam", "gCam record button"), NotificationManager.IMPORTANCE_LOW))
+            GCamLanguage.string(this, R.string.gcam_gcam_record_button), NotificationManager.IMPORTANCE_LOW))
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         startForeground(NOTIFICATION_ID, Notification.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle(GCamLanguage.text(this, "gCam — кнопка записи", "gCam — record button"))
+            .setSmallIcon(R.mipmap.gcam_ic_launcher)
+            .setContentTitle(GCamLanguage.string(this, R.string.gcam_gcam_record_button_2))
             .setContentIntent(open)
             .setOngoing(true)
             .build())
@@ -142,8 +142,8 @@ class GCamRecordOverlayService : Service() {
         if (intent?.action == ACTION_LANGUAGE) runCatching {
             getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID,
                 Notification.Builder(this, CHANNEL_ID)
-                    .setSmallIcon(R.mipmap.ic_launcher)
-                    .setContentTitle(GCamLanguage.text(this, "gCam — кнопка записи", "gCam — record button"))
+                    .setSmallIcon(R.mipmap.gcam_ic_launcher)
+                    .setContentTitle(GCamLanguage.string(this, R.string.gcam_gcam_record_button_2))
                     .setContentIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
                         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
                     .setOngoing(true).build())
@@ -243,8 +243,7 @@ class GCamRecordOverlayService : Service() {
         }
         val config = RecorderSettings.load(this)
         if (config.cameraIds.isEmpty()) {
-            Toast.makeText(this, GCamLanguage.text(this, "Выберите камеры для записи в gCam",
-                "Select cameras to record in gCam"), Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, GCamLanguage.string(this, R.string.gcam_select_cameras_to_record_in_gcam), Toast.LENGTH_SHORT).show()
             return
         }
         if (config.storage == RecordingStorage.EXTERNAL && storageError != null) {

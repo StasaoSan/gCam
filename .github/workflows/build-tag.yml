@@ -108,7 +108,7 @@ jobs:
           grep -q '[^[:space:]]' dist/RELEASE_NOTES.md
           echo "Release $tag: versionName=$version versionCode=$version_code"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "apk=gCam_[${tag}].apk" >> "$GITHUB_OUTPUT"
+          echo "apk=gCam-${tag}.apk" >> "$GITHUB_OUTPUT"
           echo "version_name=$version" >> "$GITHUB_OUTPUT"
           echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
         env:
@@ -165,7 +165,7 @@ jobs:
             echo "Unexpected APK metadata: $package_line" >&2
             exit 1
           fi
-          shasum -a 256 "dist/${APK_NAME}" > dist/SHA256SUMS.txt
+          shasum -a 256 "dist/${APK_NAME}" | sed 's|  dist/|  |' > dist/SHA256SUMS.txt
       - name: Keep signed APK for one day
         uses: actions/upload-artifact@v4
         with:
@@ -183,16 +183,13 @@ jobs:
         run: |
           set -euo pipefail
           test -f "dist/${APK_NAME}"
-          # gh treats square brackets in an exact filename as a glob character class.
-          # Let gh expand a pattern that matches the one signed APK instead.
-          apk_pattern='dist/gCam_*.apk'
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            gh release upload "$TAG_NAME" "$apk_pattern" dist/SHA256SUMS.txt \
+            gh release upload "$TAG_NAME" "dist/${APK_NAME}" dist/SHA256SUMS.txt \
               --clobber
             gh release edit "$TAG_NAME" \
               --title "gCam ${TAG_NAME}" --notes-file dist/RELEASE_NOTES.md --draft=false
           else
-            gh release create "$TAG_NAME" "$apk_pattern" dist/SHA256SUMS.txt \
+            gh release create "$TAG_NAME" "dist/${APK_NAME}" dist/SHA256SUMS.txt \
               --verify-tag \
               --title "gCam ${TAG_NAME}" --notes-file dist/RELEASE_NOTES.md
           fi

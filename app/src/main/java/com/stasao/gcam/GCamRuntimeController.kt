@@ -7,6 +7,7 @@ import android.provider.Settings
 
 object GCamRuntimeController {
     fun startAfterBoot(context: Context, force: Boolean = false) {
+        if (!RecorderHost.captureAvailable(context)) return
         val config = GCamRuntimeSettings.load(context)
         if (!config.autostart) return
         if (!GCamRuntimeSettings.claimAutostartForCurrentBoot(context, force)) return
@@ -25,7 +26,7 @@ object GCamRuntimeController {
     }
 
     fun startAfterManualLaunch(context: Context) {
-        UsbTestService.request(context)
+        if (!RecorderHost.captureAvailable(context)) return
         startCameraBridge(context)
         startOverlayIfAllowed(context, GCamRuntimeSettings.load(context))
         applyCameraOverlaySetting(context, GCamRuntimeSettings.load(context).cameraOverlay)
@@ -33,6 +34,7 @@ object GCamRuntimeController {
     }
 
     fun applyOverlaySetting(context: Context) {
+        if (!RecorderHost.captureAvailable(context)) return
         val config = GCamRuntimeSettings.load(context)
         val enabled = config.statusOverlay || config.blindStatusOverlay || config.hudStatusOverlay
         if (enabled && Settings.canDrawOverlays(context)) {
@@ -43,24 +45,28 @@ object GCamRuntimeController {
     }
 
     fun applyCameraOverlaySetting(context: Context, enabled: Boolean) {
+        if (!RecorderHost.captureAvailable(context)) return
         val intent = Intent(context, GCamCameraOverlayService::class.java)
         if (enabled && Settings.canDrawOverlays(context)) startForeground(context, intent)
         else context.stopService(intent)
     }
 
     fun applyRecordOverlaySetting(context: Context, enabled: Boolean) {
+        if (!RecorderHost.captureAvailable(context)) return
         val intent = Intent(context, GCamRecordOverlayService::class.java)
         if (enabled && Settings.canDrawOverlays(context)) startForeground(context, intent)
         else context.stopService(intent)
     }
 
     fun updateRecordOverlay(context: Context) {
+        if (!RecorderHost.captureAvailable(context)) return
         if (Settings.canDrawOverlays(context)) startForeground(context,
             Intent(context, GCamRecordOverlayService::class.java)
                 .setAction(GCamRecordOverlayService.ACTION_UPDATE_LAYOUT))
     }
 
     fun updateAllOverlayPositions(context: Context) {
+        if (!RecorderHost.captureAvailable(context)) return
         if (!Settings.canDrawOverlays(context)) return
         val config = GCamRuntimeSettings.load(context)
         if (!config.statusOverlay && !config.blindStatusOverlay && !config.hudStatusOverlay) return
@@ -70,6 +76,7 @@ object GCamRuntimeController {
     }
 
     fun updateBridgeLanguage(context: Context, language: Int) {
+        if (!RecorderHost.captureAvailable(context)) return
         startForeground(context, Intent(context, QCarCamCaptureService::class.java)
             .setAction(QCarCamCaptureService.ACTION_LANGUAGE)
             .putExtra(QCarCamCaptureService.EXTRA_LANGUAGE, language))

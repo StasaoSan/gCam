@@ -1,0 +1,26 @@
+<resources>
+    <string name="panel_recorder_title">Регистратор</string>
+    <string name="panel_recorder_permissions">Разрешения</string>
+    <string name="panel_recorder_permissions_unavailable">Android не смог открыть эти настройки разрешений.</string>
+    <string name="panel_recorder_allowed">Разрешено</string>
+    <string name="panel_recorder_allow">Разрешить</string>
+    <string name="panel_recorder_ready">Готов к записи</string>
+    <string name="panel_recorder_waiting_frames">Ожидаем первые записанные кадры…</string>
+    <string name="panel_recorder_recording_count">Запись: %1$d / %2$d камер</string>
+    <string name="panel_recorder_preview">Камеры</string>
+    <string name="panel_recorder_show_preview">Показать камеры</string>
+    <string name="panel_recorder_hide_preview">Скрыть предпросмотр</string>
+    <string name="panel_recorder_preview_recording">Камеры используются для записи. Статус записи отображается сверху.</string>
+    <string name="panel_recorder_preview_unavailable">Предпросмотр появится при подключении автомобильных камер.</string>
+    <string name="panel_recorder_camera_selected">Будет записываться</string>
+    <string name="panel_recorder_camera_off">Не записывается</string>
+    <string name="panel_recorder_quality">Качество и фрагменты</string>
+    <string name="panel_recorder_use_recommended">Рекомендуемые параметры</string>
+    <string name="panel_recorder_free_space">Свободно: %1$s</string>
+    <string name="panel_recorder_vehicle_speed">Скорость автомобиля</string>
+    <string name="panel_recorder_vehicle_speed_hint">Показания приборки, без зависимости от GPS.</string>
+    <string name="panel_recorder_auto_record">Начинать запись автоматически</string>
+    <string name="panel_recorder_auto_record_hint">Записывать выбранные камеры при запуске gPanel.</string>
+    <string name="panel_recorder_more">Дополнительно</string>
+    <string name="panel_recorder_details">Технические сведения</string>
+</resources>

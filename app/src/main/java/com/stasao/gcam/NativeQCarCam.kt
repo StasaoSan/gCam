@@ -53,7 +53,12 @@ object NativeQCarCam {
      * 20..45: cumulative nanosecond total/count pairs for get, copy, upload,
      * draw, swap, hold, ION sync, PBO fence wait, PBO map, texture submit,
      * eglMakeCurrent, QCarCam release, PBO unmap. The recorder subtracts
-     * snapshots to report 15-second stage averages instead of lifetime averages.
+     * snapshots to report stage averages instead of lifetime averages.
+     * 51/52: output worker thread CPU nanoseconds/count. 53/54/55: private
+     * GPU-copy submission wall nanoseconds/thread CPU nanoseconds/count.
+     * Thread CPU excludes blocked driver time; these are not GPU busy counters.
+     * 56..59: current output phase, monotonic phase start ns, last EGL error,
+     * and the owning output generation. Idle phase has no active wait age.
      */
     @JvmStatic external fun stats(): LongArray
 

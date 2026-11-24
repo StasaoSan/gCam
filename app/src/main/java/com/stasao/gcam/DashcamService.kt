@@ -15,6 +15,7 @@ import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.IBinder
+import android.os.Build
 import android.os.Process
 import android.os.Debug
 import android.os.PowerManager
@@ -39,6 +40,7 @@ import android.os.Handler
 import android.os.Looper
 
 class DashcamService : Service() {
+    override fun attachBaseContext(base: Context) = super.attachBaseContext(RecorderHost.wrapContext(base))
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val encoders = ConcurrentHashMap<Int, CameraEncoder>()
     // Native stop, MediaCodec drain and USB finalization must never block the UI.
@@ -55,17 +57,26 @@ class DashcamService : Service() {
     private var maintenanceJob: Job? = null
     private var startupJob: Job? = null
     private var recoveryJob: Job? = null
+    private var encoderRecoveryJob: Job? = null
+    private var stageDiagnosticJob: Job? = null
+    private var stageLogSampler = RecorderStageLogSampler()
+    @Volatile private var diagnosticStartupEncoder: CameraEncoder? = null
+    @Volatile private var recoveringEncoder: Int? = null
     @Volatile private var recoveryPending = false
     @Volatile private var recoveryStartedElapsedMs = 0L
     @Volatile private var lastRecoveryReason = ""
     private var recoveryWarning: String? = null
     private var config = RecorderConfig()
+    @Volatile private var samplePool:EncodedSamplePool?=null
+    @Volatile private var bufferPressureUntil=0L
+    @Volatile private var bufferPressureBudget=RecorderBufferPolicy.MAX_BYTES
+    private var engineCheckpointSource:RecorderEngineCheckpointSource?=null
     private var stampSource: RecorderStampSource? = null
     private var capture: IQCarCamCapture? = null
     private var captureBound = false
     @Volatile private var starting = false
     private var currentState = RecorderState()
-    private var recordingSessionId = 0L
+    @Volatile private var recordingSessionId = 0L
     @Volatile private var lastCaptureSnapshot = "not_sampled"
     private var storageReceiver: BroadcastReceiver? = null
     private val captureConnection = object : ServiceConnection {
@@ -73,6 +84,12 @@ class DashcamService : Service() {
             capture = IQCarCamCapture.Stub.asInterface(service)
             captureBound = true
             if (starting && !destroyed) encoderWorker.execute { startEncoders() }
+        }
+
+        override fun onNullBinding(name: ComponentName?) {
+            unbindCapture()
+            recoveryPending = false
+            startupFailed(GCamLanguage.string(this@DashcamService, R.string.gcam_the_camera_service_is_unavailable))
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -87,6 +104,14 @@ class DashcamService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        engineCheckpointSource=RecorderEngineCheckpointSource(this) {
+            if(!destroyed && !stopping && !starting && encoders.isNotEmpty()) {
+                val accepted=encoders.values.count {it.requestCheckpoint()}
+                encoderWorker.execute {
+                    RecorderDiagnostics.record(this,"recording_checkpoint_requested reason=engine_stop channels=$accepted")
+                }
+            }
+        }
         createChannel()
         recoveryWarning = savedRecoveryWarning()
         storageReceiver = runCatching { StorageDiagnostics.observe(this) }.onFailure {
@@ -117,8 +142,14 @@ class DashcamService : Service() {
 
     private fun startRecording(intent: Intent?) {
         if (destroyed || stopping || starting || encoders.isNotEmpty() || recoveryJob?.isActive == true) return
+        if (!RecorderHost.captureAvailable(this)) {
+            recoveryPending = false
+            startupFailed(GCamLanguage.string(this, R.string.gcam_the_cameras_are_managed_by_another_app))
+            return
+        }
+        ensureStageDiagnostics()
         starting = true
-        UsbConnectionTest.recorderBusy = true
+        RecorderRepository.busy = true
         recordingSessionId = SystemClock.elapsedRealtime()
         lastCaptureSnapshot = "not_sampled"
         RecorderDiagnostics.record(this, "recording_environment session=$recordingSessionId ${RecorderDiagnostics.environment(this)}")
@@ -147,7 +178,7 @@ class DashcamService : Service() {
             startupFailed("Выберите хотя бы одну камеру")
             return
         }
-        startForeground(NOTIFICATION_ID, notification("Запуск камер…"), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        startForeground(NOTIFICATION_ID, notification("Запуск камер…"), captureServiceType())
         val waitForUsb = intent?.getBooleanExtra(EXTRA_WAIT_FOR_USB, false) == true ||
             (intent == null && config.storage == RecordingStorage.EXTERNAL)
         publish(RecorderState(recording = true, status = if (config.storage == RecordingStorage.EXTERNAL)
@@ -213,24 +244,16 @@ class DashcamService : Service() {
             if (stable) {
                 val attempt = runCatching {
                     RecordingStore.removeInterrupted(this, config.storage)
-                    val maintenance = RecordingStore.enforceLimit(this, config)
-                    if (maintenance.ready) {
-                        UsbConnectionTest.ensure(this, config) { status ->
-                            mainHandler.post { if (starting) publish(RecorderState(recording = true, status = status)) }
-                        }
-                    }
-                    maintenance
+                    RecordingStore.enforceLimit(this, config)
                 }
                 attempt.getOrNull()?.let {
                     RecorderDiagnostics.record(this,
                         "autostart_usb_ready waitMs=${SystemClock.elapsedRealtime() - startedAt} " +
-                            "volume=${validation.getOrNull()} writeReadSyncDeleteProbe=ok " +
-                            "stressTest=${if (it.ready) "passed" else "skipped_archive_not_ready"}")
+                            "volume=${validation.getOrNull()} writeReadSyncDeleteProbe=ok")
                     return it
                 }
                 attempt.exceptionOrNull()?.let {
-                    if (it is ArchiveAccessRequiredException || it is kotlinx.coroutines.CancellationException ||
-                        (it is UsbTestFailure && !waitForUsb)) throw it
+                    if (it is ArchiveAccessRequiredException || it is kotlinx.coroutines.CancellationException) throw it
                 }
                 tracker.observe(now, false)
                 lastReason = attempt.exceptionOrNull()?.message ?: "Ошибка записи на USB"
@@ -260,29 +283,85 @@ class DashcamService : Service() {
         }
     }
 
+    private fun captureServiceType(): Int = if (Build.VERSION.SDK_INT >= 34)
+        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+
+    private fun newEncoder(id: Int): CameraEncoder {
+        val session = recordingSessionId
+        lateinit var encoder: CameraEncoder
+        encoder = CameraEncoder(this, id, config, session,checkNotNull(samplePool)) { message ->
+            // A retiring encoder must never overwrite the replacement's state.
+            if (recordingSessionId == session && encoders[id] === encoder) errors[id] = message
+        }
+        return encoder
+    }
+
+    private fun startEncoder(encoder:CameraEncoder,remote:IQCarCamCapture) {
+        // Diagnostic visibility only: the serial lifecycle worker remains the owner.
+        diagnosticStartupEncoder=encoder
+        try {encoder.start(remote)} finally {if(diagnosticStartupEncoder===encoder)diagnosticStartupEncoder=null}
+    }
+
+    private fun ensureStageDiagnostics() {
+        if(stageDiagnosticJob?.isActive==true)return
+        val sampler=RecorderStageLogSampler()
+        stageLogSampler=sampler
+        stageDiagnosticJob=scope.launch(Dispatchers.IO) {
+            while(isActive && !destroyed) {
+                // Local counters are sampled independently of potentially blocked capture Binder calls.
+                val observed=encoders.values.toMutableList()
+                diagnosticStartupEncoder?.let {if(it !in observed)observed+=it}
+                val lines=sampler.sample(observed.map{it.diagnosticMetrics()})
+                for(line in lines) {
+                    if(!isActive || destroyed)break
+                    RecorderDiagnostics.record(this@DashcamService,line)
+                }
+                delay(5_000)
+            }
+        }
+    }
+
+    private fun stopStageDiagnostics() {
+        stageLogSampler.close();stageDiagnosticJob?.cancel();stageDiagnosticJob=null
+    }
+
     private fun startEncoders() {
         if (!starting) return
         val remote = capture ?: return
-        val locationRequested = config.stampGps || config.stampSpeed
+        if(samplePool==null) {
+            val pool=EncodedSamplePool(activeChannels=config.cameraIds)
+            if(!pool.available) {
+                pool.close()
+                scope.launch(Dispatchers.Main) {startupFailed("Недоступен нативный буфер записи")}
+                return
+            }
+            samplePool=pool
+            updateBufferBudget()
+            RecorderDiagnostics.record(this,"recording_buffer native=true requestedBytes=${RecorderBufferPolicy.MAX_BYTES} state=${pool.snapshot()}")
+        }
+        val locationRequested = RecorderStampSource.requiresLocation(this, config)
         val locationReady = locationRequested &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED &&
             runCatching {
                 startForeground(
                     NOTIFICATION_ID, notification("Запуск камер…"),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+                    captureServiceType() or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
                 )
                 true
             }.onFailure {
                 RecorderDiagnostics.record(this, "location_stamp_unavailable type=${it.javaClass.simpleName}")
             }.getOrDefault(false)
         stampSource = RecorderStampSource(this, config).also { if (locationReady) it.start() }
+        val startedInputs = mutableSetOf<Int>()
         config.cameraIds.sorted().forEach { id ->
             if (!starting || destroyed) return@forEach
             runCatching {
                 remote.setRecorderOverlay(id, stampSource?.currentText().orEmpty())
-                CameraEncoder(this, id, config, recordingSessionId) { message -> errors[id] = message }.also {
-                    it.start(remote); encoders[id] = it
-                }
+                // Retain ownership even if startup cannot detach its native target.
+                val encoder = newEncoder(id)
+                encoders[id] = encoder
+                startEncoder(encoder,remote)
+                startedInputs += id
             }.onFailure {
                 errors[id] = it.message ?: it.javaClass.simpleName
                 RecorderDiagnostics.recordException(this,
@@ -291,14 +370,19 @@ class DashcamService : Service() {
         }
         if (!starting || destroyed) return
         starting = false
-        if (encoders.isEmpty()) {
+        if (startedInputs.isEmpty()) {
             stampSource?.stop(); stampSource = null
             RecorderDiagnostics.record(this, "recording_start_no_cameras errors=${errors.toSortedMap()}")
             scope.launch(Dispatchers.Main) { recoverFromCameraFailure("Камеры не запустились") }
             return
         }
-        if (encoders.size != config.cameraIds.size) {
-            val failedIds = config.cameraIds - encoders.keys
+        val checkpointSession=recordingSessionId
+        mainHandler.post {
+            if(!destroyed && !stopping && recordingSessionId==checkpointSession && encoders.isNotEmpty())
+                engineCheckpointSource?.start()
+        }
+        if (startedInputs.size != config.cameraIds.size) {
+            val failedIds = config.cameraIds - startedInputs
             RecorderDiagnostics.record(this, "recording_partial_start failedInputs=${failedIds.sorted()} errors=${failedIds.map { errors[it] }}")
             scope.launch(Dispatchers.Main) {
                 recoverFromCameraFailure("Не запустились камеры: ${failedIds.sorted().joinToString()}")
@@ -309,7 +393,8 @@ class DashcamService : Service() {
         statsJob?.cancel()
         statsJob = scope.launch {
             val previous = mutableMapOf<Int, Pair<Long, Long>>()
-            val stoppedCaptures = config.cameraIds.associateWith { CaptureStopTracker() }
+            val stoppedCaptures = config.cameraIds.associateWith { CaptureStopTracker() }.toMutableMap()
+            val previousEncoders = mutableMapOf<Int, CameraEncoder>()
             val previousTiming = mutableMapOf<Int, LongArray>()
             val previousMux = mutableMapOf<Int, Pair<Long, Long>>()
             fun stageUs(current: LongArray, old: LongArray?, index: Int): Long {
@@ -341,6 +426,14 @@ class DashcamService : Service() {
                 val now = System.nanoTime()
                 val rawStats = mutableMapOf<Int, LongArray>()
                 val cameras = config.cameraIds.associateWith { id ->
+                    encoders[id]?.let { encoder ->
+                        if (previousEncoders.put(id, encoder) !== encoder) {
+                            previous.remove(id)
+                            previousTiming.remove(id)
+                            previousMux.remove(id)
+                            stoppedCaptures[id] = CaptureStopTracker()
+                        }
+                    }
                     val stats = runCatching { remote.stats(id) }.getOrDefault(longArrayOf())
                     rawStats[id] = stats
                     val frames = stats.getOrElse(1) { 0 }
@@ -362,6 +455,7 @@ class DashcamService : Service() {
                             append(" fps=").append("%.2f".format(fps))
                             append(" frames=").append(frames)
                             append(" timeouts=").append(stats.getOrElse(2) { 0 })
+                            append(" replacedFrames=").append(stats.getOrElse(46) { 0 })
                             append(" getAvgUs=").append(stats.getOrElse(5) { 0 })
                             append(" getMaxUs=").append(stats.getOrElse(6) { 0 })
                             append(" memcpyAvgUs=").append(stats.getOrElse(7) { 0 })
@@ -393,12 +487,16 @@ class DashcamService : Service() {
                         "input=${it.inputId} running=${it.recording} qFrames=${it.frames} error=${it.error}"
                     }
                 val active = cameras.values.count(CameraRecordingState::recording)
-                val status = if (cameras.values.none { it.error != null }) "Запись: $active/${config.cameraIds.size} камер"
+                val status = recoveringEncoder?.let { recoveringCameraStatus(it) }
+                    ?: if (cameras.values.none { it.error != null }) "Запись: $active/${config.cameraIds.size} камер"
                     else "Запись с ошибками: $active/${config.cameraIds.size}"
                 val failedStorage = encoders.values.firstOrNull { it.storageFailed }
                 if (failedStorage != null) {
-                    val reason = errors[failedStorage.inputId] ?: "Ошибка записи файла на USB"
-                    scope.launch(Dispatchers.Main) { recoverFromStorageFailure(reason) }
+                    val reason = errors[failedStorage.inputId] ?: "Ошибка записи файла"
+                    scope.launch(Dispatchers.Main) {
+                        if(config.storage==RecordingStorage.EXTERNAL)recoverFromStorageFailure(reason)
+                        else recoverFromCameraFailure(reason)
+                    }
                     break
                 }
                 if (config.storage == RecordingStorage.EXTERNAL && tick % USB_RECORDING_CHECK_INTERVAL_SECONDS == 0) {
@@ -412,16 +510,20 @@ class DashcamService : Service() {
                         break
                     }
                 }
-                val deadEncoder = encoders.values.firstOrNull { !it.drainAlive }
+                val deadEncoder = encoders.values.firstOrNull { it.inputId != recoveringEncoder && !it.drainAlive }
                 if (deadEncoder != null) {
-                    val reason = errors[deadEncoder.inputId] ?: "Кодер камеры ${deadEncoder.inputId} остановился"
+                    val reason = deadEncoder.failureMessage ?: errors[deadEncoder.inputId]
+                        ?: "Кодер камеры ${deadEncoder.inputId} остановился"
                     RecorderDiagnostics.record(this@DashcamService,
-                        "recording_auto_stop reason=encoder_stopped input=${deadEncoder.inputId} error=$reason")
-                    scope.launch(Dispatchers.Main) { recoverFromCameraFailure(reason) }
-                    break
+                        "recording_encoder_stopped input=${deadEncoder.inputId} error=$reason")
+                    val local = withContext(Dispatchers.Main) { recoverSingleEncoder(deadEncoder, reason) }
+                    if (!local) {
+                        scope.launch(Dispatchers.Main) { recoverFromCameraFailure(reason) }
+                        break
+                    }
                 }
                 val captureStopped = encoders.values.firstOrNull { encoder ->
-                    stoppedCaptures.getValue(encoder.inputId).observe(
+                    encoder.inputId != recoveringEncoder && stoppedCaptures.getValue(encoder.inputId).observe(
                         SystemClock.elapsedRealtime(),
                         rawStats[encoder.inputId]?.getOrNull(0)?.let { it != 0L },
                         encoder.outputFrames,
@@ -436,8 +538,8 @@ class DashcamService : Service() {
                     break
                 }
                 val stalled = encoders.values.firstOrNull {
-                    SystemClock.elapsedRealtime() - (it.lastOutputElapsedMs.takeIf { time -> time > 0 }
-                        ?: recordingSessionId) > 30_000L
+                    it.inputId != recoveringEncoder && SystemClock.elapsedRealtime() - (it.lastOutputElapsedMs.takeIf { time -> time > 0 }
+                        ?: recordingSessionId) > 30_000L && !it.hasLiveBufferedBacklog(SystemClock.elapsedRealtime())
                 }
                 if (stalled != null) {
                     scope.launch(Dispatchers.Main) {
@@ -453,7 +555,9 @@ class DashcamService : Service() {
                         RecorderDiagnostics.record(this@DashcamService,
                             "recording_recovered cameras=${encoders.keys.sorted()} outputFrames=${encoders.mapValues { it.value.outputFrames }}")
                         postRecoveryNotice("Запись всех камер восстановлена после сбоя: $lastRecoveryReason", recovered = true)
-                    } else if (SystemClock.elapsedRealtime() - recoveryStartedElapsedMs > RECOVERY_FRAME_TIMEOUT_MS) {
+                    } else if (SystemClock.elapsedRealtime() - recoveryStartedElapsedMs > RECOVERY_FRAME_TIMEOUT_MS &&
+                        encoders.values.any {!it.hasLiveBufferedBacklog(SystemClock.elapsedRealtime()) &&
+                            SystemClock.elapsedRealtime()-it.lastOutputElapsedMs>RECOVERY_FRAME_TIMEOUT_MS}) {
                         RecorderDiagnostics.record(this@DashcamService,
                             "recording_recovery_no_frames outputFrames=${encoders.mapValues { it.value.outputFrames }}")
                         scope.launch(Dispatchers.Main) { recoverFromCameraFailure("Нет кадров после перезапуска камер") }
@@ -498,6 +602,7 @@ class DashcamService : Service() {
                     val systemMemory = ActivityManager.MemoryInfo().also {
                         getSystemService(ActivityManager::class.java).getMemoryInfo(it)
                     }
+                    val poolState=updateBufferBudget(systemMemory)
                     RecorderDiagnostics.record(this@DashcamService, buildString {
                         append("sample windowMs=$windowMs recorderCpuPct=")
                         append((recorderCpu - previousRecorderCpu).coerceAtLeast(0) * 100 / windowMs)
@@ -513,6 +618,12 @@ class DashcamService : Service() {
                         append(" qcarcamGraphicsKb=").append(captureRuntime.getOrElse(4) { -1 })
                         append(" systemAvailableBytes=").append(systemMemory.availMem)
                         append(" systemLowMemory=").append(systemMemory.lowMemory)
+                        poolState?.let {
+                            append(" bufferBudgetBytes=").append(it.budgetBytes)
+                            append(" bufferAllocatedBytes=").append(it.allocatedCapacityBytes)
+                            append(" bufferLeasedBytes=").append(it.leasedPayloadBytes)
+                            append(" bufferLiveLeases=").append(it.liveLeases)
+                        }
                         append(" thermalStatus=").append(getSystemService(PowerManager::class.java)?.currentThermalStatus ?: -1)
                         append(" internalFreeBytes=").append(filesDir.usableSpace)
                         append(" recorderFpsCap=").append(captureRuntime.getOrElse(5) { -1 })
@@ -529,11 +640,25 @@ class DashcamService : Service() {
                             append(" maxGapMs=").append(c?.maxGapMs?.toInt() ?: 0)
                             append(" outFrames=").append(encoder?.outputFrames ?: 0)
                             append(" outBytes=").append(encoder?.outputBytes ?: 0)
-                            append(" outAgeMs=").append(encoder?.lastOutputElapsedMs?.let { elapsed - it } ?: -1)
+                            append(" outAgeMs=").append(encoder?.lastOutputElapsedMs?.let(::ageMs) ?: -1)
                             append(" segments=").append(encoder?.completedSegments ?: 0)
                             append(" drainAlive=").append(encoder?.drainAlive ?: false)
+                            encoder?.writerSnapshot()?.let { queue ->
+                                append(" writerOperation=").append(encoder.writerOperation)
+                                append(" writerOperationAgeMs=").append(ageMs(encoder.writerOperationStartedElapsedMs))
+                                append(" writerQueueBytes=").append(queue.retainedBytes)
+                                append(" writerQueueFrames=").append(queue.retainedSamples)
+                                append(" writerQueueAgeMs=").append(queue.oldestAgeMs)
+                                append(" writerPeakBytes=").append(queue.maxRetainedBytes)
+                                append(" writerPeakFrames=").append(queue.maxRetainedSamples)
+                                append(" writerRejected=").append(queue.rejected)
+                                append(" writerQueuedDiscarded=").append(queue.discarded)
+                                append(" writerStopped=").append(queue.stopped)
+                            }
                             append(" operation=").append(encoder?.operation ?: "none")
-                            append(" operationAgeMs=").append(encoder?.let { elapsed - it.operationStartedElapsedMs } ?: -1)
+                            append(" operationAgeMs=").append(encoder?.operationStartedElapsedMs?.let(::ageMs) ?: -1)
+                            append(" codecFailed=").append(encoder?.codecFailed ?: false)
+                            append(" failureOperation=").append(encoder?.failureOperation ?: "none")
                             append(" error=").append(c?.error?.replace(' ', '_') ?: "none")
                             if (stages.size >= 46) {
                                 append(" stageUs[get/copy/upload/draw/swap/hold/sync/pboWait/map/tex/makeCurrent/release/unmap]=")
@@ -544,6 +669,44 @@ class DashcamService : Service() {
                                 append(stages.getOrElse(18) { 0 }).append('/')
                                 append(stages.getOrElse(10) { 0 }).append('/')
                                 append(stages.getOrElse(12) { 0 })
+                            }
+                            if (stages.size >= 51) {
+                                fun delta(index:Int)=(stages[index]-(oldStages?.getOrNull(index) ?: 0L)).coerceAtLeast(0L)
+                                append(" sourceNoCapacityDelta=").append(delta(47))
+                                append(" sourceUploadsDelta=").append(delta(48))
+                                append(" acceptedOffersDelta=").append(delta(49))
+                                append(" cancelledReservationsDelta=").append(delta(50))
+                            }
+                            if (stages.size >= 56) {
+                                fun delta(index: Int) = (stages[index] - (oldStages?.getOrElse(index) { 0 } ?: 0)).coerceAtLeast(0L)
+                                val copies = delta(55)
+                                append(" outputThreadCpuAvgUs=").append(stageUs(stages, oldStages, 51))
+                                append(" outputThreadCpuSamples=").append(delta(52))
+                                append(" privateCopyWallAvgUs=").append(if (copies > 0) delta(53) / copies / 1_000 else 0)
+                                append(" privateCopyThreadCpuAvgUs=").append(if (copies > 0) delta(54) / copies / 1_000 else 0)
+                                append(" privateCopySamples=").append(copies)
+                            }
+                            if (stages.size >= 60) {
+                                val phase = stages[56].toInt()
+                                val name = when (phase) {
+                                    0 -> "idle"
+                                    1 -> "wait_sync"
+                                    2 -> "draw"
+                                    3 -> "swap"
+                                    4 -> "finish"
+                                    5 -> "detach"
+                                    6 -> "bind"
+                                    7 -> "fence_submit"
+                                    else -> "unknown"
+                                }
+                                val since = stages[57]
+                                // Native phase timestamps use CLOCK_MONOTONIC, like nanoTime.
+                                val phaseAgeMs = if (phase == 0) 0L else if (since > 0)
+                                    ((System.nanoTime() - since).coerceAtLeast(0L) / 1_000_000) else -1L
+                                append(" outputPhase=").append(name)
+                                append(" outputPhaseAgeMs=").append(phaseAgeMs)
+                                append(" outputPhaseGeneration=").append(stages[59])
+                                append(" outputLastEglError=0x").append(stages[58].toString(16))
                             }
                             if (encoder != null) {
                                 val oldMux = previousMux[id] ?: (0L to 0L)
@@ -577,17 +740,170 @@ class DashcamService : Service() {
         }
     }
 
-    private fun recoverFromCameraFailure(reason: String) {
+    private fun cameraLabel(input: Int): String = GCamLanguage.string(this, when (input) {
+        0 -> R.string.gcam_left
+        1 -> R.string.gcam_right
+        2 -> R.string.gcam_front
+        else -> R.string.gcam_rear
+    })
+
+    private fun recoveringCameraStatus(input: Int): String =
+        GCamLanguage.string(this, R.string.gcam_recovering_one_camera, cameraLabel(input)) +
+            " · ${(config.cameraIds.size-1).coerceAtLeast(0)}/${config.cameraIds.size}"
+
+    /** These are shared failures, not a reason to keep retrying just one slot. */
+    private fun singleEncoderSharedFailure(input:Int,remote:IQCarCamCapture):String? {
+        val now=SystemClock.elapsedRealtime()
+        val states=encoders.values.map {EncoderRecoveryHealth(it.inputId,it.drainAlive,it.storageFailed,
+            it.codecFailed,if(it.hasLiveBufferedBacklog(now))maxOf(1,it.outputFrames) else it.outputFrames,
+            if(it.hasLiveBufferedBacklog(now))it.lastEncodedElapsedMs else it.lastOutputElapsedMs)}
+        val block=isolatedEncoderRecoveryBlock(input,config.cameraIds,states,
+            capture===remote && remote.asBinder().isBinderAlive,SystemClock.elapsedRealtime()) ?: return null
+        return when(block.reason) {
+            EncoderRecoveryBlock.Reason.CAPTURE -> "Сервис камер отключился"
+            EncoderRecoveryBlock.Reason.OWNERSHIP -> "Изменился состав записывающих камер"
+            EncoderRecoveryBlock.Reason.STORAGE -> encoders[requireNotNull(block.inputId)]?.failureMessage ?:
+                "Ошибка накопителя камеры ${block.inputId}"
+            EncoderRecoveryBlock.Reason.OTHER_CHANNEL -> encoders[requireNotNull(block.inputId)]?.failureMessage ?:
+                "Нет стабильной записи камеры ${block.inputId}"
+        }
+    }
+
+    private class LocalEncoderOwnerChanged:IllegalStateException("Camera owner changed during isolated recovery")
+
+    /** Only a runtime codec failure is local. USB, Binder and multi-camera failures
+     * still use the existing full-session recovery path. Called on the main thread. */
+    private fun recoverSingleEncoder(failed: CameraEncoder, reason: String): Boolean {
+        val id = failed.inputId
+        val remote = capture ?: return false
+        if (destroyed || stopping || starting || recoveryPending || recoveringEncoder != null ||
+            recoveryJob?.isActive == true || !failed.codecFailed || failed.storageFailed ||
+            encoders[id] !== failed || config.cameraIds.size < 2 || !remote.asBinder().isBinderAlive) return false
+        if(singleEncoderSharedFailure(id,remote)!=null)return false
+        val session = recordingSessionId
+        recordRecoverySnapshot("encoder", reason)
+        StorageDiagnostics.capture(this, "encoder_recovery:$reason")
+        val attempts = noteRecoveryFailure()
+        lastRecoveryReason = reason
+        recoveringEncoder = id
+        val status = recoveringCameraStatus(id)
+        publish(currentState.copy(recording = true, status = status))
+        postRecoveryNotice(status)
+        RecorderDiagnostics.record(this,
+            "encoder_recovery_scheduled session=$session input=$id attempts15m=$attempts " +
+                "failureOperation=${failed.failureOperation} reason=$reason")
+        encoderRecoveryJob = scope.launch(Dispatchers.Main) {
+            val recoveryScope = this
+            fun active()=recoveryScope.isActive && !stopping && !destroyed &&
+                recordingSessionId==session && recoveringEncoder==id
+            fun sharedHealthy()=singleEncoderSharedFailure(id,remote)==null
+            var failures=0
+            var localAttempt=0L
+            try {
+                while(active()) {
+                    singleEncoderSharedFailure(id,remote)?.let {error(it)}
+                    localAttempt++
+                    try {
+                        // A previous failed start may have changed the slot to its candidate.
+                        val owner=requireNotNull(encoders[id])
+                        val result=CompletableDeferred<Result<CameraEncoder?>>()
+                        encoderWorker.execute {
+                            result.complete(runCatching {
+                                replaceTrackedEncoder(encoders,id,owner,
+                                    isActive={active() && sharedHealthy()},
+                                    close={encoder ->
+                                        encoder.stop()
+                                        check(!encoder.storageFailed) {"Storage error while closing camera $id"}
+                                    },
+                                    create={errors.remove(id);newEncoder(id)},
+                                    start={candidate ->
+                                        if(!active())throw kotlinx.coroutines.CancellationException()
+                                        startEncoder(candidate,remote)
+                                    })
+                            })
+                        }
+                        val replacement=result.await().getOrThrow()
+                        if(!active())return@launch
+                        singleEncoderSharedFailure(id,remote)?.let {error(it)}
+                        if(replacement==null)throw LocalEncoderOwnerChanged()
+                        replacement.failureMessage?.let {errors[id]=it}
+                        val startedAt=SystemClock.elapsedRealtime()
+                        RecorderDiagnostics.record(this@DashcamService,
+                            "encoder_recovery_started session=$session input=$id localAttempt=$localAttempt otherInputs=${(encoders.keys-id).sorted()}")
+                        while(active()) {
+                            singleEncoderSharedFailure(id,remote)?.let {error(it)}
+                            if(encoders[id]!==replacement)throw LocalEncoderOwnerChanged()
+                            check(replacement.drainAlive && !replacement.codecFailed) {
+                                replacement.failureMessage ?: "Encoder $id stopped after restart"
+                            }
+                            val elapsed=SystemClock.elapsedRealtime()-startedAt
+                            if(elapsed>=5_000 && replacement.outputFrames>=3 &&
+                                SystemClock.elapsedRealtime()-replacement.lastOutputElapsedMs<2_000) {
+                                RecorderDiagnostics.record(this@DashcamService,
+                                    "encoder_recovered session=$session input=$id localAttempt=$localAttempt elapsedMs=$elapsed " +
+                                        "outputFrames=${replacement.outputFrames} otherInputs=${(encoders.keys-id).sorted()}")
+                                postRecoveryNotice(GCamLanguage.string(this@DashcamService,
+                                    R.string.gcam_one_camera_recovered,cameraLabel(id)),recovered=true)
+                                return@launch
+                            }
+                            check(elapsed<15_000 || replacement.hasLiveBufferedBacklog(SystemClock.elapsedRealtime())) {
+                                "No stable recorded frames after restarting camera $id"
+                            }
+                            delay(250)
+                        }
+                    }catch(cancelled:kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    }catch(changed:LocalEncoderOwnerChanged) {
+                        throw changed
+                    }catch(failure:Throwable) {
+                        if(!active())return@launch
+                        singleEncoderSharedFailure(id,remote)?.let {error(it)}
+                        // Standalone retains its existing full-session fallback.
+                        if(!RecorderHost.embedded(this@DashcamService))throw failure
+                        failures=(failures+1).coerceAtMost(4)
+                        val waitMs=localEncoderRetryDelayMs(failures)
+                        errors[id]=failure.message ?: reason
+                        withContext(Dispatchers.IO) {
+                            RecorderDiagnostics.recordException(this@DashcamService,
+                                "encoder_recovery_retry session=$session input=$id localAttempt=$localAttempt " +
+                                    "delayMs=$waitMs retained=true fallback=none otherInputs=${(encoders.keys-id).sorted()}",failure)
+                        }
+                        // No lifecycle worker is held during backoff/cooldown. The same slot
+                        // stays owned, including a candidate whose native start failed.
+                        delay(waitMs)
+                    }
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                RecorderDiagnostics.recordException(this@DashcamService,
+                    "encoder_recovery_failed session=$session input=$id fallback=full_session", failure)
+                if (!stopping && !destroyed && recordingSessionId == session) {
+                    recoveringEncoder = null
+                    encoderRecoveryJob = null
+                    recoverFromCameraFailure(failure.message ?: reason, recordedAttempt = attempts)
+                }
+            } finally {
+                if (recordingSessionId == session && recoveringEncoder == id) {
+                    recoveringEncoder = null
+                    encoderRecoveryJob = null
+                }
+            }
+        }
+        return true
+    }
+
+    private fun recoverFromCameraFailure(reason: String, recordedAttempt: Int? = null) {
         if (destroyed || stopping || recoveryJob?.isActive == true) return
         // Do not query MediaProvider on the main thread during a possible USB hang.
         if (config.storage == RecordingStorage.EXTERNAL &&
             (encoders.values.any { it.storageFailed } || StorageRecoveryPolicy.isStorageFailure(reason))) {
-            recoverFromStorageFailure(reason)
+            recoverFromStorageFailure(reason, recordedAttempt)
             return
         }
         recordRecoverySnapshot("camera", reason)
         StorageDiagnostics.capture(this, "camera_recovery:$reason")
-        val attemptsInWindow = noteRecoveryFailure()
+        val attemptsInWindow = recordedAttempt ?: noteRecoveryFailure()
         val delayMs = RECOVERY_DELAYS_MS[(attemptsInWindow - 1).coerceIn(0, RECOVERY_DELAYS_MS.lastIndex)]
         val selected = config
         val message = "Сбой записи: $reason. Перезапуск камер через ${delayMs / 1_000} с " +
@@ -623,10 +939,10 @@ class DashcamService : Service() {
         }
     }
 
-    private fun recoverFromStorageFailure(reason: String) {
+    private fun recoverFromStorageFailure(reason: String, recordedAttempt: Int? = null) {
         if (destroyed || stopping || recoveryJob?.isActive == true) return
         val selected = config
-        val attempts = noteRecoveryFailure()
+        val attempts = recordedAttempt ?: noteRecoveryFailure()
         val delayMs = StorageRecoveryPolicy.delayMs(attempts)
         val message = "USB-накопитель недоступен. Запись возобновится после его подключения."
         lastRecoveryReason = reason
@@ -646,17 +962,24 @@ class DashcamService : Service() {
         }
     }
 
+    // Read the event timestamp before the current clock: concurrently received frames
+    // must never appear to have a negative age in the diagnostic snapshot.
+    private fun ageMs(timestamp: Long): Long = (SystemClock.elapsedRealtime() - timestamp).coerceAtLeast(0)
+
     private fun recordRecoverySnapshot(kind: String, reason: String) {
-        val now = SystemClock.elapsedRealtime()
         RecorderDiagnostics.record(this, buildString {
             append("recording_recovery_snapshot kind=$kind session=$recordingSessionId reason=$reason")
             append(" capture=[$lastCaptureSnapshot]")
             encoders.toSortedMap().forEach { (id, encoder) ->
                 append(" | input=$id operation=${encoder.operation}")
-                append(" operationAgeMs=${now - encoder.operationStartedElapsedMs}")
-                append(" uri=${encoder.segmentUri} outFrames=${encoder.outputFrames}")
-                append(" outAgeMs=${now - encoder.lastOutputElapsedMs}")
+                append(" operationAgeMs=${ageMs(encoder.operationStartedElapsedMs)}")
+                append(" outFrames=${encoder.outputFrames}")
+                val diagnostic=encoder.diagnosticSnapshot()
+                append(" diagInstance=").append(diagnostic.instance)
+                append(" diagActive=[").append(RecorderStageLogSampler.activeDescription(diagnostic)).append(']')
+                append(" outAgeMs=${ageMs(encoder.lastOutputElapsedMs)}")
                 append(" drainAlive=${encoder.drainAlive} storageFailed=${encoder.storageFailed}")
+                append(" codecFailed=${encoder.codecFailed} failureOperation=${encoder.failureOperation}")
             }
         })
     }
@@ -676,6 +999,7 @@ class DashcamService : Service() {
             else prefs.getLong(RECOVERY_FREQUENT_UNTIL, 0L)
         prefs.edit()
             .putString(RECOVERY_EVENTS, recent.joinToString(","))
+            .putLong(RECOVERY_LAST_FAILURE, now)
             .putLong(RECOVERY_WARNING_UNTIL, now + RECOVERY_WARNING_LIFETIME_MS)
             .putLong(RECOVERY_FREQUENT_UNTIL, frequentUntil)
             .apply()
@@ -702,7 +1026,7 @@ class DashcamService : Service() {
 
     private fun startupFailed(message: String) {
         starting = false
-        UsbConnectionTest.recorderBusy = false
+        RecorderRepository.busy = false
         publish(RecorderState(status = message))
         if (recoveryPending) {
             RecorderDiagnostics.record(this, "recording_recovery_failed message=$message")
@@ -715,6 +1039,9 @@ class DashcamService : Service() {
     }
 
     private fun stopRecording(reason: String? = null, keepServiceAlive: Boolean = false): CompletableDeferred<Unit> {
+        engineCheckpointSource?.stop()
+        encoderRecoveryJob?.cancel(); encoderRecoveryJob = null
+        recoveringEncoder = null
         if (!keepServiceAlive) {
             recoveryJob?.cancel(); recoveryJob = null
             recoveryPending = false
@@ -726,6 +1053,8 @@ class DashcamService : Service() {
         }
         stopping = true
         starting = false
+        // Atomic intent is immediate even if local cleanup currently holds the worker.
+        encoders.values.forEach {it.requestStop()}
         stopKeepsService = keepServiceAlive
         stopReason = reason
         val completed = CompletableDeferred<Unit>()
@@ -745,50 +1074,85 @@ class DashcamService : Service() {
         }, 8_000)
         encoderWorker.execute {
             stampSource?.stop(); stampSource = null
-            val closing = encoders.values.toList()
-            closing.forEach { it.requestStop() }
-            closing.forEach { encoder ->
-                runCatching { encoder.stop() }.onFailure {
-                    RecorderDiagnostics.recordException(this,
-                        "encoder_stop_error input=${encoder.inputId} type=${it.javaClass.name} message=${it.message}", it)
-                }
-            }
-            encoders.clear()
-            RecorderDiagnostics.record(this, "recording_stopped")
-            mainHandler.post {
-                unbindCapture()
-                stopping = false
-                UsbConnectionTest.recorderBusy = false
-                if (!destroyed) {
-                    publish(RecorderState(usedBytes = currentState.usedBytes,
-                        status = stopReason ?: "Регистратор остановлен"))
-                    if (stopKeepsService) {
-                        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID,
-                            notification(stopReason ?: "Перезапуск камер…"))
-                    } else {
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
-                    }
-                }
-                completed.complete(Unit)
-            }
+            finishStoppingEncoders(completed)
         }
         return completed
     }
 
+    /** A detach timeout must keep the slot owned and block the next session. */
+    private fun finishStoppingEncoders(completed: CompletableDeferred<Unit>) {
+        val closing = encoders.values.toList()
+        closing.forEach { it.requestStop() }
+        val closed = closeEncoderSlots(encoders, close = { it.stop() }) { input, failure ->
+            RecorderDiagnostics.recordException(this,
+                "encoder_stop_error input=$input retained=true " +
+                    "type=${failure.javaClass.name} message=${failure.message}", failure)
+        }
+        if (!closed) {
+            mainHandler.postDelayed({
+                if (!destroyed) publish(RecorderState(usedBytes = currentState.usedBytes,
+                    status = GCamLanguage.string(this, R.string.gcam_waiting_encoder_detachment)))
+                encoderWorker.execute { finishStoppingEncoders(completed) }
+            }, 2_000)
+            return
+        }
+        samplePool?.close();samplePool=null
+        RecorderDiagnostics.record(this, "recording_stopped")
+        mainHandler.post {
+            unbindCapture()
+            stopping = false
+            RecorderRepository.busy = false
+            if (!destroyed) {
+                publish(RecorderState(usedBytes = currentState.usedBytes,
+                    status = stopReason ?: "Регистратор остановлен"))
+                if (stopKeepsService) {
+                    getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID,
+                        notification(stopReason ?: "Перезапуск камер…"))
+                } else {
+                    stopStageDiagnostics()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+            }
+            completed.complete(Unit)
+        }
+    }
+
     override fun onDestroy() {
         destroyed = true
+        engineCheckpointSource?.stop();engineCheckpointSource=null
+        stopStageDiagnostics()
         storageReceiver?.let { runCatching { unregisterReceiver(it) } }
         storageReceiver = null
         if (!stopping && (starting || encoders.isNotEmpty() || captureBound)) stopRecording()
         scope.cancel()
-        encoderWorker.shutdown() // Queued finalization survives coroutine cancellation.
+        // Native detach can require a retry; keep its worker until all targets close.
+        if (stopping) stopCompletion.invokeOnCompletion { encoderWorker.shutdown() }
+        else encoderWorker.shutdown()
         super.onDestroy()
     }
 
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
+        val cap=RecorderBufferPolicy.trimBudget(level)
+        if(cap<RecorderBufferPolicy.MAX_BYTES) {
+            bufferPressureBudget=cap
+            bufferPressureUntil=SystemClock.elapsedRealtime()+30_000L
+            samplePool?.let {it.setBudget(cap);it.trim(0)}
+        }
         if (encoders.isNotEmpty()) RecorderDiagnostics.record(this, "trim_memory level=$level")
+    }
+
+    private fun updateBufferBudget(memory:ActivityManager.MemoryInfo?=null):EncodedSamplePool.Snapshot? {
+        val pool=samplePool ?: return null
+        val info=memory ?: ActivityManager.MemoryInfo().also {
+            getSystemService(ActivityManager::class.java).getMemoryInfo(it)
+        }
+        val state=pool.snapshot()
+        val pressure=if(SystemClock.elapsedRealtime()<bufferPressureUntil)bufferPressureBudget else RecorderBufferPolicy.MAX_BYTES
+        pool.setBudget(minOf(pressure,RecorderBufferPolicy.budget(info.availMem,state.leasedPayloadBytes,info.lowMemory)))
+        if(info.lowMemory)pool.trim(0)
+        return pool.snapshot()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -801,7 +1165,12 @@ class DashcamService : Service() {
 
     private fun publish(state: RecorderState) {
         if (recoveryWarning != null && savedRecoveryWarning() == null) recoveryWarning = null
-        val visibleState = state.copy(warning = recoveryWarning)
+        val warningAt = if (recoveryWarning == null) 0L else {
+            val prefs = getSharedPreferences(RECOVERY_PREFS, MODE_PRIVATE)
+            prefs.getLong(RECOVERY_LAST_FAILURE, 0L).takeIf { it > 0 }
+                ?: prefs.getString(RECOVERY_EVENTS, null).orEmpty().split(',').lastOrNull()?.toLongOrNull() ?: 0L
+        }
+        val visibleState = state.copy(warning = recoveryWarning, warningAtMs = warningAt)
         currentState = visibleState
         RecorderRepository.update(visibleState)
         val cameras = visibleState.cameras.values.sortedBy(CameraRecordingState::inputId)
@@ -810,6 +1179,7 @@ class DashcamService : Service() {
             putExtra(EXTRA_USED_BYTES, visibleState.usedBytes)
             putExtra(EXTRA_STATUS, visibleState.status)
             putExtra(EXTRA_WARNING, visibleState.warning)
+            putExtra(EXTRA_WARNING_AT, visibleState.warningAtMs)
             putExtra(EXTRA_CAMERA_IDS, cameras.map(CameraRecordingState::inputId).toIntArray())
             putExtra(EXTRA_FRAMES, cameras.map(CameraRecordingState::frames).toLongArray())
             putExtra(EXTRA_FPS, cameras.map(CameraRecordingState::fps).toDoubleArray())
@@ -837,11 +1207,11 @@ class DashcamService : Service() {
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(
             NotificationChannel(CHANNEL_ID,
-                GCamLanguage.text(this, "Видеорегистратор", "Dashcam"), NotificationManager.IMPORTANCE_LOW)
+                GCamLanguage.string(this, R.string.gcam_dashcam), NotificationManager.IMPORTANCE_LOW)
         )
         manager.createNotificationChannel(
             NotificationChannel(ERROR_CHANNEL_ID,
-                GCamLanguage.text(this, "Сбои записи", "Recording failures"), NotificationManager.IMPORTANCE_HIGH)
+                GCamLanguage.string(this, R.string.gcam_recording_failures), NotificationManager.IMPORTANCE_HIGH)
         )
     }
 
@@ -849,10 +1219,10 @@ class DashcamService : Service() {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val notification = NotificationCompat.Builder(this, ERROR_CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.mipmap.gcam_ic_launcher)
             .setContentTitle(if (recovered)
-                GCamLanguage.text(this, "gCam — запись восстановлена", "gCam — recording recovered")
-                else GCamLanguage.text(this, "gCam — сбой записи", "gCam — recording failure"))
+                GCamLanguage.string(this, R.string.gcam_gcam_recording_recovered)
+                else GCamLanguage.string(this, R.string.gcam_gcam_recording_failure))
             .setContentText(GCamLanguage.display(this, message))
             .setStyle(NotificationCompat.BigTextStyle().bigText(GCamLanguage.display(this, message)))
             .setContentIntent(open)
@@ -871,12 +1241,12 @@ class DashcamService : Service() {
         val stop = PendingIntent.getService(this, 1, Intent(this, DashcamService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle(GCamLanguage.text(this, "gCam — камеры 360°", "gCam — 360° cameras"))
+            .setSmallIcon(R.mipmap.gcam_ic_launcher)
+            .setContentTitle(GCamLanguage.string(this, R.string.gcam_gcam_360_cameras))
             .setContentText(GCamLanguage.display(this, text))
             .setOngoing(true)
             .setContentIntent(open)
-            .addAction(0, GCamLanguage.text(this, "Остановить", "Stop"), stop)
+            .addAction(0, GCamLanguage.string(this, R.string.gcam_stop), stop)
             .build()
     }
 
@@ -888,6 +1258,7 @@ class DashcamService : Service() {
         private const val RECOVERY_PREFS = "recorder_recovery"
         private const val RECOVERY_EVENTS = "events"
         private const val RECOVERY_WARNING_UNTIL = "warning_until"
+        private const val RECOVERY_LAST_FAILURE = "last_failure"
         private const val RECOVERY_FREQUENT_UNTIL = "frequent_until"
         private const val RECOVERY_WINDOW_MS = 15 * 60_000L
         private const val RECOVERY_WARNING_LIFETIME_MS = 6 * 60 * 60_000L
@@ -926,6 +1297,7 @@ class DashcamService : Service() {
         private const val EXTRA_USED_BYTES = "used_bytes"
         private const val EXTRA_STATUS = "status"
         private const val EXTRA_WARNING = "warning"
+        private const val EXTRA_WARNING_AT = "warning_at"
         private const val EXTRA_CAMERA_IDS = "camera_ids"
         private const val EXTRA_FRAMES = "frames"
         private const val EXTRA_FPS = "fps"
@@ -994,7 +1366,8 @@ class DashcamService : Service() {
                 intent.getBooleanExtra(EXTRA_RECORDING, false), cameras,
                 intent.getLongExtra(EXTRA_USED_BYTES, 0),
                 intent.getStringExtra(EXTRA_STATUS) ?: "Регистратор остановлен",
-                intent.getStringExtra(EXTRA_WARNING)
+                intent.getStringExtra(EXTRA_WARNING),
+                intent.getLongExtra(EXTRA_WARNING_AT, 0L)
             )
         }
     }

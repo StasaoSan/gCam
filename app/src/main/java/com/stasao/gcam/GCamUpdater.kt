@@ -51,19 +51,18 @@ internal object GCamUpdater {
             require(Regex("v[0-9]+(?:\\.[0-9]+){1,3}").matches(tag)) { "Некорректный тег релиза" }
             if (!isNewer(tag.removePrefix("v"), installedVersion(context))) return@withContext null
 
-            val expectedName = "gCam_[$tag].apk"
             val assets = json.getJSONArray("assets")
-            val asset = (0 until assets.length())
-                .map { assets.getJSONObject(it) }
-                .firstOrNull { it.optString("name") == expectedName }
-                ?: throw IllegalStateException("В релизе $tag нет файла $expectedName")
+            val candidates = (0 until assets.length()).map { assets.getJSONObject(it) }
+            val assetName = GCamReleaseAssetNames.find(tag, candidates.map { it.optString("name") })
+                ?: throw IllegalStateException("В релизе $tag нет файла gCam-$tag.apk")
+            val asset = candidates.first { it.optString("name") == assetName }
             val size = asset.getLong("size")
             require(size in 1..MAX_APK_BYTES) { "Некорректный размер APK" }
             val digest = asset.optString("digest")
             require(Regex("sha256:[a-fA-F0-9]{64}").matches(digest)) { "У APK нет контрольной суммы SHA-256" }
             val downloadUrl = asset.getString("browser_download_url")
             val uri = Uri.parse(downloadUrl)
-            val expectedPath = "/$RELEASE_REPOSITORY/releases/download/$tag/$expectedName"
+            val expectedPath = "/$RELEASE_REPOSITORY/releases/download/$tag/$assetName"
             require(uri.scheme == "https" && uri.host == "github.com" &&
                 Uri.decode(uri.encodedPath) == expectedPath && uri.query == null
             ) { "Некорректный адрес APK" }
@@ -130,7 +129,7 @@ internal object GCamUpdater {
     }
 
     fun launchInstaller(context: Context, apk: File) {
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apk)
+        val uri = FileProvider.getUriForFile(context, RecorderHost.fileAuthority(context), apk)
         context.startActivity(Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, "application/vnd.android.package-archive")
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)

@@ -12,6 +12,8 @@ import androidx.core.content.ContextCompat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
+import kotlin.math.roundToInt
 
 /** Supplies a small, low-frequency text stamp; video pixels never enter Kotlin. */
 class RecorderStampSource(private val context: Context, private val config: RecorderConfig) {
@@ -19,6 +21,11 @@ class RecorderStampSource(private val context: Context, private val config: Reco
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
     @Volatile private var latestGps: Location? = null
     @Volatile private var latestNetwork: Location? = null
+    private val vehicleSession = UUID.randomUUID().toString()
+    @Volatile private var stopped = false
+    // This object is cheap; eager construction makes every start/stop generation explicit.
+    // Its shared worker is created only after an embedded speed sample is requested.
+    private val vehicleSpeedReader=LatestRecorderSpeedReader(::readVehicleSpeed,SystemClock::elapsedRealtime)
     private val listener = LocationListener { location ->
         val gps = location.provider == LocationManager.GPS_PROVIDER
         val previous = if (gps) latestGps else latestNetwork
@@ -28,7 +35,9 @@ class RecorderStampSource(private val context: Context, private val config: Reco
     }
 
     fun start() {
-        if (!config.stampGps && !config.stampSpeed) return
+        stopped = false
+        vehicleSpeedReader.start()
+        if (!requiresLocation(context, config)) return
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) !=
             PackageManager.PERMISSION_GRANTED) return
         for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
@@ -42,9 +51,13 @@ class RecorderStampSource(private val context: Context, private val config: Reco
     }
 
     fun stop() {
-        runCatching { locationManager.removeUpdates(listener) }
+        stopped = true
+        vehicleSpeedReader.stop()
+        if(requiresLocation(context,config))runCatching { locationManager.removeUpdates(listener) }
         latestGps = null
         latestNetwork = null
+        // The panel's telemetry lease expires after 3 seconds without another read.
+        // Stop never calls a possibly blocked provider or closes its in-flight client.
     }
 
     fun currentText(): String {
@@ -60,10 +73,36 @@ class RecorderStampSource(private val context: Context, private val config: Reco
                 else "GPS --"
         }
         if (config.stampSpeed) {
-            val recentSpeed = fresh(latestGps, 3_000_000_000L)
-            parts += if (recentSpeed?.hasSpeed() == true) "${(recentSpeed.speed * 3.6f).toInt().coerceAtLeast(0)} KM/H"
-                else "-- KM/H"
+            if (RecorderHost.embedded(context)) {
+                val speed = vehicleSpeed()
+                parts += speed?.let { "${it.roundToInt()} KM/H" } ?: "-- KM/H"
+            } else {
+                val recentSpeed = fresh(latestGps, 3_000_000_000L)
+                parts += if (recentSpeed?.hasSpeed() == true) "${(recentSpeed.speed * 3.6f).toInt().coerceAtLeast(0)} KM/H"
+                    else "-- KM/H"
+            }
         }
         return parts.joinToString("  ")
+    }
+
+    private fun vehicleSpeed(): Float? {
+        if (stopped) return null
+        return vehicleSpeedReader.sample()
+    }
+
+    private fun readVehicleSpeed(): LatestRecorderSpeedReader.Reading? {
+        if(stopped)return null
+        val client=context.contentResolver.acquireUnstableContentProviderClient(RecorderHost.telemetryUri) ?: return null
+        return client.use {
+            if(stopped)return@use null
+            val snapshot = client.call("vehicle_speed", vehicleSession, null) ?: return null
+            if (!snapshot.containsKey("speedKmh") || !snapshot.containsKey("sampledAtMs")) return null
+            LatestRecorderSpeedReader.Reading(snapshot.getFloat("speedKmh"),snapshot.getLong("sampledAtMs"))
+        }
+    }
+
+    companion object {
+        fun requiresLocation(context: Context, config: RecorderConfig): Boolean =
+            config.stampGps || (!RecorderHost.embedded(context) && config.stampSpeed)
     }
 }

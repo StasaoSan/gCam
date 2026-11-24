@@ -11,9 +11,11 @@ import java.security.MessageDigest
 internal object CaptureClientTrust {
     private const val ANHUD_PACKAGE = "com.g992.anhud"
     private const val BLIND_PACKAGE = "com.stasao.gblind"
+    private const val PANEL_PACKAGE = "com.stasao.gpanel"
     private const val ZONES_PACKAGE = "com.stasao.gzones"
     private const val TRUST_FILE = "anhud_camera_signer.sha256"
     private const val BLIND_TRUST_FILE = "gblind_camera_signer.sha256"
+    private const val PANEL_TRUST_FILE = "gpanel_camera_signer.sha256"
     private const val ZONES_TRUST_FILE = "gzones_camera_signer.sha256"
 
     data class Status(
@@ -25,6 +27,7 @@ internal object CaptureClientTrust {
 
     fun status(context: Context): Status = statusFor(context, ANHUD_PACKAGE, TRUST_FILE)
     fun blindStatus(context: Context): Status = statusFor(context, BLIND_PACKAGE, BLIND_TRUST_FILE)
+    fun panelStatus(context: Context): Status = statusFor(context, PANEL_PACKAGE, PANEL_TRUST_FILE)
 
     private fun statusFor(context: Context, appPackage: String, fileName: String): Status {
         val signer = currentSigner(context, appPackage) ?: return Status(false, false, false, false)
@@ -36,6 +39,7 @@ internal object CaptureClientTrust {
 
     fun approve(context: Context): Boolean = approveFor(context, ANHUD_PACKAGE, TRUST_FILE)
     fun approveBlind(context: Context): Boolean = approveFor(context, BLIND_PACKAGE, BLIND_TRUST_FILE)
+    fun approvePanel(context: Context): Boolean = approveFor(context, PANEL_PACKAGE, PANEL_TRUST_FILE)
 
     private fun approveFor(context: Context, appPackage: String, fileName: String): Boolean {
         val signer = currentSigner(context, appPackage) ?: return false
@@ -53,12 +57,7 @@ internal object CaptureClientTrust {
 
     fun revoke(context: Context) = trustFile(context, TRUST_FILE).delete()
     fun revokeBlind(context: Context) = trustFile(context, BLIND_TRUST_FILE).delete()
-
-    fun isBlindCaller(context: Context, uid: Int): Boolean =
-        context.packageManager.getPackagesForUid(uid)?.contains(BLIND_PACKAGE) == true
-
-    fun isZonesCaller(context: Context, uid: Int): Boolean =
-        context.packageManager.getPackagesForUid(uid)?.contains(ZONES_PACKAGE) == true
+    fun revokePanel(context: Context) = trustFile(context, PANEL_TRUST_FILE).delete()
 
     fun enforceCaller(context: Context, callingUid: Int, transactionCode: Int) {
         if (callingUid == Process.myUid()) return
@@ -78,29 +77,25 @@ internal object CaptureClientTrust {
         if (!externalHudCall && !blindReport) throw SecurityException("Записью может управлять только gCam")
         val manager = context.packageManager
         // Check the actual Binder UID first; an Intent extra or a claimed package name is forgeable.
-        val blind = isBlindCaller(context, callingUid)
-        val zones = isZonesCaller(context, callingUid)
-        val appPackage = if (blind) BLIND_PACKAGE else if (zones) ZONES_PACKAGE else ANHUD_PACKAGE
-        val fileName = if (blind) BLIND_TRUST_FILE else if (zones) ZONES_TRUST_FILE else TRUST_FILE
-        if (manager.getPackagesForUid(callingUid)?.contains(appPackage) != true ||
-            (blindReport && !blind)) {
+        val packages = manager.getPackagesForUid(callingUid).orEmpty()
+        val client = CaptureClientAccess.clientFor(packages.asList())
+        val (appPackage, fileName) = when {
+            PANEL_PACKAGE in packages -> PANEL_PACKAGE to PANEL_TRUST_FILE
+            client == CaptureClientAccess.Client.BLIND -> BLIND_PACKAGE to BLIND_TRUST_FILE
+            client == CaptureClientAccess.Client.ZONES -> ZONES_PACKAGE to ZONES_TRUST_FILE
+            else -> ANHUD_PACKAGE to TRUST_FILE
+        }
+        if (appPackage !in packages ||
+            (blindReport && !CaptureClientAccess.canReportBlindHealth(client))) {
             throw SecurityException("Доступ к камерам gCam разрешён только доверенным приложениям")
         }
-        if (blind && !blindReport && transactionCode !in setOf(
+        if (!CaptureClientAccess.canManageProjection(client) && !blindReport && transactionCode !in setOf(
                 IQCarCamCapture.Stub.TRANSACTION_startHudV2,
                 IQCarCamCapture.Stub.TRANSACTION_configureHudV2,
                 IQCarCamCapture.Stub.TRANSACTION_stopHud,
                 IQCarCamCapture.Stub.TRANSACTION_hudStatus,
                 IQCarCamCapture.Stub.TRANSACTION_hudStats)) {
             throw SecurityException("gBlind не может управлять проекцией")
-        }
-        if (zones && transactionCode !in setOf(
-                IQCarCamCapture.Stub.TRANSACTION_startHudV2,
-                IQCarCamCapture.Stub.TRANSACTION_configureHudV2,
-                IQCarCamCapture.Stub.TRANSACTION_stopHud,
-                IQCarCamCapture.Stub.TRANSACTION_hudStatus,
-                IQCarCamCapture.Stub.TRANSACTION_hudStats)) {
-            throw SecurityException("Внешнему клиенту доступен только видеопросмотр")
         }
         if (manager.checkSignatures(callingUid, Process.myUid()) == PackageManager.SIGNATURE_MATCH) {
             return // Existing debug builds signed by the same Android debug key.

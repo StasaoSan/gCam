@@ -39,11 +39,11 @@ class GCamCameraOverlayService : Service() {
         val notifications = getSystemService(NotificationManager::class.java)
         notifications.createNotificationChannel(
             NotificationChannel(CHANNEL_ID,
-                GCamLanguage.text(this, "Плавающие камеры", "Floating cameras"), NotificationManager.IMPORTANCE_LOW)
+                GCamLanguage.string(this, R.string.gcam_floating_cameras), NotificationManager.IMPORTANCE_LOW)
         )
         startForeground(NOTIFICATION_ID, Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setContentTitle(GCamLanguage.text(this, "gCam: камеры поверх окон", "gCam: floating cameras"))
+            .setContentTitle(GCamLanguage.string(this, R.string.gcam_gcam_floating_cameras))
             .setOngoing(true)
             .build())
         windows = getSystemService(WINDOW_SERVICE) as WindowManager
@@ -97,8 +97,7 @@ class GCamCameraOverlayService : Service() {
         }
         val title = TextView(this).apply {
             titleView = this
-            text = GCamLanguage.text(this@GCamCameraOverlayService,
-                "⋮⋮  Камеры 360°", "⋮⋮  360° Cameras")
+            text = GCamLanguage.string(this@GCamCameraOverlayService, R.string.gcam_message_360_cameras)
             setTextColor(Color.WHITE)
             textSize = 14f
             gravity = Gravity.CENTER_VERTICAL
@@ -108,8 +107,7 @@ class GCamCameraOverlayService : Service() {
         val close = TextView(this).apply {
             closeView = this
             text = "✕"
-            contentDescription = GCamLanguage.text(this@GCamCameraOverlayService,
-                "Закрыть плавающие камеры", "Close floating cameras")
+            contentDescription = GCamLanguage.string(this@GCamCameraOverlayService, R.string.gcam_close_floating_cameras)
             setTextColor(Color.WHITE)
             textSize = 19f
             gravity = Gravity.CENTER
@@ -168,9 +166,8 @@ class GCamCameraOverlayService : Service() {
     }
 
     private fun updateLanguage() {
-        titleView?.text = GCamLanguage.text(this, "⋮⋮  Камеры 360°", "⋮⋮  360° Cameras")
-        closeView?.contentDescription = GCamLanguage.text(this,
-            "Закрыть плавающие камеры", "Close floating cameras")
+        titleView?.text = GCamLanguage.string(this, R.string.gcam_message_360_cameras)
+        closeView?.contentDescription = GCamLanguage.string(this, R.string.gcam_close_floating_cameras)
         val labels = if (GCamLanguage.isEnglish(this)) listOf("Left", "Right", "Front", "Rear")
             else listOf("Левая", "Правая", "Перед", "Зад")
         cameraLabels.forEachIndexed { index, label -> label?.text = labels[index] }
@@ -178,7 +175,7 @@ class GCamCameraOverlayService : Service() {
             getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID,
                 Notification.Builder(this, CHANNEL_ID)
                     .setSmallIcon(android.R.drawable.ic_menu_camera)
-                    .setContentTitle(GCamLanguage.text(this, "gCam: камеры поверх окон", "gCam: floating cameras"))
+                    .setContentTitle(GCamLanguage.string(this, R.string.gcam_gcam_floating_cameras))
                     .setOngoing(true).build())
         }
     }
@@ -263,9 +260,11 @@ private class FloatingCameraCapture(context: Context) {
 
     private fun queueStart(input: Int, surface: Surface) {
         executor.execute {
-            val client = synchronized(this) { if (!closed && surfaces[input] === surface) remote else null }
-            if (client != null && surface.isValid) runCatching {
-                client.startHudV2(6 + input, surface, input, 15, 0f, 0f, 1f, 1f, 0f, 0, 0)
+            synchronized(this@FloatingCameraCapture) {
+                val client = remote
+                if (!closed && surfaces[input] === surface && client != null && surface.isValid) {
+                    runCatching { PreviewCameraOutputs.start(client, surface, input, 15) }
+                }
             }
         }
     }
@@ -273,7 +272,7 @@ private class FloatingCameraCapture(context: Context) {
     private fun queueStop(input: Int, surface: Surface) {
         executor.execute {
             val client = synchronized(this) { remote }
-            runCatching { client?.stopHud(6 + input) }
+            runCatching { PreviewCameraOutputs.stop(client, surface, input) }
             surface.release()
         }
     }

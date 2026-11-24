@@ -22,6 +22,7 @@
 #include <sys/system_properties.h>
 #include <linux/dma-buf.h>
 #include <unistd.h>
+#include "recorder_load_policy.h"
 
 #define TAG "gcam_qcarcam"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
@@ -31,7 +32,7 @@
 #define STRIDE_BYTES (W * 2u)
 #define BYTES (W * H * 2u)
 #define NBUF 3u
-#define HUD_STREAMS 13 /* 0/1: projection, 2/3: cluster, 4/5: editors, 6..9: gCam preview, 10/11: side, 12: rear */
+#define HUD_STREAMS 14 /* 0/1: projection, 2/3: cluster, 4/5: editors, 6..9: gCam preview, 10/11: side, 12: zones rear, 13: gBlind reverse rear */
 #define UYVY8 0x07080102u
 #define FOURCC_CODE(a,b,c,d) ((uint32_t)(a)|((uint32_t)(b)<<8)|((uint32_t)(c)<<16)|((uint32_t)(d)<<24))
 #define DRM_FORMAT_ABGR8888 FOURCC_CODE('A','B','2','4')
@@ -65,7 +66,7 @@ typedef struct {
 
 typedef struct {
     pthread_mutex_t mutex; pthread_t thread; int created; ANativeWindow *window;
-    atomic_bool stop, running; atomic_ullong frames, dropped, first_ms, last_ns;
+    atomic_bool stop, running; atomic_ullong frames, dropped, replaced, first_ms, last_ns;
     atomic_bool zero_copy;
     atomic_ullong get_total_ns, get_max_ns, get_count, memcpy_total_ns, memcpy_max_ns, memcpy_count;
     atomic_ullong draw_total_ns, draw_max_ns, draw_count, swap_total_ns, swap_max_ns, swap_count;
@@ -75,7 +76,12 @@ typedef struct {
     atomic_ullong map_total_ns, map_count, tex_total_ns, tex_count;
     atomic_ullong make_current_total_ns, make_current_count, release_total_ns, release_count;
     atomic_ullong unmap_total_ns, unmap_count;
-    unsigned input; int recordable, target_fps;
+    atomic_ullong source_frames_no_capacity,source_uploads,accepted_offers,cancelled_reservations;
+    atomic_ullong output_cpu_total_ns,output_cpu_count;
+    atomic_ullong private_copy_total_ns,private_copy_cpu_total_ns,private_copy_count;
+    atomic_int output_phase,last_egl_error;
+    atomic_ullong output_phase_started_ns,output_phase_generation;
+    atomic_uint input; atomic_int recordable, target_fps;
     _Atomic float crop_x, crop_y, crop_zoom, crop_width, crop_height, fisheye;
     atomic_int shape, quarter_turns, custom_crop, active_upload_mode;
     atomic_uint overlay_version;
@@ -85,7 +91,7 @@ typedef struct {
 static state_t s = {
     .mutex=PTHREAD_MUTEX_INITIALIZER,
     .crop_x=0.5f, .crop_y=0.5f, .crop_zoom=1.0f, .crop_width=1.0f, .crop_height=1.0f, .fisheye=0.0f,
-    .status="Остановлено"
+    .last_egl_error=EGL_SUCCESS,.status="Остановлено"
 };
 static state_t recorders[4];
 static state_t hud_streams[HUD_STREAMS];
@@ -93,13 +99,53 @@ static pthread_once_t recorders_once=PTHREAD_ONCE_INIT;
 static pthread_once_t hud_streams_once=PTHREAD_ONCE_INIT;
 
 static void init_recorders(void){
-    for(unsigned i=0;i<4;i++){pthread_mutex_init(&recorders[i].mutex,NULL);recorders[i].input=i;recorders[i].recordable=1;atomic_store(&recorders[i].crop_x,0.5f);atomic_store(&recorders[i].crop_y,0.5f);atomic_store(&recorders[i].crop_zoom,1.0f);atomic_store(&recorders[i].fisheye,0.0f);snprintf(recorders[i].status,sizeof(recorders[i].status),"Остановлено");}
+    for(unsigned i=0;i<4;i++){pthread_mutex_init(&recorders[i].mutex,NULL);recorders[i].input=i;recorders[i].recordable=1;atomic_store(&recorders[i].last_egl_error,EGL_SUCCESS);atomic_store(&recorders[i].crop_x,0.5f);atomic_store(&recorders[i].crop_y,0.5f);atomic_store(&recorders[i].crop_zoom,1.0f);atomic_store(&recorders[i].fisheye,0.0f);snprintf(recorders[i].status,sizeof(recorders[i].status),"Остановлено");}
 }
 static void init_hud_streams(void){
-    for(unsigned i=0;i<HUD_STREAMS;i++){pthread_mutex_init(&hud_streams[i].mutex,NULL);atomic_store(&hud_streams[i].crop_x,0.5f);atomic_store(&hud_streams[i].crop_y,0.5f);atomic_store(&hud_streams[i].crop_zoom,1.0f);atomic_store(&hud_streams[i].fisheye,0.0f);snprintf(hud_streams[i].status,sizeof(hud_streams[i].status),"Остановлено");}
+    for(unsigned i=0;i<HUD_STREAMS;i++){pthread_mutex_init(&hud_streams[i].mutex,NULL);atomic_store(&hud_streams[i].last_egl_error,EGL_SUCCESS);atomic_store(&hud_streams[i].crop_x,0.5f);atomic_store(&hud_streams[i].crop_y,0.5f);atomic_store(&hud_streams[i].crop_zoom,1.0f);atomic_store(&hud_streams[i].fisheye,0.0f);snprintf(hud_streams[i].status,sizeof(hud_streams[i].status),"Остановлено");}
 }
 
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000ull+t.tv_nsec; }
+enum { OUTPUT_IDLE,OUTPUT_WAIT_SYNC,OUTPUT_DRAW,OUTPUT_SWAP,OUTPUT_FINISH,
+       OUTPUT_DETACH,OUTPUT_BIND,OUTPUT_FENCE_SUBMIT };
+/* The sole output owner records pending work before entering the driver. The
+ * snapshot remains readable even if that call never returns. */
+static void output_phase_set(state_t *state,int phase,uint64_t generation){
+    if(!state)return;
+    atomic_store(&state->output_phase_generation,phase?generation:0);
+    atomic_store(&state->output_phase_started_ns,phase?now_ns():0);
+    atomic_store_explicit(&state->output_phase,phase,memory_order_release);
+}
+static void output_egl_failure(state_t *state){
+    if(state)atomic_store(&state->last_egl_error,eglGetError());
+}
+static const char *output_phase_name(int phase){
+    switch(phase){
+        case OUTPUT_WAIT_SYNC:return "wait_sync";case OUTPUT_DRAW:return "draw";
+        case OUTPUT_SWAP:return "swap";case OUTPUT_FINISH:return "finish";
+        case OUTPUT_DETACH:return "detach";case OUTPUT_BIND:return "bind";
+        case OUTPUT_FENCE_SUBMIT:return "fence_submit";default:return "idle";
+    }
+}
+static void output_owned_message(state_t *state,char *message,size_t capacity){
+    if(!state){snprintf(message,capacity,"EGL target still owned; restart camera process; invalid output");return;}
+    int phase=atomic_load_explicit(&state->output_phase,memory_order_acquire);
+    uint64_t started=atomic_load(&state->output_phase_started_ns),now=now_ns();
+    uint64_t age=phase&&started&&now>=started?(now-started)/1000000ull:0;
+    snprintf(message,capacity,"EGL target still owned; restart camera process; phase=%s(%d) phaseAgeMs=%llu phaseGeneration=%llu eglError=0x%x",
+        output_phase_name(phase),phase,(unsigned long long)age,
+        (unsigned long long)atomic_load(&state->output_phase_generation),atomic_load(&state->last_egl_error));
+}
+/* Called only for an actually owned new generation, never for a request
+ * while its old EGL window can still be inside a driver call. */
+static void output_diagnostics_reset(state_t *state){
+    output_phase_set(state,OUTPUT_IDLE,0);atomic_store(&state->last_egl_error,EGL_SUCCESS);
+}
+static uint64_t thread_cpu_ns(void){
+    struct timespec value;
+    return clock_gettime(CLOCK_THREAD_CPUTIME_ID,&value)?0:
+        (uint64_t)value.tv_sec*1000000000ull+(uint64_t)value.tv_nsec;
+}
 static void metric_add(atomic_ullong *total,atomic_ullong *maximum,uint64_t value){
     atomic_fetch_add(total,(unsigned long long)value);unsigned long long old=atomic_load(maximum);
     while(value>old&&!atomic_compare_exchange_weak(maximum,&old,value)){}
@@ -148,9 +194,16 @@ typedef void (*f_image_target_texture)(GLenum target,void *image);
 typedef enum { UPLOAD_PBO=0, UPLOAD_DMABUF_RGBA=1, UPLOAD_DIRECT=2 } upload_mode_t;
 typedef struct {
     EGLDisplay d; EGLSurface s; EGLContext c; EGLConfig cfg; GLuint program,texture;
+    /* This renderer has one owner thread. Keep its last successful binding;
+     * output frames need not bounce through the lifecycle pbuffer. */
+    EGLSurface current_surface;
+    state_t *diagnostic;
+    uint64_t diagnostic_generation;
     GLuint overlay_program,overlay_texture;unsigned overlay_version;int overlay_width;
     GLint overlay_sampler,overlay_size,overlay_text_size,overlay_content_ratio;
     GLint sampler,crop_center,crop_zoom,crop_extent,fisheye,output_aspect,shape,quarter_turns,custom_crop; int w,h;
+    GLuint recorder_fbo,recorder_copy_program;
+    GLint recorder_copy_sampler;
     GLuint pbo[NBUF],imported_texture[NBUF]; EGLImageKHR image[NBUF]; GLsync fence[NBUF],pbo_fence[NBUF];
     int pbo_upload,recordable; upload_mode_t upload_mode;
     PFNEGLCREATEIMAGEKHRPROC create_image; PFNEGLDESTROYIMAGEKHRPROC destroy_image;
@@ -158,6 +211,21 @@ typedef struct {
     EGLBoolean (*presentation_time)(EGLDisplay,EGLSurface,EGLnsecsANDROID);
     char fallback_reason[160];
 } renderer_t;
+static EGLBoolean renderer_make_current(renderer_t *renderer,EGLSurface surface,state_t *stage){
+    if(renderer->current_surface==surface&&surface!=EGL_NO_SURFACE)return EGL_TRUE;
+    output_phase_set(renderer->diagnostic,OUTPUT_BIND,renderer->diagnostic_generation);
+    uint64_t start=now_ns();
+    EGLBoolean result=eglMakeCurrent(renderer->d,surface,surface,renderer->c);
+    if(!result)output_egl_failure(renderer->diagnostic);
+    if(stage){
+        atomic_fetch_add(&stage->make_current_total_ns,now_ns()-start);
+        atomic_fetch_add(&stage->make_current_count,1);
+    }
+    /* After an EGL failure, require a real bind before trusting any surface. */
+    renderer->current_surface=result?surface:EGL_NO_SURFACE;
+    output_phase_set(renderer->diagnostic,OUTPUT_IDLE,0);
+    return result;
+}
 static void fallback_reason(renderer_t *r,const char *fmt,...){
     va_list ap;va_start(ap,fmt);vsnprintf(r->fallback_reason,sizeof(r->fallback_reason),fmt,ap);va_end(ap);
     LOGE("zero-copy unavailable: %s",r->fallback_reason);
@@ -343,21 +411,7 @@ static int init_direct_upload(renderer_t *r){
     LOGI("using direct ION mmap -> glTexSubImage2D upload (experimental)");
     return 0;
 }
-static int renderer_init(renderer_t *r,ANativeWindow *window,int recordable,frame_memory_t *memory){
-    memset(r,0,sizeof(*r));r->d=eglGetDisplay(EGL_DEFAULT_DISPLAY);if(r->d==EGL_NO_DISPLAY||!eglInitialize(r->d,NULL,NULL))return -1;
-    EGLint attrs[]={EGL_RENDERABLE_TYPE,EGL_OPENGL_ES3_BIT,EGL_SURFACE_TYPE,EGL_WINDOW_BIT|EGL_PBUFFER_BIT,EGL_RED_SIZE,8,EGL_GREEN_SIZE,8,EGL_BLUE_SIZE,8,EGL_ALPHA_SIZE,8,EGL_RECORDABLE_ANDROID,recordable?EGL_TRUE:EGL_DONT_CARE,EGL_NONE};
-    EGLConfig cfg;EGLint count=0,fmt;
-    if(!eglChooseConfig(r->d,attrs,&cfg,1,&count)||!count){
-        /* Some vendor drivers expose only opaque recordable window configs. */
-        attrs[11]=EGL_DONT_CARE;
-        if(!eglChooseConfig(r->d,attrs,&cfg,1,&count)||!count)return -1;
-    }
-    eglGetConfigAttrib(r->d,cfg,EGL_NATIVE_VISUAL_ID,&fmt);
-    if(!recordable&&window)ANativeWindow_setBuffersGeometry(window,0,0,fmt);
-    r->cfg=cfg;
-    EGLint pbuffer_attrs[]={EGL_WIDTH,1,EGL_HEIGHT,1,EGL_NONE};
-    r->s=window?eglCreateWindowSurface(r->d,cfg,window,NULL):eglCreatePbufferSurface(r->d,cfg,pbuffer_attrs);EGLint ca[]={EGL_CONTEXT_CLIENT_VERSION,3,EGL_NONE};r->c=eglCreateContext(r->d,cfg,EGL_NO_CONTEXT,ca);
-    if(r->s==EGL_NO_SURFACE||r->c==EGL_NO_CONTEXT||!eglMakeCurrent(r->d,r->s,r->s,r->c))return -1;r->recordable=recordable;r->presentation_time=(void *)eglGetProcAddress("eglPresentationTimeANDROID");eglSwapInterval(r->d,recordable?0:1);eglQuerySurface(r->d,r->s,EGL_WIDTH,&r->w);eglQuerySurface(r->d,r->s,EGL_HEIGHT,&r->h);
+static int renderer_program(renderer_t *r){
     const char *vs="#version 300 es\nconst vec2 p[3]=vec2[3](vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));out vec2 uv;void main(){gl_Position=vec4(p[gl_VertexID],0.,1.);uv=(p[gl_VertexID]+1.)*.5;}";
     const char *fs=
         "#version 300 es\n"
@@ -399,6 +453,25 @@ static int renderer_init(renderer_t *r,ANativeWindow *window,int recordable,fram
         "}";
     GLuint v=shader(GL_VERTEX_SHADER,vs),f=shader(GL_FRAGMENT_SHADER,fs);if(!v||!f)return -1;r->program=glCreateProgram();glAttachShader(r->program,v);glAttachShader(r->program,f);glLinkProgram(r->program);glDeleteShader(v);glDeleteShader(f);GLint linked=0;glGetProgramiv(r->program,GL_LINK_STATUS,&linked);if(!linked)return -1;
     r->sampler=glGetUniformLocation(r->program,"packedUyvy");r->crop_center=glGetUniformLocation(r->program,"cropCenter");r->crop_zoom=glGetUniformLocation(r->program,"cropZoom");r->crop_extent=glGetUniformLocation(r->program,"cropExtent");r->fisheye=glGetUniformLocation(r->program,"fisheyeStrength");r->output_aspect=glGetUniformLocation(r->program,"outputAspect");r->shape=glGetUniformLocation(r->program,"outputShape");r->quarter_turns=glGetUniformLocation(r->program,"quarterTurns");r->custom_crop=glGetUniformLocation(r->program,"customCrop");
+    return 0;
+}
+static int renderer_init(renderer_t *r,ANativeWindow *window,int recordable,frame_memory_t *memory){
+    memset(r,0,sizeof(*r));r->d=eglGetDisplay(EGL_DEFAULT_DISPLAY);if(r->d==EGL_NO_DISPLAY||!eglInitialize(r->d,NULL,NULL))return -1;
+    EGLint attrs[]={EGL_RENDERABLE_TYPE,EGL_OPENGL_ES3_BIT,EGL_SURFACE_TYPE,EGL_WINDOW_BIT|EGL_PBUFFER_BIT,EGL_RED_SIZE,8,EGL_GREEN_SIZE,8,EGL_BLUE_SIZE,8,EGL_ALPHA_SIZE,8,EGL_RECORDABLE_ANDROID,recordable?EGL_TRUE:EGL_DONT_CARE,EGL_NONE};
+    EGLConfig cfg;EGLint count=0,fmt;
+    if(!eglChooseConfig(r->d,attrs,&cfg,1,&count)||!count){
+        /* Some vendor drivers expose only opaque recordable window configs. */
+        attrs[11]=EGL_DONT_CARE;
+        if(!eglChooseConfig(r->d,attrs,&cfg,1,&count)||!count)return -1;
+    }
+    eglGetConfigAttrib(r->d,cfg,EGL_NATIVE_VISUAL_ID,&fmt);
+    if(!recordable&&window)ANativeWindow_setBuffersGeometry(window,0,0,fmt);
+    r->cfg=cfg;
+    EGLint pbuffer_attrs[]={EGL_WIDTH,1,EGL_HEIGHT,1,EGL_NONE};
+    EGLint ca[]={EGL_CONTEXT_CLIENT_VERSION,3,EGL_NONE};r->c=eglCreateContext(r->d,cfg,EGL_NO_CONTEXT,ca);
+    r->s=window?eglCreateWindowSurface(r->d,cfg,window,NULL):eglCreatePbufferSurface(r->d,cfg,pbuffer_attrs);
+    if(r->s==EGL_NO_SURFACE||r->c==EGL_NO_CONTEXT||!eglMakeCurrent(r->d,r->s,r->s,r->c))return -1;r->recordable=recordable;r->presentation_time=(void *)eglGetProcAddress("eglPresentationTimeANDROID");eglSwapInterval(r->d,recordable?0:1);eglQuerySurface(r->d,r->s,EGL_WIDTH,&r->w);eglQuerySurface(r->d,r->s,EGL_HEIGHT,&r->h);
+    if(renderer_program(r))return -1;
     if(try_dmabuf_import(r,memory)==0)return 0;
     char upload_override[PROP_VALUE_MAX]={0};
     __system_property_get("debug.gcam.upload",upload_override);
@@ -441,7 +514,7 @@ static int draw(renderer_t *r,state_t *state,unsigned idx,const void *p,draw_met
     metrics->draw_ns=now_ns()-draw_started;
     if(r->recordable&&r->presentation_time)r->presentation_time(r->d,r->s,(EGLnsecsANDROID)now_ns());uint64_t swap_started=now_ns();EGLBoolean swapped=eglSwapBuffers(r->d,r->s);metrics->swap_ns=now_ns()-swap_started;return swapped?0:-1;
 }
-static void renderer_free(renderer_t *r){if(!r->d||r->d==EGL_NO_DISPLAY)return;discard_dmabuf_import(r);for(unsigned i=0;i<NBUF;i++)if(r->pbo_fence[i]){glDeleteSync(r->pbo_fence[i]);r->pbo_fence[i]=0;}if(r->pbo[0])glDeleteBuffers(NBUF,r->pbo);if(r->texture)glDeleteTextures(1,&r->texture);if(r->program)glDeleteProgram(r->program);if(r->overlay_texture)glDeleteTextures(1,&r->overlay_texture);if(r->overlay_program)glDeleteProgram(r->overlay_program);eglMakeCurrent(r->d,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);if(r->c&&r->c!=EGL_NO_CONTEXT)eglDestroyContext(r->d,r->c);if(r->s&&r->s!=EGL_NO_SURFACE)eglDestroySurface(r->d,r->s);/* EGLDisplay is process-global and may still be used by other camera encoders. */}
+static void renderer_free(renderer_t *r){if(!r->d||r->d==EGL_NO_DISPLAY)return;discard_dmabuf_import(r);for(unsigned i=0;i<NBUF;i++)if(r->pbo_fence[i]){glDeleteSync(r->pbo_fence[i]);r->pbo_fence[i]=0;}if(r->pbo[0])glDeleteBuffers(NBUF,r->pbo);if(r->texture)glDeleteTextures(1,&r->texture);if(r->recorder_fbo)glDeleteFramebuffers(1,&r->recorder_fbo);if(r->recorder_copy_program)glDeleteProgram(r->recorder_copy_program);if(r->program)glDeleteProgram(r->program);if(r->overlay_texture)glDeleteTextures(1,&r->overlay_texture);if(r->overlay_program)glDeleteProgram(r->overlay_program);eglMakeCurrent(r->d,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);if(r->c&&r->c!=EGL_NO_CONTEXT)eglDestroyContext(r->d,r->c);if(r->s&&r->s!=EGL_NO_SURFACE)eglDestroySurface(r->d,r->s);/* EGLDisplay is process-global and may still be used by other camera encoders. */}
 
 typedef struct { uint64_t len; uint32_t heap_mask, flags, fd, unused; } ion_alloc_t;
 #define ION_IOC_ALLOC_G636 0xc0184900UL
@@ -530,7 +603,7 @@ static void *stream_thread(void *arg){
         uint64_t frame_now=now_ns();
         if(frame_interval_ns){
             if(next_frame_ns&&frame_now<next_frame_ns){record_hold(state,acquired_ns,f.idx);a.release(cam,f.idx);continue;}
-            if(!next_frame_ns||frame_now>next_frame_ns+frame_interval_ns)next_frame_ns=frame_now+frame_interval_ns;else next_frame_ns+=frame_interval_ns;
+            next_frame_ns=recorder_next_due_ns(next_frame_ns,frame_now,frame_interval_ns);
         }
         void *pixels=memory[f.idx].address;
         if(!pixels){atomic_fetch_add(&state->dropped,1);record_hold(state,acquired_ns,f.idx);a.release(cam,f.idx);continue;}
@@ -577,7 +650,7 @@ done:atomic_store(&state->running,false);if(started){release_all_frames(&r,&a,ca
 }
 static void stop_state(state_t *state){atomic_store(&state->stop,true);pthread_mutex_lock(&state->mutex);int join=state->created;pthread_t t=state->thread;pthread_mutex_unlock(&state->mutex);if(join&&!pthread_equal(pthread_self(),t))pthread_join(t,NULL);pthread_mutex_lock(&state->mutex);state->created=0;pthread_mutex_unlock(&state->mutex);}
 static jstring start_state(JNIEnv *e,state_t *state,jobject surface,jint input,int recordable,int target_fps){
-    stop_state(state);if(!surface)return (*e)->NewStringUTF(e,"Surface не создан");state->window=ANativeWindow_fromSurface(e,surface);if(!state->window)return (*e)->NewStringUTF(e,"Не удалось получить ANativeWindow");atomic_store(&state->stop,false);atomic_store(&state->running,false);atomic_store(&state->frames,0);atomic_store(&state->dropped,0);atomic_store(&state->first_ms,0);atomic_store(&state->last_ns,0);atomic_store(&state->zero_copy,false);atomic_store(&state->active_upload_mode,-1);atomic_store(&state->get_total_ns,0);atomic_store(&state->get_max_ns,0);atomic_store(&state->get_count,0);atomic_store(&state->memcpy_total_ns,0);atomic_store(&state->memcpy_max_ns,0);atomic_store(&state->memcpy_count,0);atomic_store(&state->upload_total_ns,0);atomic_store(&state->upload_max_ns,0);atomic_store(&state->upload_count,0);atomic_store(&state->draw_total_ns,0);atomic_store(&state->draw_max_ns,0);atomic_store(&state->draw_count,0);atomic_store(&state->swap_total_ns,0);atomic_store(&state->swap_max_ns,0);atomic_store(&state->swap_count,0);atomic_store(&state->hold_total_ns,0);atomic_store(&state->hold_max_ns,0);atomic_store(&state->hold_count,0);atomic_store(&state->gap_max_ns,0);state->input=(unsigned)input;state->recordable=recordable;state->target_fps=target_fps;statusf(state,"Запуск QCarCam input %d…",input);if(pthread_create(&state->thread,NULL,stream_thread,state)){ANativeWindow_release(state->window);state->window=NULL;statusf(state,"Не удалось создать поток захвата");return (*e)->NewStringUTF(e,state->status);}pthread_mutex_lock(&state->mutex);state->created=1;pthread_mutex_unlock(&state->mutex);return (*e)->NewStringUTF(e,"Запуск принят");
+    stop_state(state);if(!surface)return (*e)->NewStringUTF(e,"Surface не создан");state->window=ANativeWindow_fromSurface(e,surface);if(!state->window)return (*e)->NewStringUTF(e,"Не удалось получить ANativeWindow");atomic_store(&state->stop,false);atomic_store(&state->running,false);atomic_store(&state->frames,0);atomic_store(&state->dropped,0);atomic_store(&state->replaced,0);atomic_store(&state->first_ms,0);atomic_store(&state->last_ns,0);atomic_store(&state->zero_copy,false);atomic_store(&state->active_upload_mode,-1);atomic_store(&state->get_total_ns,0);atomic_store(&state->get_max_ns,0);atomic_store(&state->get_count,0);atomic_store(&state->memcpy_total_ns,0);atomic_store(&state->memcpy_max_ns,0);atomic_store(&state->memcpy_count,0);atomic_store(&state->upload_total_ns,0);atomic_store(&state->upload_max_ns,0);atomic_store(&state->upload_count,0);atomic_store(&state->draw_total_ns,0);atomic_store(&state->draw_max_ns,0);atomic_store(&state->draw_count,0);atomic_store(&state->swap_total_ns,0);atomic_store(&state->swap_max_ns,0);atomic_store(&state->swap_count,0);atomic_store(&state->hold_total_ns,0);atomic_store(&state->hold_max_ns,0);atomic_store(&state->hold_count,0);atomic_store(&state->gap_max_ns,0);state->input=(unsigned)input;state->recordable=recordable;state->target_fps=target_fps;statusf(state,"Запуск QCarCam input %d…",input);if(pthread_create(&state->thread,NULL,stream_thread,state)){ANativeWindow_release(state->window);state->window=NULL;statusf(state,"Не удалось создать поток захвата");return (*e)->NewStringUTF(e,state->status);}pthread_mutex_lock(&state->mutex);state->created=1;pthread_mutex_unlock(&state->mutex);return (*e)->NewStringUTF(e,"Запуск принят");
 }
 static uint64_t metric_average_us(atomic_ullong *total,atomic_ullong *count){uint64_t n=atomic_load(count);return n?atomic_load(total)/n/1000ull:0;}
 static jlongArray state_stats(JNIEnv *e,state_t *state){
@@ -604,41 +677,50 @@ static jlongArray state_stats(JNIEnv *e,state_t *state){
         atomic_load(&state->tex_total_ns),atomic_load(&state->tex_count),
         atomic_load(&state->make_current_total_ns),atomic_load(&state->make_current_count),
         atomic_load(&state->release_total_ns),atomic_load(&state->release_count),
-        atomic_load(&state->unmap_total_ns),atomic_load(&state->unmap_count)
+        atomic_load(&state->unmap_total_ns),atomic_load(&state->unmap_count),
+        atomic_load(&state->replaced),
+        atomic_load(&state->source_frames_no_capacity),atomic_load(&state->source_uploads),
+        atomic_load(&state->accepted_offers),atomic_load(&state->cancelled_reservations),
+        atomic_load(&state->output_cpu_total_ns),atomic_load(&state->output_cpu_count),
+        atomic_load(&state->private_copy_total_ns),atomic_load(&state->private_copy_cpu_total_ns),
+        atomic_load(&state->private_copy_count),
+        atomic_load_explicit(&state->output_phase,memory_order_acquire),
+        atomic_load(&state->output_phase_started_ns),atomic_load(&state->last_egl_error),
+        atomic_load(&state->output_phase_generation)
     };
     const jsize count=(jsize)(sizeof(v)/sizeof(v[0]));
     jlongArray a=(*e)->NewLongArray(e,count);if(a)(*e)->SetLongArrayRegion(e,a,0,count,v);return a;
 }
 
-/* One QCarCam handle and one GPU upload per physical input. HUD surfaces and the
- * encoder are independent consumers of the same current texture. The service's
- * Binder methods only change desired outputs; EGL objects stay on this thread. */
+/* One QCarCam handle and one source upload per physical input. Every output
+ * owns its EGL context, Surface and fixed texture queue. Capture only offers
+ * immutable copies; no consumer swap is executed on the capture thread. */
 #define SHARED_OUTPUTS (HUD_STREAMS + 1)
-#include "recorder_load_policy.h"
-/* Shared across inputs: showing any camera gives every background recorder less GPU work. */
-static _Atomic uint64_t visible_output_mask, recorder_slow_until, recorder_severe_until;
-static void extend_pressure(_Atomic uint64_t *value,uint64_t now,uint64_t cost,uint64_t threshold){
-    uint64_t old=atomic_load(value),next;
-    do {next=recorder_pressure_deadline(now,cost,threshold,old);if(next==old)return;}
-    while(!atomic_compare_exchange_weak(value,&old,next));
-}
-static int recorder_budget(int requested,uint64_t now){
-    return recorder_fps_budget(requested,atomic_load(&visible_output_mask)!=0,now,
-        atomic_load(&recorder_slow_until),atomic_load(&recorder_severe_until));
+/* The capture thread owns each encoder's history. Atomic deadlines also allow
+ * the diagnostic Binder thread to report pressure without sharing mutable counters. */
+static _Atomic uint64_t visible_output_mask;
+static _Atomic uint64_t recorder_slow_until[4], recorder_severe_until[4];
+static int recorder_budget(unsigned input,int requested,uint64_t now){
+    return recorder_fps_budget(requested,now,
+        atomic_load(&recorder_slow_until[input]),atomic_load(&recorder_severe_until[input]));
 }
 typedef struct {
     state_t *stats;
     ANativeWindow *pending, *window;
     EGLSurface surface;
-    int wanted, width, height;
-    uint64_t next_due_ns, requested_ns;
+    int wanted, width, height, preparing;
+    uint64_t next_due_ns, requested_ns, generation, closed_generation;
 } shared_output_t;
+struct async_recorder;
 typedef struct {
     pthread_mutex_t mutex, lifecycle_mutex;
+    pthread_cond_t outputs_changed;
     pthread_t thread;
     int created, exited, stop, warm;
     unsigned input;
     shared_output_t outputs[SHARED_OUTPUTS];
+    struct async_recorder *recorder;
+    struct async_recorder *hud_workers[HUD_STREAMS];
 } shared_camera_t;
 static shared_camera_t shared_cameras[4];
 static pthread_once_t shared_once=PTHREAD_ONCE_INIT;
@@ -648,10 +730,33 @@ static void init_shared(void){
     for(unsigned i=0;i<4;i++){
         shared_camera_t *camera=&shared_cameras[i];
         pthread_mutex_init(&camera->mutex,NULL);
-        pthread_mutex_init(&camera->lifecycle_mutex,NULL);camera->input=i;
+        pthread_mutex_init(&camera->lifecycle_mutex,NULL);
+        pthread_condattr_t attr;pthread_condattr_init(&attr);
+#ifdef __ANDROID__
+        pthread_condattr_setclock(&attr,CLOCK_MONOTONIC);
+#endif
+        pthread_cond_init(&camera->outputs_changed,&attr);pthread_condattr_destroy(&attr);camera->input=i;
         for(unsigned slot=0;slot<HUD_STREAMS;slot++)camera->outputs[slot].stats=&hud_streams[slot];
         camera->outputs[HUD_STREAMS].stats=&recorders[i];
     }
+}
+static struct timespec capture_stop_deadline(void){
+    struct timespec deadline;
+#ifdef __ANDROID__
+    clock_gettime(CLOCK_MONOTONIC,&deadline);
+#else
+    clock_gettime(CLOCK_REALTIME,&deadline);
+#endif
+    deadline.tv_sec++;return deadline;
+}
+static int capture_wait_finished(shared_camera_t *camera,const struct timespec *deadline){
+    pthread_mutex_lock(&camera->mutex);
+    while(camera->created&&!camera->exited){
+        if(pthread_cond_timedwait(&camera->outputs_changed,&camera->mutex,deadline)){
+            pthread_mutex_unlock(&camera->mutex);return 0;
+        }
+    }
+    pthread_mutex_unlock(&camera->mutex);return 1;
 }
 static int camera_has_outputs(shared_camera_t *camera){
     for(int i=0;i<SHARED_OUTPUTS;i++)if(camera->outputs[i].wanted)return 1;
@@ -659,7 +764,7 @@ static int camera_has_outputs(shared_camera_t *camera){
 }
 static void reset_output_stats(state_t *state,int input,int recordable,int fps){
     atomic_store(&state->running,false);atomic_store(&state->frames,0);
-    atomic_store(&state->dropped,0);atomic_store(&state->first_ms,0);
+    atomic_store(&state->dropped,0);atomic_store(&state->replaced,0);atomic_store(&state->first_ms,0);
     atomic_store(&state->last_ns,0);atomic_store(&state->zero_copy,false);
     atomic_store(&state->active_upload_mode,-1);
     atomic_store(&state->get_total_ns,0);atomic_store(&state->get_max_ns,0);
@@ -679,34 +784,11 @@ static void reset_output_stats(state_t *state,int input,int recordable,int fps){
     atomic_store(&state->make_current_total_ns,0);atomic_store(&state->make_current_count,0);
     atomic_store(&state->release_total_ns,0);atomic_store(&state->release_count,0);
     atomic_store(&state->unmap_total_ns,0);atomic_store(&state->unmap_count,0);
+    atomic_store(&state->output_cpu_total_ns,0);atomic_store(&state->output_cpu_count,0);
+    atomic_store(&state->private_copy_total_ns,0);atomic_store(&state->private_copy_cpu_total_ns,0);
+    atomic_store(&state->private_copy_count,0);
     state->input=(unsigned)input;state->recordable=recordable;state->target_fps=fps;
     statusf(state,"Запуск QCarCam input %d…",input);
-}
-static void apply_shared_outputs(shared_camera_t *camera,renderer_t *r){
-    pthread_mutex_lock(&camera->mutex);
-    for(int i=0;i<SHARED_OUTPUTS;i++){
-        shared_output_t *out=&camera->outputs[i];
-        if(out->surface!=EGL_NO_SURFACE&&out->surface&&(!out->wanted||out->pending)){
-            eglDestroySurface(r->d,out->surface);out->surface=EGL_NO_SURFACE;
-            ANativeWindow_release(out->window);out->window=NULL;
-            atomic_store(&out->stats->running,false);
-        }
-        if(!out->wanted&&out->pending){ANativeWindow_release(out->pending);out->pending=NULL;}
-        if(out->wanted&&out->pending){
-            out->window=out->pending;out->pending=NULL;
-            if(i<4){EGLint format=0;eglGetConfigAttrib(r->d,r->cfg,EGL_NATIVE_VISUAL_ID,&format);ANativeWindow_setBuffersGeometry(out->window,0,0,format);}
-            out->surface=eglCreateWindowSurface(r->d,r->cfg,out->window,NULL);
-            if(out->surface==EGL_NO_SURFACE){
-                statusf(out->stats,"Ошибка EGL surface 0x%x",eglGetError());
-                ANativeWindow_release(out->window);out->window=NULL;out->wanted=0;
-            }else{
-                eglQuerySurface(r->d,out->surface,EGL_WIDTH,&out->width);
-                eglQuerySurface(r->d,out->surface,EGL_HEIGHT,&out->height);
-                out->next_due_ns=0;
-            }
-        }
-    }
-    pthread_mutex_unlock(&camera->mutex);
 }
 static int shared_upload(renderer_t *r,unsigned idx,const void *pixels,draw_metrics_t *metrics,state_t *stage){
     if(r->upload_mode==UPLOAD_DMABUF_RGBA){glBindTexture(GL_TEXTURE_2D,r->imported_texture[idx]);return 0;}
@@ -749,11 +831,8 @@ static int shared_upload(renderer_t *r,unsigned idx,const void *pixels,draw_metr
 }
 static int shared_draw(renderer_t *r,shared_output_t *out,uint64_t timestamp,draw_metrics_t *metrics){
     state_t *state=out->stats;
-    uint64_t current_start=now_ns();
-    EGLBoolean current=eglMakeCurrent(r->d,out->surface,out->surface,r->c);
-    atomic_fetch_add(&state->make_current_total_ns,now_ns()-current_start);
-    atomic_fetch_add(&state->make_current_count,1);
-    if(!current)return -1;
+    if(!renderer_make_current(r,out->surface,state))return -1;
+    output_phase_set(state,OUTPUT_DRAW,r->diagnostic_generation);
     uint64_t start=now_ns();
     glUseProgram(r->program);glUniform1i(r->sampler,0);
     glUniform2f(r->crop_center,atomic_load(&state->crop_x),atomic_load(&state->crop_y));
@@ -769,16 +848,27 @@ static int shared_draw(renderer_t *r,shared_output_t *out,uint64_t timestamp,dra
     glViewport(0,0,out->width,out->height);glDrawArrays(GL_TRIANGLES,0,3);
     if(state->recordable)overlay_draw(r,state,out->width,out->height);
     metrics->draw_ns=now_ns()-start;
-    if(state->recordable&&r->presentation_time)r->presentation_time(r->d,out->surface,(EGLnsecsANDROID)timestamp);
+    output_phase_set(state,OUTPUT_SWAP,r->diagnostic_generation);
+    if(state->recordable&&r->presentation_time&&!r->presentation_time(r->d,out->surface,(EGLnsecsANDROID)timestamp))
+        output_egl_failure(state);
     start=now_ns();EGLBoolean ok=eglSwapBuffers(r->d,out->surface);
+    if(!ok)output_egl_failure(state);
     metrics->swap_ns=now_ns()-start;
     return ok?0:-1;
 }
+#include "async_recorder.inc"
+
 static void *shared_stream_thread(void *argument){
     shared_camera_t *camera=argument;qapi_t api={0};qhandle_t cam=NULL;
     frame_memory_t memory[NBUF]={{-1,NULL,false},{-1,NULL,false},{-1,NULL,false}};
     qbuffers_t qb={0};renderer_t r={.d=EGL_NO_DISPLAY,.s=EGL_NO_SURFACE,.c=EGL_NO_CONTEXT};
     uint64_t acquired_ns[NBUF]={0};char error[384]={0};int acquired=0,started=0;
+    atomic_store(&recorder_slow_until[camera->input],0);
+    atomic_store(&recorder_severe_until[camera->input],0);
+    atomic_store(&recorders[camera->input].source_frames_no_capacity,0);
+    atomic_store(&recorders[camera->input].source_uploads,0);
+    atomic_store(&recorders[camera->input].accepted_offers,0);
+    atomic_store(&recorders[camera->input].cancelled_reservations,0);
     if(acquire_api(&api,error,sizeof(error)))goto fail;
     acquired=1;cam=api.open(camera->input);
     if(!cam){snprintf(error,sizeof(error),"QCarCam input %u не открылся",camera->input);goto fail;}
@@ -793,10 +883,14 @@ static void *shared_stream_thread(void *argument){
     rc=api.start(cam);if(rc){snprintf(error,sizeof(error),"qcarcam_start: %d",rc);goto fail;}
     started=1;
     while(1){
-        apply_shared_outputs(camera,&r);
+        for(int output=0;output<SHARED_OUTPUTS;output++)async_apply_output(camera,&r,output);
         pthread_mutex_lock(&camera->mutex);
         int finish=camera->stop||(!camera->warm&&!camera_has_outputs(camera));
-        int visible=0;for(int i=0;i<SHARED_OUTPUTS;i++)visible|=camera->outputs[i].wanted&&camera->outputs[i].surface!=EGL_NO_SURFACE;
+        int visible=0;
+        for(int i=0;i<SHARED_OUTPUTS;i++){
+            async_recorder_t *worker=async_worker(camera,i);
+            visible|=camera->outputs[i].wanted&&worker&&!atomic_load(&worker->stop);
+        }
         pthread_mutex_unlock(&camera->mutex);
         if(finish)break;
         if(r.upload_mode==UPLOAD_DMABUF_RGBA){
@@ -816,64 +910,90 @@ static void *shared_stream_thread(void *argument){
         acquired_ns[frame.idx]=now_ns();
         if(!visible){record_hold(&recorders[camera->input],acquired_ns,frame.idx);api.release(cam,frame.idx);continue;}
         uint64_t timestamp=now_ns();int due[SHARED_OUTPUTS]={0},due_count=0;
+        uint64_t due_generation[SHARED_OUTPUTS]={0};
         pthread_mutex_lock(&camera->mutex);
         for(int i=0;i<SHARED_OUTPUTS;i++){
             shared_output_t *out=&camera->outputs[i];
-            if(!out->wanted||out->surface==EGL_NO_SURFACE)continue;
-            if(!out->next_due_ns||timestamp>=out->next_due_ns){due[i]=1;due_count++;}
+            if(!out->wanted)continue;
+            async_recorder_t *worker=async_worker(camera,i);
+            if(!worker||atomic_load(&worker->stop))continue;
+            if(!out->next_due_ns||timestamp>=out->next_due_ns){
+                due[i]=1;due_generation[i]=out->generation;due_count++;
+            }
         }
         pthread_mutex_unlock(&camera->mutex);
         if(!due_count){record_hold(&recorders[camera->input],acquired_ns,frame.idx);api.release(cam,frame.idx);continue;}
+        recorder_reservation_t reservations[SHARED_OUTPUTS]={0};int admitted=0,capacity_blocked=0;
+        for(int i=0;i<SHARED_OUTPUTS;i++)if(due[i]){
+            int admission=recorder_reserve_frame(camera,i,due_generation[i],&reservations[i]);
+            admitted+=admission==ADMISSION_RESERVED;
+            capacity_blocked|=admission==ADMISSION_NO_CAPACITY;
+        }
+        /* Keep the requested cadence even when every bounded output pool is
+         * occupied; a rejected frame must not turn into a busy retry loop. */
+        for(int i=0;i<SHARED_OUTPUTS;i++)if(due[i]){
+            pthread_mutex_lock(&camera->mutex);
+            shared_output_t *out=&camera->outputs[i];
+            if(out->wanted&&out->generation==due_generation[i]){
+                int fps=atomic_load(&out->stats->target_fps);
+                if(i==HUD_STREAMS)fps=recorder_budget(camera->input,fps,now_ns());
+                uint64_t interval=fps>0?1000000000ull/(uint64_t)fps:0;
+                out->next_due_ns=recorder_next_due_ns(out->next_due_ns,timestamp,interval);
+            }
+            pthread_mutex_unlock(&camera->mutex);
+        }
+        for(int i=0;i<SHARED_OUTPUTS;i++)if(reservations[i].slot&&
+                !recorder_reservation_current(camera,&reservations[i])){
+            recorder_cancel_reservation(camera,&reservations[i]);admitted--;
+        }
+        if(!admitted){
+            if(capacity_blocked)atomic_fetch_add(&recorders[camera->input].source_frames_no_capacity,1);
+            record_hold(&recorders[camera->input],acquired_ns,frame.idx);api.release(cam,frame.idx);continue;
+        }
         int cpu_reads=memory[frame.idx].cached&&r.upload_mode!=UPLOAD_DMABUF_RGBA;
         uint64_t sync_start=now_ns();
         int sync_failed=cpu_reads&&sync_cpu_buffer(memory[frame.idx].fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_READ);
         if(cpu_reads){atomic_fetch_add(&recorders[camera->input].sync_total_ns,now_ns()-sync_start);atomic_fetch_add(&recorders[camera->input].sync_count,1);}
         if(sync_failed){
+            for(int i=0;i<SHARED_OUTPUTS;i++)recorder_cancel_reservation(camera,&reservations[i]);
             record_hold(&recorders[camera->input],acquired_ns,frame.idx);api.release(cam,frame.idx);
             snprintf(error,sizeof(error),"ION cache sync failed");break;
         }
+        /* A stop or generation replacement may arrive while the cache sync is
+         * in progress. Close its read transaction, then return the source
+         * without making an unobservable GPU upload. */
+        admitted=0;
+        for(int i=0;i<SHARED_OUTPUTS;i++)if(reservations[i].slot){
+            if(recorder_reservation_current(camera,&reservations[i]))admitted++;
+            else recorder_cancel_reservation(camera,&reservations[i]);
+        }
+        if(!admitted){
+            if(cpu_reads){
+                sync_start=now_ns();
+                sync_failed=sync_cpu_buffer(memory[frame.idx].fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_READ);
+                atomic_fetch_add(&recorders[camera->input].sync_total_ns,now_ns()-sync_start);
+                atomic_fetch_add(&recorders[camera->input].sync_count,1);
+            }
+            record_hold(&recorders[camera->input],acquired_ns,frame.idx);api.release(cam,frame.idx);
+            if(sync_failed){snprintf(error,sizeof(error),"ION cache sync failed");break;}
+            continue;
+        }
+        atomic_fetch_add(&recorders[camera->input].source_uploads,1);
         draw_metrics_t upload={0};int failed=shared_upload(&r,frame.idx,memory[frame.idx].address,&upload,&recorders[camera->input]);
         sync_start=now_ns();
         sync_failed=cpu_reads&&sync_cpu_buffer(memory[frame.idx].fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_READ);
         if(cpu_reads){atomic_fetch_add(&recorders[camera->input].sync_total_ns,now_ns()-sync_start);atomic_fetch_add(&recorders[camera->input].sync_count,1);}
         if(sync_failed)failed=1;
-        if(failed){record_hold(&recorders[camera->input],acquired_ns,frame.idx);api.release(cam,frame.idx);snprintf(error,sizeof(error),"ION/GPU upload failed");break;}
-        /* HUD is drawn first so encoder backpressure cannot delay its current frame. */
-        pthread_mutex_lock(&camera->mutex);
-        for(int i=0;i<SHARED_OUTPUTS;i++){
-            if(!due[i])continue;
-            shared_output_t *out=&camera->outputs[i];draw_metrics_t timing={0};
-            if(shared_draw(&r,out,timestamp,&timing)){
-                statusf(out->stats,"Ошибка EGL вывода; поток остановлен");
-                if(i<HUD_STREAMS)atomic_fetch_and(&visible_output_mask,~(1ull<<(camera->input*HUD_STREAMS+i)));
-                out->wanted=0;atomic_store(&out->stats->running,false);continue;
-            }
-            state_t *stats=out->stats;
-            uint64_t completed_ns=now_ns(),cost=upload.upload_ns+timing.draw_ns+timing.swap_ns;
-            extend_pressure(&recorder_slow_until,completed_ns,cost,60000000ull);
-            extend_pressure(&recorder_severe_until,completed_ns,cost,120000000ull);
-            int fps=stats->recordable?recorder_budget(stats->target_fps,completed_ns):stats->target_fps;
-            uint64_t interval=fps>0?1000000000ull/(uint64_t)fps:0;
-            /* A late frame must not schedule an immediate catch-up burst. */
-            out->next_due_ns=(stats->recordable?completed_ns:timestamp)+interval;
-            metric_add(&stats->get_total_ns,&stats->get_max_ns,get_ns);atomic_fetch_add(&stats->get_count,1);
-            if(upload.memcpy_ns){metric_add(&stats->memcpy_total_ns,&stats->memcpy_max_ns,upload.memcpy_ns);atomic_fetch_add(&stats->memcpy_count,1);}
-            metric_add(&stats->upload_total_ns,&stats->upload_max_ns,upload.upload_ns);atomic_fetch_add(&stats->upload_count,1);
-            metric_add(&stats->draw_total_ns,&stats->draw_max_ns,timing.draw_ns);atomic_fetch_add(&stats->draw_count,1);
-            metric_add(&stats->swap_total_ns,&stats->swap_max_ns,timing.swap_ns);atomic_fetch_add(&stats->swap_count,1);
-            uint64_t previous=atomic_load(&stats->last_ns);
-            if(previous)metric_max(&stats->gap_max_ns,timestamp-previous);
-            uint64_t count=atomic_fetch_add(&stats->frames,1)+1;
-            atomic_store(&stats->last_ns,timestamp);atomic_store(&stats->running,true);
-            atomic_store(&stats->zero_copy,r.upload_mode==UPLOAD_DMABUF_RGBA);
-            atomic_store(&stats->active_upload_mode,r.upload_mode);
-            if(count==1){
-                atomic_store(&stats->first_ms,(timestamp-out->requested_ns)/1000000ull);
-                statusf(stats,"QCarCam input %u · общий поток активен",camera->input);
-            }
+        if(failed){
+            for(int i=0;i<SHARED_OUTPUTS;i++)recorder_cancel_reservation(camera,&reservations[i]);
+            record_hold(&recorders[camera->input],acquired_ns,frame.idx);api.release(cam,frame.idx);
+            snprintf(error,sizeof(error),"ION/GPU upload failed");break;
         }
-        pthread_mutex_unlock(&camera->mutex);
-        if(!eglMakeCurrent(r.d,r.s,r.s,r.c)){snprintf(error,sizeof(error),"EGL restore failed");break;}
+        /* Each offer is bounded and never waits for a consumer or its GPU fence.
+         * All workers sample private copies, so source buffers may be returned
+         * as soon as this producer's copy fences complete. */
+        for(int i=0;i<SHARED_OUTPUTS;i++)if(reservations[i].slot)
+            async_offer_reserved(camera,&r,&reservations[i],frame.idx,timestamp,get_ns,&upload);
         if(r.upload_mode==UPLOAD_DMABUF_RGBA){
             r.fence[frame.idx]=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);
             if(!r.fence[frame.idx]){
@@ -889,6 +1009,8 @@ static void *shared_stream_thread(void *argument){
         }
     }
 fail:
+    pthread_mutex_lock(&camera->mutex);camera->stop=1;pthread_mutex_unlock(&camera->mutex);
+    async_detach_all(camera);
     if(r.d!=EGL_NO_DISPLAY){
         eglMakeCurrent(r.d,r.s,r.s,r.c);
         if(started)release_all_frames(&r,&api,cam,&recorders[camera->input],acquired_ns);
@@ -896,19 +1018,21 @@ fail:
     pthread_mutex_lock(&camera->mutex);
     for(int i=0;i<SHARED_OUTPUTS;i++){
         shared_output_t *out=&camera->outputs[i];
-        if(!out->wanted&&!out->pending&&!out->window&&(!out->surface||out->surface==EGL_NO_SURFACE))continue;
-        if(r.d!=EGL_NO_DISPLAY&&out->surface&&out->surface!=EGL_NO_SURFACE)eglDestroySurface(r.d,out->surface);
-        out->surface=EGL_NO_SURFACE;
+        out->wanted=0;
         if(out->window)ANativeWindow_release(out->window);out->window=NULL;
         if(out->pending)ANativeWindow_release(out->pending);out->pending=NULL;
+        if(!async_worker(camera,i)){out->preparing=0;out->closed_generation=out->generation;}
         atomic_store(&out->stats->running,false);
-        if(error[0]&&out->wanted)statusf(out->stats,"QCarCam: %s",error);
+        if(error[0])statusf(out->stats,"QCarCam: %s",error);
     }
+    pthread_cond_broadcast(&camera->outputs_changed);
     atomic_fetch_and(&visible_output_mask,~(((1ull<<HUD_STREAMS)-1)<<(camera->input*HUD_STREAMS)));
-    camera->exited=1;
+    atomic_store(&recorder_slow_until[camera->input],0);
+    atomic_store(&recorder_severe_until[camera->input],0);
     pthread_mutex_unlock(&camera->mutex);
     if(started)api.stop(cam);if(cam)api.close(cam);
     renderer_free(&r);free_buffers(memory,&qb);if(acquired)release_api();
+    pthread_mutex_lock(&camera->mutex);camera->exited=1;pthread_cond_broadcast(&camera->outputs_changed);pthread_mutex_unlock(&camera->mutex);
     return NULL;
 }
 static jstring shared_start(JNIEnv *env,jobject surface,int input,int output,int fps){
@@ -925,9 +1049,13 @@ static jstring shared_start(JNIEnv *env,jobject surface,int input,int output,int
         pthread_mutex_unlock(&camera->mutex);pthread_join(old,NULL);
         pthread_mutex_lock(&camera->mutex);
     }
+    if(camera->created&&camera->stop){
+        pthread_mutex_unlock(&camera->mutex);pthread_mutex_unlock(&camera->lifecycle_mutex);
+        ANativeWindow_release(window);return (*env)->NewStringUTF(env,"Camera source is still stopping");
+    }
     shared_output_t *out=&camera->outputs[output];
     if(out->pending)ANativeWindow_release(out->pending);
-    out->pending=window;out->wanted=1;out->requested_ns=now_ns();
+    out->pending=window;out->wanted=1;out->requested_ns=now_ns();out->generation++;
     if(output<HUD_STREAMS)atomic_fetch_or(&visible_output_mask,1ull<<(input*HUD_STREAMS+output));
     reset_output_stats(out->stats,input,output==HUD_STREAMS,fps);
     if(!camera->created){
@@ -945,34 +1073,69 @@ static jstring shared_start(JNIEnv *env,jobject surface,int input,int output,int
     pthread_mutex_unlock(&camera->lifecycle_mutex);
     return (*env)->NewStringUTF(env,"Запуск принят");
 }
-static void shared_stop(int input,int output){
+static int shared_stop_with_error(int input,int output,char *diagnostic,size_t capacity){
+    if(diagnostic&&capacity)diagnostic[0]=0;
     pthread_once(&shared_once,init_shared);
-    if(input<0||input>3||output<0||output>=SHARED_OUTPUTS)return;
+    if(input<0||input>3||output<0||output>=SHARED_OUTPUTS){
+        if(diagnostic&&capacity)output_owned_message(NULL,diagnostic,capacity);
+        return -1;
+    }
     shared_camera_t *camera=&shared_cameras[input];
     pthread_mutex_lock(&camera->lifecycle_mutex);
+    const struct timespec deadline=capture_stop_deadline();
     pthread_mutex_lock(&camera->mutex);
-    shared_output_t *out=&camera->outputs[output];out->wanted=0;
+    shared_output_t *out=&camera->outputs[output];out->wanted=0;uint64_t generation=++out->generation;
     if(output<HUD_STREAMS)atomic_fetch_and(&visible_output_mask,~(1ull<<(input*HUD_STREAMS+output)));
     atomic_store(&out->stats->running,false);
     int join=camera->created&&!camera->warm&&!camera_has_outputs(camera);
     if(join)camera->stop=1;
     pthread_t thread=camera->thread;
     pthread_mutex_unlock(&camera->mutex);
+    int failed=0;
     if(join&&!pthread_equal(pthread_self(),thread)){
-        pthread_join(thread,NULL);
-        pthread_mutex_lock(&camera->mutex);camera->created=0;pthread_mutex_unlock(&camera->mutex);
+        if(capture_wait_finished(camera,&deadline)){
+            pthread_join(thread,NULL);
+            pthread_mutex_lock(&camera->mutex);camera->created=0;pthread_mutex_unlock(&camera->mutex);
+            for(int i=0;i<SHARED_OUTPUTS;i++)async_reap_completed(camera,i);
+        }else failed=1;
     }
-    statusf(out->stats,"Остановлено");
-    pthread_mutex_unlock(&camera->lifecycle_mutex);
+    pthread_mutex_lock(&camera->mutex);
+    /* A codec may release its input Surface after recorder stop returns, just
+     * like a HUD consumer. Both therefore require the worker's actual detach
+     * acknowledgement, even while the physical source keeps serving peers.
+     * Repeated cancellation of a fully released target needs no producer trip. */
+    if(!out->pending&&!out->window&&!out->preparing)
+        out->closed_generation=generation;
+    while(out->closed_generation<generation){
+        if(pthread_cond_timedwait(&camera->outputs_changed,&camera->mutex,&deadline)){failed=1;break;}
+    }
+    failed|=out->closed_generation<generation;
+    pthread_mutex_unlock(&camera->mutex);
+    if(failed){
+        char message[512];output_owned_message(out->stats,message,sizeof(message));
+        /* A later Binder start may reset the shared diagnostic state as soon
+         * as lifecycle_mutex is unlocked. Preserve this caller's snapshot. */
+        if(diagnostic&&capacity)snprintf(diagnostic,capacity,"%s",message);
+    }
+    statusf(out->stats,failed?"EGL target still owned; restart camera process":"Остановлено");
+    pthread_mutex_unlock(&camera->lifecycle_mutex);return failed?-1:0;
 }
-static void shared_stop_hud_slot(int slot){
+static int shared_stop(int input,int output){
+    return shared_stop_with_error(input,output,NULL,0);
+}
+static int shared_stop_hud_slot_with_error(int slot,char *diagnostic,size_t capacity){
+    if(diagnostic&&capacity)diagnostic[0]=0;
     for(int input=0;input<4;input++){
         shared_camera_t *camera=&shared_cameras[input];
         pthread_mutex_lock(&camera->mutex);
-        int attached=camera->outputs[slot].wanted||camera->outputs[slot].pending||camera->outputs[slot].window;
+        int attached=camera->outputs[slot].wanted||camera->outputs[slot].pending||camera->outputs[slot].window||camera->outputs[slot].preparing;
         pthread_mutex_unlock(&camera->mutex);
-        if(attached)shared_stop(input,slot);
+        if(attached&&shared_stop_with_error(input,slot,diagnostic,capacity))return -1;
     }
+    return 0;
+}
+static int shared_stop_hud_slot(int slot){
+    return shared_stop_hud_slot_with_error(slot,NULL,0);
 }
 JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_warmInput(JNIEnv *env,jclass clazz,jint input,jboolean warm){
     (void)env;(void)clazz;pthread_once(&shared_once,init_shared);
@@ -984,11 +1147,15 @@ JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_warmInput(JNIEnv *env,
         pthread_mutex_unlock(&camera->mutex);pthread_join(old,NULL);
         pthread_mutex_lock(&camera->mutex);
     }
+    if(camera->created&&camera->stop){pthread_mutex_unlock(&camera->mutex);pthread_mutex_unlock(&camera->lifecycle_mutex);return;}
     camera->warm=warm;
     if(warm&&!camera->created){camera->stop=0;camera->exited=0;if(!pthread_create(&camera->thread,NULL,shared_stream_thread,camera))camera->created=1;}
     int join=!warm&&camera->created&&!camera_has_outputs(camera);
     if(join)camera->stop=1;pthread_t thread=camera->thread;pthread_mutex_unlock(&camera->mutex);
-    if(join&&!pthread_equal(pthread_self(),thread)){pthread_join(thread,NULL);pthread_mutex_lock(&camera->mutex);camera->created=0;pthread_mutex_unlock(&camera->mutex);}
+    const struct timespec deadline=capture_stop_deadline();
+    if(join&&!pthread_equal(pthread_self(),thread)&&capture_wait_finished(camera,&deadline)){
+        pthread_join(thread,NULL);pthread_mutex_lock(&camera->mutex);camera->created=0;pthread_mutex_unlock(&camera->mutex);for(int i=0;i<SHARED_OUTPUTS;i++)async_reap_completed(camera,i);
+    }
     pthread_mutex_unlock(&camera->lifecycle_mutex);
 }
 JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderOverlay(JNIEnv *env,jclass clazz,jint input,jstring value){
@@ -1004,7 +1171,7 @@ JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderOverlay(JNIEnv
 }
 
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_start(JNIEnv *e,jclass c,jobject surface,jint input){(void)c;return start_state(e,&s,surface,input,0,25);}
-JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStart(JNIEnv *e,jclass c,jint slot,jobject surface,jint input,jint target_fps,jfloat crop_x,jfloat crop_y,jfloat crop_zoom,jfloat fisheye,jint shape){(void)c;pthread_once(&shared_once,init_shared);if(slot<0||slot>=HUD_STREAMS)return (*e)->NewStringUTF(e,"Некорректный HUD slot");if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");if(target_fps<1)target_fps=1;if(target_fps>20)target_fps=20;shared_stop_hud_slot(slot);state_t *state=&hud_streams[slot];atomic_store(&state->crop_x,crop_x<0.f?0.f:(crop_x>1.f?1.f:crop_x));atomic_store(&state->crop_y,crop_y<0.f?0.f:(crop_y>1.f?1.f:crop_y));atomic_store(&state->crop_zoom,crop_zoom<1.f?1.f:(crop_zoom>3.f?3.f:crop_zoom));atomic_store(&state->fisheye,fisheye<0.f?0.f:(fisheye>1.f?1.f:fisheye));atomic_store(&state->shape,shape<0?0:(shape>2?2:shape));atomic_store(&state->custom_crop,0);atomic_store(&state->quarter_turns,0);return shared_start(e,surface,input,slot,target_fps);}
+JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStart(JNIEnv *e,jclass c,jint slot,jobject surface,jint input,jint target_fps,jfloat crop_x,jfloat crop_y,jfloat crop_zoom,jfloat fisheye,jint shape){(void)c;pthread_once(&shared_once,init_shared);if(slot<0||slot>=HUD_STREAMS)return (*e)->NewStringUTF(e,"Некорректный HUD slot");if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");if(target_fps<1)target_fps=1;int limit=hud_output_fps_limit(slot);if(target_fps>limit)target_fps=limit;if(shared_stop_hud_slot(slot))return (*e)->NewStringUTF(e,"EGL target still owned; restart camera process");state_t *state=&hud_streams[slot];atomic_store(&state->crop_x,crop_x<0.f?0.f:(crop_x>1.f?1.f:crop_x));atomic_store(&state->crop_y,crop_y<0.f?0.f:(crop_y>1.f?1.f:crop_y));atomic_store(&state->crop_zoom,crop_zoom<1.f?1.f:(crop_zoom>3.f?3.f:crop_zoom));atomic_store(&state->fisheye,fisheye<0.f?0.f:(fisheye>1.f?1.f:fisheye));atomic_store(&state->shape,shape<0?0:(shape>2?2:shape));atomic_store(&state->custom_crop,0);atomic_store(&state->quarter_turns,0);return shared_start(e,surface,input,slot,target_fps);}
 JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_hudConfigure(JNIEnv *e,jclass c,jint slot,jfloat crop_x,jfloat crop_y,jfloat crop_zoom,jfloat fisheye,jint shape){(void)e;(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>=HUD_STREAMS)return;state_t *state=&hud_streams[slot];atomic_store(&state->crop_x,crop_x<0.f?0.f:(crop_x>1.f?1.f:crop_x));atomic_store(&state->crop_y,crop_y<0.f?0.f:(crop_y>1.f?1.f:crop_y));atomic_store(&state->crop_zoom,crop_zoom<1.f?1.f:(crop_zoom>3.f?3.f:crop_zoom));atomic_store(&state->fisheye,fisheye<0.f?0.f:(fisheye>1.f?1.f:fisheye));atomic_store(&state->shape,shape<0?0:(shape>2?2:shape));atomic_store(&state->custom_crop,0);atomic_store(&state->quarter_turns,0);}
 static void set_hud_crop_v2(state_t *state,jfloat x,jfloat y,jfloat width,jfloat height,jfloat fisheye,jint shape,jint turns){
     float w=fminf(1.f,fmaxf(.05f,width)),h=fminf(1.f,fmaxf(.05f,height));
@@ -1016,18 +1183,36 @@ static void set_hud_crop_v2(state_t *state,jfloat x,jfloat y,jfloat width,jfloat
     atomic_store(&state->quarter_turns,turns<0?0:(turns>3?3:turns));
     atomic_store(&state->custom_crop,1);
 }
-JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStartV2(JNIEnv *e,jclass c,jint slot,jobject surface,jint input,jint target_fps,jfloat x,jfloat y,jfloat width,jfloat height,jfloat fisheye,jint shape,jint turns){(void)c;pthread_once(&shared_once,init_shared);if(slot<0||slot>=HUD_STREAMS)return (*e)->NewStringUTF(e,"Некорректный HUD slot");if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");if(target_fps<1)target_fps=1;if(target_fps>20)target_fps=20;shared_stop_hud_slot(slot);state_t *state=&hud_streams[slot];set_hud_crop_v2(state,x,y,width,height,fisheye,shape,turns);return shared_start(e,surface,input,slot,target_fps);}
+JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStartV2(JNIEnv *e,jclass c,jint slot,jobject surface,jint input,jint target_fps,jfloat x,jfloat y,jfloat width,jfloat height,jfloat fisheye,jint shape,jint turns){(void)c;pthread_once(&shared_once,init_shared);if(slot<0||slot>=HUD_STREAMS)return (*e)->NewStringUTF(e,"Некорректный HUD slot");if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");if(target_fps<1)target_fps=1;int limit=hud_output_fps_limit(slot);if(target_fps>limit)target_fps=limit;if(shared_stop_hud_slot(slot))return (*e)->NewStringUTF(e,"EGL target still owned; restart camera process");state_t *state=&hud_streams[slot];set_hud_crop_v2(state,x,y,width,height,fisheye,shape,turns);return shared_start(e,surface,input,slot,target_fps);}
 JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_hudConfigureV2(JNIEnv *e,jclass c,jint slot,jfloat x,jfloat y,jfloat width,jfloat height,jfloat fisheye,jint shape,jint turns){(void)e;(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>=HUD_STREAMS)return;set_hud_crop_v2(&hud_streams[slot],x,y,width,height,fisheye,shape,turns);}
-JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStop(JNIEnv *e,jclass c,jint slot){(void)e;(void)c;pthread_once(&shared_once,init_shared);if(slot>=0&&slot<HUD_STREAMS)shared_stop_hud_slot(slot);}
+JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStop(JNIEnv *e,jclass c,jint slot){
+    (void)c;pthread_once(&shared_once,init_shared);char message[512];
+    if(slot>=0&&slot<HUD_STREAMS&&shared_stop_hud_slot_with_error(slot,message,sizeof(message))){
+        jclass error=(*e)->FindClass(e,"java/lang/IllegalStateException");
+        if(error)(*e)->ThrowNew(e,error,message);
+    }
+}
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStatus(JNIEnv *e,jclass c,jint slot){(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>=HUD_STREAMS)return (*e)->NewStringUTF(e,"Некорректный HUD slot");char x[512];pthread_mutex_lock(&hud_streams[slot].mutex);snprintf(x,sizeof(x),"%s",hud_streams[slot].status);pthread_mutex_unlock(&hud_streams[slot].mutex);return (*e)->NewStringUTF(e,x);}
 JNIEXPORT jlongArray JNICALL Java_com_stasao_gcam_NativeQCarCam_hudStats(JNIEnv *e,jclass c,jint slot){(void)c;pthread_once(&hud_streams_once,init_hud_streams);if(slot<0||slot>=HUD_STREAMS){state_t empty={0};return state_stats(e,&empty);}return state_stats(e,&hud_streams[slot]);}
 JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_stop(JNIEnv *e,jclass c){(void)e;(void)c;stop_state(&s);statusf(&s,"Остановлено");}
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_status(JNIEnv *e,jclass c){(void)c;char x[512];pthread_mutex_lock(&s.mutex);snprintf(x,sizeof(x),"%s",s.status);pthread_mutex_unlock(&s.mutex);return (*e)->NewStringUTF(e,x);}
 JNIEXPORT jlongArray JNICALL Java_com_stasao_gcam_NativeQCarCam_stats(JNIEnv *e,jclass c){(void)c;return state_stats(e,&s);}
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStart(JNIEnv *e,jclass c,jobject surface,jint input,jint target_fps){(void)c;pthread_once(&shared_once,init_shared);if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");if(target_fps<1)target_fps=1;if(target_fps>25)target_fps=25;return shared_start(e,surface,input,HUD_STREAMS,target_fps);}
-JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStop(JNIEnv *e,jclass c,jint input){(void)e;(void)c;shared_stop(input,HUD_STREAMS);}
+JNIEXPORT void JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStop(JNIEnv *e,jclass c,jint input){
+    (void)c;char message[512];
+    if(shared_stop_with_error(input,HUD_STREAMS,message,sizeof(message))){
+        jclass error=(*e)->FindClass(e,"java/lang/IllegalStateException");
+        if(error)(*e)->ThrowNew(e,error,message);
+    }
+}
 JNIEXPORT jlongArray JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderLoad(JNIEnv *e,jclass c){
-    (void)c;jlong values[]={recorder_budget(25,now_ns()),(jlong)atomic_load(&visible_output_mask)};
+    (void)c;uint64_t now=now_ns();int budget=25;
+    for(unsigned input=0;input<4;input++){
+        int current=recorder_budget(input,25,now);
+        if(current<budget)budget=current;
+    }
+    /* Existing clients receive the lowest active pressure cap plus the output mask. */
+    jlong values[]={budget,(jlong)atomic_load(&visible_output_mask)};
     jlongArray result=(*e)->NewLongArray(e,2);if(result)(*e)->SetLongArrayRegion(e,result,0,2,values);return result;
 }
 JNIEXPORT jstring JNICALL Java_com_stasao_gcam_NativeQCarCam_recorderStatus(JNIEnv *e,jclass c,jint input){(void)c;pthread_once(&recorders_once,init_recorders);if(input<0||input>3)return (*e)->NewStringUTF(e,"Некорректный input");char x[512];pthread_mutex_lock(&recorders[input].mutex);snprintf(x,sizeof(x),"%s",recorders[input].status);pthread_mutex_unlock(&recorders[input].mutex);return (*e)->NewStringUTF(e,x);}

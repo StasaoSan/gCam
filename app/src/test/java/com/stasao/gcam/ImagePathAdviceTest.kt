@@ -1,6 +1,6 @@
 package com.stasao.gcam
 
-import org.junit.Assert.assertTrue
+import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class ImagePathAdviceTest {
@@ -9,19 +9,20 @@ class ImagePathAdviceTest {
         connected = true, video = true, error = null,
     )
 
-    @Test fun distinguishesMissingAccessFromNoFrames() {
-        assertTrue(ImagePathAdvice.explain("gBlind", ready.copy(access = false)).contains("не разрешён"))
-        assertTrue(ImagePathAdvice.explain("gBlind", ready.copy(video = false)).contains("кадры"))
+    @Test fun missingAccessTakesPriorityOverMissingFrames() {
+        assertEquals(R.string.gcam_path_access_missing,
+            ImagePathAdvice.messageId(ready.copy(access = false, video = false)))
+        assertEquals(R.string.gcam_path_frames_missing,
+            ImagePathAdvice.messageId(ready.copy(video = false)))
     }
 
     @Test fun healthySignalPointsToDisplaySettings() {
-        assertTrue(ImagePathAdvice.explain("ANHUD", ready).contains("положение окна"))
+        assertEquals(R.string.gcam_path_ready, ImagePathAdvice.messageId(ready))
     }
 
-    @Test fun englishAdviceUsesTheSameStateOrder() {
-        assertTrue(ImagePathAdvice.explain("gBlind", ready.copy(access = false), english = true)
-            .contains("no gCam access"))
-        assertTrue(ImagePathAdvice.explain("ANHUD", ready, english = true)
-            .contains("window position"))
+    @Test fun staleStatusTakesPriorityOverPreviousError() {
+        assertEquals(R.string.gcam_path_status_missing,
+            ImagePathAdvice.messageId(ready.copy(reportFresh = false, error = "old error")))
+        assertEquals(R.string.gcam_path_error, ImagePathAdvice.messageId(ready.copy(error = "live error")))
     }
 }

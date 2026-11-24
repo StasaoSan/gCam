@@ -1,0 +1,26 @@
+<resources>
+    <string name="panel_recorder_title">Recorder</string>
+    <string name="panel_recorder_permissions">Permissions</string>
+    <string name="panel_recorder_permissions_unavailable">Android could not open these permission settings.</string>
+    <string name="panel_recorder_allowed">Allowed</string>
+    <string name="panel_recorder_allow">Allow</string>
+    <string name="panel_recorder_ready">Ready to record</string>
+    <string name="panel_recorder_waiting_frames">Waiting for the first recorded frames…</string>
+    <string name="panel_recorder_recording_count">Recording: %1$d / %2$d cameras</string>
+    <string name="panel_recorder_preview">Cameras</string>
+    <string name="panel_recorder_show_preview">Show cameras</string>
+    <string name="panel_recorder_hide_preview">Hide preview</string>
+    <string name="panel_recorder_preview_recording">The cameras are recording. Recording status is shown above.</string>
+    <string name="panel_recorder_preview_unavailable">Preview appears when vehicle cameras are connected.</string>
+    <string name="panel_recorder_camera_selected">Will be recorded</string>
+    <string name="panel_recorder_camera_off">Not recorded</string>
+    <string name="panel_recorder_quality">Quality and segments</string>
+    <string name="panel_recorder_use_recommended">Recommended settings</string>
+    <string name="panel_recorder_free_space">Free: %1$s</string>
+    <string name="panel_recorder_vehicle_speed">Vehicle speed</string>
+    <string name="panel_recorder_vehicle_speed_hint">Instrument cluster readings, independent of GPS.</string>
+    <string name="panel_recorder_auto_record">Start recording automatically</string>
+    <string name="panel_recorder_auto_record_hint">Record the selected cameras when gPanel starts.</string>
+    <string name="panel_recorder_more">More settings</string>
+    <string name="panel_recorder_details">Technical details</string>
+</resources>

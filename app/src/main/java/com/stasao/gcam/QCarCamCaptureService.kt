@@ -3,7 +3,10 @@ package com.stasao.gcam
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -12,6 +15,7 @@ import android.os.Parcel
 import android.view.Surface
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import java.util.Locale
 
 /**
@@ -20,6 +24,7 @@ import java.util.Locale
  * with the Binder stack used by Qualcomm Codec2.
  */
 class QCarCamCaptureService : Service() {
+    override fun attachBaseContext(base: Context) = super.attachBaseContext(RecorderHost.wrapContext(base))
     private val healthHandler = Handler(Looper.getMainLooper())
     private val hudRequested = BooleanArray(2)
     private val hudClientActive = BooleanArray(2)
@@ -33,6 +38,21 @@ class QCarCamCaptureService : Service() {
     @Volatile private var hudVideoReceived = false
     @Volatile private var hudEverVideoReceived = false
     @Volatile private var hudError: String? = null
+    @Volatile private var ownsCapture = false
+    private var watchingLegacy = false
+    private val legacyChanges = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.data?.schemeSpecificPart !in RecorderHost.legacyPackages) return
+            val available = RecorderHost.captureAvailable(context)
+            if (ownsCapture && !available) {
+                // Ending the isolated broker closes its vendor handles and notifies
+                // all clients. The recorder process remains alive to finalize MP4s.
+                ownsCapture = false
+                android.os.Process.killProcess(android.os.Process.myPid())
+            }
+            ownsCapture = available
+        }
+    }
     private val healthHeartbeat = object : Runnable {
         override fun run() {
             publishHudHealth()
@@ -43,15 +63,25 @@ class QCarCamCaptureService : Service() {
     private val binder = object : IQCarCamCapture.Stub() {
         override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
             if (code in IBinder.FIRST_CALL_TRANSACTION..IBinder.LAST_CALL_TRANSACTION) {
+                if (!ownsCapture) {
+                    throw IllegalStateException("The camera service has been transferred to gPanel")
+                }
                 CaptureClientTrust.enforceCaller(this@QCarCamCaptureService, Binder.getCallingUidOrThrow(), code)
             }
             return super.onTransact(code, data, reply, flags)
         }
 
-        override fun start(surface: Surface, inputId: Int, targetFps: Int): String =
-            NativeQCarCam.recorderStart(surface, inputId, targetFps)
+        override fun start(surface: Surface, inputId: Int, targetFps: Int): String {
+            RecorderDiagnostics.recordHud(this@QCarCamCaptureService,
+                "recorder_output_start input=$inputId fps=$targetFps callerUid=${Binder.getCallingUid()}")
+            return NativeQCarCam.recorderStart(surface, inputId, targetFps)
+        }
 
-        override fun stop(inputId: Int) = NativeQCarCam.recorderStop(inputId)
+        override fun stop(inputId: Int) {
+            RecorderDiagnostics.recordHud(this@QCarCamCaptureService,
+                "recorder_output_stop input=$inputId callerUid=${Binder.getCallingUid()}")
+            NativeQCarCam.recorderStop(inputId)
+        }
 
         override fun status(inputId: Int): String = NativeQCarCam.recorderStatus(inputId)
 
@@ -91,7 +121,7 @@ class QCarCamCaptureService : Service() {
             shape: Int
         ): String {
             checkBlindSlot(slot)
-            if (slot !in 0..12) return "Некорректный HUD slot"
+            if (slot !in 0..13) return "Некорректный HUD slot"
             if (slot < 2) {
                 hudRequested[slot] = true
                 hudInputs[slot] = inputId
@@ -131,7 +161,7 @@ class QCarCamCaptureService : Service() {
             fisheye: Float, shape: Int, quarterTurns: Int
         ): String {
             checkBlindSlot(slot)
-            if (slot !in 0..12) return "Некорректный HUD slot"
+            if (slot !in 0..13) return "Некорректный HUD slot"
             if (slot < 2) {
                 hudRequested[slot] = true
                 hudInputs[slot] = inputId
@@ -165,7 +195,7 @@ class QCarCamCaptureService : Service() {
 
         override fun stopHud(slot: Int) {
             checkBlindSlot(slot)
-            if (slot !in 0..12) return
+            if (slot !in 0..13) return
             NativeQCarCam.hudStop(slot)
             if (slot < 2) {
                 hudRequested[slot] = false
@@ -207,46 +237,50 @@ class QCarCamCaptureService : Service() {
 
     private fun checkBlindSlot(slot: Int) {
         val uid = Binder.getCallingUidOrThrow()
-        if (slot in 10..11 && uid != android.os.Process.myUid() &&
-            !CaptureClientTrust.isBlindCaller(this, uid) && !CaptureClientTrust.isZonesCaller(this, uid)) {
-            throw SecurityException("Большой просмотр доступен только разрешённым клиентам камер")
-        }
-        if (slot == 12 && uid != android.os.Process.myUid() && !CaptureClientTrust.isZonesCaller(this, uid)) {
-            throw SecurityException("Дополнительный поток доступен только разрешённому клиенту камер")
-        }
-        if (CaptureClientTrust.isZonesCaller(this, uid) && slot !in listOf(10, 11, 12)) {
-            throw SecurityException("Клиент камер может использовать только слоты 10, 11 и 12")
-        }
-        if (slot in 6..9 && uid != android.os.Process.myUid()) {
-            throw SecurityException("Плавающие окна gCam доступны только gCam")
-        }
-        if (CaptureClientTrust.isBlindCaller(this, uid) && slot !in listOf(2, 3, 5, 10, 11)) {
-            throw SecurityException("gBlind может использовать только слоты приборки 2/3, редактор 5 и большой просмотр 10/11")
+        val client = CaptureClientAccess.clientFor(packageManager.getPackagesForUid(uid).orEmpty().asList())
+        if (!CaptureClientAccess.canUseHudSlot(client, uid == android.os.Process.myUid(), slot)) {
+            throw SecurityException("Канал камеры недоступен этому приложению")
         }
     }
 
     override fun onCreate() {
         super.onCreate()
+        if (RecorderHost.embedded(this)) {
+            val filter = IntentFilter().apply {
+                addAction(Intent.ACTION_PACKAGE_ADDED)
+                addAction(Intent.ACTION_PACKAGE_REMOVED)
+                addAction(Intent.ACTION_PACKAGE_CHANGED)
+                addDataScheme("package")
+            }
+            ContextCompat.registerReceiver(this, legacyChanges, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+            watchingLegacy = true
+        }
+        ownsCapture = RecorderHost.captureAvailable(this)
         previousHudLogMs = SystemClock.elapsedRealtime()
         healthHandler.post(healthHeartbeat)
     }
 
-    override fun onBind(intent: Intent?): IBinder = binder
+    override fun onBind(intent: Intent?): IBinder? =
+        binder.takeIf { ownsCapture }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!ownsCapture) {
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         if (intent?.action == ACTION_LANGUAGE)
             GCamLanguage.useInProcess(intent.getIntExtra(EXTRA_LANGUAGE, GCamLanguage.SYSTEM))
         val notifications = getSystemService(NotificationManager::class.java)
         notifications.createNotificationChannel(
             NotificationChannel(HEALTH_CHANNEL_ID,
-                GCamLanguage.text(this, "Связь gCam с ANHUD", "gCam–ANHUD connection"), NotificationManager.IMPORTANCE_LOW)
+                GCamLanguage.string(this, R.string.gcam_gcam_anhud_connection), NotificationManager.IMPORTANCE_LOW)
         )
         startForeground(
             HEALTH_NOTIFICATION_ID,
             NotificationCompat.Builder(this, HEALTH_CHANNEL_ID)
-                .setSmallIcon(R.mipmap.ic_launcher)
+                .setSmallIcon(R.mipmap.gcam_ic_launcher)
                 .setContentTitle("gCam")
-                .setContentText(GCamLanguage.text(this, "Камеры готовы для ANHUD", "Cameras ready for ANHUD"))
+                .setContentText(GCamLanguage.string(this, R.string.gcam_cameras_ready_for_anhud))
                 .setOngoing(true)
                 .build()
         )
@@ -254,8 +288,10 @@ class QCarCamCaptureService : Service() {
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
-        NativeQCarCam.warmInput(0, false)
-        NativeQCarCam.warmInput(1, false)
+        if (ownsCapture) {
+            NativeQCarCam.warmInput(0, false)
+            NativeQCarCam.warmInput(1, false)
+        }
         hudRequested.fill(false)
         hudClientActive.fill(false)
         hudClientKnown = false
@@ -271,6 +307,7 @@ class QCarCamCaptureService : Service() {
     }
 
     override fun onDestroy() {
+        if (watchingLegacy) unregisterReceiver(legacyChanges)
         healthHandler.removeCallbacks(healthHeartbeat)
         super.onDestroy()
     }

@@ -1,0 +1,16 @@
+<resources>
+    <string name="panel_recorder_access_media">Recordings archive</string>
+    <string name="panel_recorder_access_media_detail">Allows viewing recordings from earlier installations. New videos can be recorded without this permission.</string>
+    <string name="panel_recorder_access_notifications">Recording notifications</string>
+    <string name="panel_recorder_access_notifications_detail">Shows recording and storage status while the app is in the background.</string>
+    <string name="panel_recorder_access_gps">Coordinates on video</string>
+    <string name="panel_recorder_access_gps_detail">Required only for the optional coordinates stamp. Speed comes from the vehicle.</string>
+    <string name="panel_recorder_access_archive">Files from earlier installations</string>
+    <string name="panel_recorder_access_archive_detail">Additional access for older recordings. New recordings are cleaned up automatically; Android may separately ask to delete older media.</string>
+    <string name="panel_recorder_access_overlay">Display over other apps</string>
+    <string name="panel_recorder_access_overlay_detail">Needed for the floating recording button and camera window. Recording itself does not require it.</string>
+    <string name="panel_recorder_archive_delete_denied">Android blocked deletion from the older archive. Check “Files from earlier installations” in Permissions above. Older media may require separate Android approval.</string>
+    <string name="panel_recorder_access_choose_camera">Select at least one recording camera.</string>
+    <string name="panel_recorder_access_camera_owner">The vehicle camera service is currently managed by another installation.</string>
+    <string name="panel_recorder_access_vehicle_camera">Vehicle cameras are unavailable on this device. You can try the interface without recording.</string>
+</resources>

@@ -1,0 +1,16 @@
+<resources>
+    <string name="panel_recorder_access_media">Архив записей</string>
+    <string name="panel_recorder_access_media_detail">Для просмотра записей прежних установок. Новое видео можно записывать и без этого разрешения.</string>
+    <string name="panel_recorder_access_notifications">Уведомления о записи</string>
+    <string name="panel_recorder_access_notifications_detail">Показывают состояние записи и накопителя, когда приложение свёрнуто.</string>
+    <string name="panel_recorder_access_gps">Координаты на видео</string>
+    <string name="panel_recorder_access_gps_detail">Нужны только для отметки координат. Скорость берётся из данных автомобиля.</string>
+    <string name="panel_recorder_access_archive">Файлы прежних установок</string>
+    <string name="panel_recorder_access_archive_detail">Дополнительный доступ к старому архиву. Новые записи очищаются автоматически; для удаления прежних Android может отдельно запросить подтверждение.</string>
+    <string name="panel_recorder_access_overlay">Поверх других приложений</string>
+    <string name="panel_recorder_access_overlay_detail">Нужно для плавающей кнопки записи и окна камер. На саму запись не влияет.</string>
+    <string name="panel_recorder_archive_delete_denied">Android запретил удаление записи из прежнего архива. Проверьте «Файлы прежних установок» в разрешениях сверху. Для старых медиафайлов может потребоваться отдельное подтверждение Android.</string>
+    <string name="panel_recorder_access_choose_camera">Выберите хотя бы одну камеру для записи.</string>
+    <string name="panel_recorder_access_camera_owner">Сервис камер автомобиля сейчас принадлежит другой установке приложения.</string>
+    <string name="panel_recorder_access_vehicle_camera">Камеры автомобиля недоступны на этом устройстве. Интерфейс можно проверить без записи.</string>
+</resources>

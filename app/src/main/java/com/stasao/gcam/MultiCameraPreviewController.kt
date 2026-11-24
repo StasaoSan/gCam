@@ -10,6 +10,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.Collections
 import java.util.WeakHashMap
 
+/** Preview slots 6..9 share captured frames with the recorder's independent encoder output. */
 class MultiCameraPreviewController(context: Context) {
     companion object {
         private val active = Collections.newSetFromMap(WeakHashMap<MultiCameraPreviewController, Boolean>())
@@ -29,7 +30,9 @@ class MultiCameraPreviewController(context: Context) {
                 if (closed) return
                 capture = IQCarCamCapture.Stub.asInterface(service)
                 surfaces.forEach { (id, surface) ->
-                    if (surface.isValid) runCatching { capture?.start(surface, id, 25) }
+                    if (surface.isValid) runCatching {
+                        capture?.let { PreviewCameraOutputs.start(it, surface, id, 25) }
+                    }
                 }
             }
         }
@@ -53,21 +56,23 @@ class MultiCameraPreviewController(context: Context) {
         }
         surfaces.put(inputId, surface)?.takeIf { it !== surface }?.release()
         val remote = capture ?: return "Подключение к QCarCam…"
-        return runCatching { remote.start(surface, inputId, 25) }
+        return runCatching { PreviewCameraOutputs.start(remote, surface, inputId, 25) }
             .getOrElse { it.message ?: "Ошибка подключения" }
     }
 
     @Synchronized fun status(inputId: Int): String = runCatching {
-        capture?.status(inputId) ?: "Подключение к QCarCam…"
+        capture?.hudStatus(6 + inputId) ?: "Подключение к QCarCam…"
     }.getOrElse { it.message ?: "Ошибка подключения" }
 
     @Synchronized fun stats(inputId: Int): LongArray = runCatching {
-        capture?.stats(inputId) ?: longArrayOf()
+        capture?.hudStats(6 + inputId) ?: longArrayOf()
     }.getOrDefault(longArrayOf())
 
     @Synchronized fun stop(inputId: Int) {
-        runCatching { capture?.stop(inputId) }
-        surfaces.remove(inputId)?.release()
+        surfaces.remove(inputId)?.let { surface ->
+            runCatching { PreviewCameraOutputs.stop(capture, surface, inputId) }
+            surface.release()
+        }
     }
 
     @Synchronized fun close() {

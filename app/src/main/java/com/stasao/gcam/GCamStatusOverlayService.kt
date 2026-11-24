@@ -108,12 +108,12 @@ class GCamStatusOverlayService : Service() {
         super.onCreate()
         val notifications = getSystemService(NotificationManager::class.java)
         notifications.createNotificationChannel(NotificationChannel(CHANNEL_ID,
-            GCamLanguage.text(this, "Индикаторы gCam", "gCam indicators"), NotificationManager.IMPORTANCE_LOW))
+            GCamLanguage.string(this, R.string.gcam_gcam_indicators), NotificationManager.IMPORTANCE_LOW))
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         startForeground(NOTIFICATION_ID, NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle(GCamLanguage.text(this, "gCam · индикаторы", "gCam · indicators"))
+            .setSmallIcon(R.mipmap.gcam_ic_launcher)
+            .setContentTitle(GCamLanguage.string(this, R.string.gcam_gcam_indicators_2))
             .setContentIntent(open)
             .setOngoing(true)
             .build())
@@ -144,8 +144,8 @@ class GCamStatusOverlayService : Service() {
             ACTION_LANGUAGE -> runCatching {
                 getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID,
                     NotificationCompat.Builder(this, CHANNEL_ID)
-                        .setSmallIcon(R.mipmap.ic_launcher)
-                        .setContentTitle(GCamLanguage.text(this, "gCam · индикаторы", "gCam · indicators"))
+                        .setSmallIcon(R.mipmap.gcam_ic_launcher)
+                        .setContentTitle(GCamLanguage.string(this, R.string.gcam_gcam_indicators_2))
                         .setContentIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
                             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
                         .setOngoing(true).build())
@@ -261,10 +261,10 @@ class GCamStatusOverlayService : Service() {
         }
         dots[Kind.COMBINED]?.view?.apply {
             setStatus(hudColor, blindColor)
-            contentDescription = GCamLanguage.text(this@GCamStatusOverlayService,
-                "Слева ANHUD: ${statusText(hudColor)}; справа gBlind: ${statusText(blindColor)}",
-                "ANHUD left: ${GCamLanguage.display(this@GCamStatusOverlayService, statusText(hudColor))}; " +
-                    "gBlind right: ${GCamLanguage.display(this@GCamStatusOverlayService, statusText(blindColor))}")
+            contentDescription = GCamLanguage.string(this@GCamStatusOverlayService,
+                R.string.gcam_combined_indicator_description,
+                GCamLanguage.display(this@GCamStatusOverlayService, statusText(hudColor)),
+                GCamLanguage.display(this@GCamStatusOverlayService, statusText(blindColor)))
         }
         val signature = listOf(hudColor, blindColor, expected, recording).hashCode()
         if (signature != lastStatusSignature || now - lastStatusLogAt >= STATUS_LOG_INTERVAL_MS) {

@@ -10,3 +10,8 @@ find_library(android-lib android)
 find_library(egl-lib EGL)
 find_library(gles-lib GLESv3)
 target_link_libraries(gcam_native ${log-lib} ${android-lib} ${egl-lib} ${gles-lib} dl m)
+
+# Recorder compressed-frame memory has no capture, GPU, or USB dependencies.
+add_library(gcam_buffer SHARED native_sample_pool.c native_sample_pool_jni.c)
+target_compile_features(gcam_buffer PRIVATE c_std_11)
+target_compile_definitions(gcam_buffer PRIVATE _POSIX_C_SOURCE=200809L)

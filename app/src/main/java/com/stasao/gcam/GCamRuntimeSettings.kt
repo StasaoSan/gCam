@@ -50,13 +50,14 @@ object GCamRuntimeSettings {
     fun load(context: Context): GCamRuntimeConfig {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val autostart = prefs.getBoolean(KEY_AUTOSTART, false)
+        val legacyIndicators = !RecorderHost.embedded(context)
         val position = loadOrMigrateOverlayPosition(context)
         return GCamRuntimeConfig(
             autostart = autostart,
             recordingAutostart = autostart && prefs.getBoolean(KEY_RECORDING_AUTOSTART, false),
-            statusOverlay = prefs.getBoolean(KEY_STATUS_OVERLAY, false),
-            blindStatusOverlay = prefs.getBoolean(KEY_BLIND_STATUS_OVERLAY, false),
-            hudStatusOverlay = prefs.getBoolean(KEY_HUD_STATUS_OVERLAY, false),
+            statusOverlay = legacyIndicators && prefs.getBoolean(KEY_STATUS_OVERLAY, false),
+            blindStatusOverlay = legacyIndicators && prefs.getBoolean(KEY_BLIND_STATUS_OVERLAY, false),
+            hudStatusOverlay = legacyIndicators && prefs.getBoolean(KEY_HUD_STATUS_OVERLAY, false),
             cameraOverlay = prefs.getBoolean(KEY_CAMERA_OVERLAY, false),
             recordOverlay = prefs.getBoolean(KEY_RECORD_OVERLAY, false),
             recordOverlayX = prefs.getFloat(KEY_RECORD_OVERLAY_X, 0.83f).coerceIn(0f, 1f),

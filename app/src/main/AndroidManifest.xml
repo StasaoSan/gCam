@@ -5,6 +5,7 @@
     <queries>
         <package android:name="com.g992.anhud" />
         <package android:name="com.stasao.gblind" />
+        <package android:name="com.stasao.gpanel" />
     </queries>
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
@@ -26,12 +27,13 @@
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
+        android:localeConfig="@xml/gcam_locales_config"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@mipmap/gcam_ic_launcher"
         android:label="@string/app_name"
-        android:roundIcon="@mipmap/ic_launcher_round"
+        android:roundIcon="@mipmap/gcam_ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.GCam">
         <activity
@@ -48,26 +50,20 @@
         <service
             android:name=".DashcamService"
             android:exported="false"
-            android:foregroundServiceType="dataSync|location"
+            android:foregroundServiceType="dataSync|specialUse|location"
             android:process=":recorder"
-            android:stopWithTask="false" />
+            android:stopWithTask="false">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Continuous in-vehicle dashcam recording from the head unit's vendor camera interface" />
+        </service>
         <service
             android:name=".QCarCamCaptureService"
             android:exported="true"
-            android:foregroundServiceType="dataSync"
-            android:process=":qcarcam" />
-        <service android:name=".UsbTestService" android:exported="false"
-            android:process=":recorder" android:foregroundServiceType="dataSync" />
-        <receiver android:name=".UsbTestReceiver" android:exported="true" android:process=":recorder">
-            <intent-filter>
-                <action android:name="android.intent.action.MEDIA_MOUNTED" />
-                <action android:name="android.intent.action.MEDIA_UNMOUNTED" />
-                <action android:name="android.intent.action.MEDIA_REMOVED" />
-                <action android:name="android.intent.action.MEDIA_BAD_REMOVAL" />
-                <action android:name="android.intent.action.MEDIA_EJECT" />
-                <data android:scheme="file" />
-            </intent-filter>
-        </receiver>
+            android:foregroundServiceType="specialUse"
+            android:process=":qcarcam">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Head unit vehicle camera capture shared by the dashcam and instrument cluster" />
+        </service>
         <service
             android:name=".GCamStatusOverlayService"
             android:exported="false"
@@ -123,6 +119,11 @@
                 <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
+        <provider
+            android:name=".RecorderMigrationProvider"
+            android:authorities="${applicationId}.recorder.migration"
+            android:exported="true"
+            android:process=":recorder" />
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

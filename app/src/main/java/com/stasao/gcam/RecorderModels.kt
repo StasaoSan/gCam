@@ -32,7 +32,8 @@ data class RecorderState(
     val cameras: Map<Int, CameraRecordingState> = emptyMap(),
     val usedBytes: Long = 0,
     val status: String = "Регистратор остановлен",
-    val warning: String? = null
+    val warning: String? = null,
+    val warningAtMs: Long = 0L
 )
 
 data class RecordingFile(

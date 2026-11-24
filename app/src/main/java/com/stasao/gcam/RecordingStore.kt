@@ -27,19 +27,21 @@ data class RemovableDrive(val volume: StorageVolume?, val id: String, val name: 
 
 object RecordingStore {
     private const val ROOT = "gCam"
+    private fun archiveName(context: Context) = if (RecorderHost.embedded(context)) "gPanel" else ROOT
+    fun archivePath(context: Context) = "${Environment.DIRECTORY_MOVIES}/${archiveName(context)}"
     private const val PROTECTED = "protected"
     const val RESERVED_FREE_BYTES = 2L * 1024 * 1024 * 1024
     private const val GB = 1024L * 1024L * 1024L
     // The synthetic "external" volume may include USB files. Keep the internal
     // archive scoped to primary storage so its quota never counts or deletes USB clips.
     private val collection: Uri get() = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-    private val rootPath = "${Environment.DIRECTORY_MOVIES}/$ROOT/"
+    private fun rootPath(context: Context) = "${archivePath(context)}/"
 
     @Synchronized fun createSegment(context: Context, inputId: Int, name: String,
                                     protected: Boolean = false,
                                     storage: RecordingStorage = RecordingStorage.INTERNAL): RecordingTarget {
         if (storage == RecordingStorage.EXTERNAL) {
-            validateExternal(context)?.let { error(it) }
+            RecorderStageMetrics.measure(RecorderStage.STORAGE_VALIDATE) { validateExternal(context) }?.let { error(it) }
             return createMediaSegment(context, externalCollection(context), inputId, name, protected, storage)
         }
         return createMediaSegment(context, collection, inputId, name, protected, storage)
@@ -50,57 +52,45 @@ object RecordingStore {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
             put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, if (protected) "$rootPath$PROTECTED/" else cameraPath(inputId))
+            put(MediaStore.MediaColumns.RELATIVE_PATH, if (protected) "${rootPath(context)}$PROTECTED/" else cameraPath(context, inputId))
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
-        val uri = requireNotNull(context.contentResolver.insert(destination, values)) {
-            "Не удалось создать файл в Movies/gCam на выбранном накопителе"
+        val uri = requireNotNull(RecorderStageMetrics.measure(RecorderStage.MEDIA_INSERT) { context.contentResolver.insert(destination, values) }) {
+            "Не удалось создать файл в ${archivePath(context)} на выбранном накопителе"
         }
         return try {
-            RecordingTarget(uri, requireNotNull(context.contentResolver.openFileDescriptor(uri, "w")), storage)
+            RecordingTarget(uri, requireNotNull(RecorderStageMetrics.measure(RecorderStage.DESCRIPTOR_OPEN) {
+                context.contentResolver.openFileDescriptor(uri, "w")
+            }), storage)
         } catch (t: Throwable) {
-            context.contentResolver.delete(uri, null, null)
+            RecorderStageMetrics.measure(RecorderStage.MEDIA_DELETE) { context.contentResolver.delete(uri, null, null) }
             throw t
         }
     }
 
-    internal fun usbTestCollection(context: Context): Uri = externalCollection(context)
-
-    internal fun createUsbTestTarget(context: Context, destination: Uri, name: String): RecordingTarget =
-        createMediaSegment(context, destination, 0, name, false, RecordingStorage.EXTERNAL)
-
-    internal fun removeUsbTestOrphans(context: Context, destination: Uri) {
-        context.contentResolver.query(destination, arrayOf(MediaStore.MediaColumns._ID),
-            "${MediaStore.MediaColumns.RELATIVE_PATH}=? AND ${MediaStore.MediaColumns.IS_PENDING}=1 " +
-                "AND ${MediaStore.MediaColumns.OWNER_PACKAGE_NAME}=? " +
-                "AND ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?",
-            arrayOf(cameraPath(0), context.packageName, "gcam-usb-test-%"), null)?.use { cursor ->
-            while (cursor.moveToNext()) context.contentResolver.delete(
-                ContentUris.withAppendedId(destination, cursor.getLong(0)), null, null)
-        }
-    }
-
     fun finishSegment(context: Context, target: RecordingTarget) {
-        val size = runCatching { target.descriptor.statSize }.getOrDefault(-1L)
-        runCatching { target.descriptor.fileDescriptor.sync() }.onFailure {
+        val size = runCatching { RecorderStageMetrics.measure(RecorderStage.SEGMENT_STAT) { target.descriptor.statSize } }.getOrDefault(-1L)
+        runCatching { RecorderStageMetrics.measure(RecorderStage.DESCRIPTOR_SYNC) { target.descriptor.fileDescriptor.sync() } }.onFailure {
             RecorderDiagnostics.record(context,
-                "segment_sync_error uri=${target.uri} type=${it.javaClass.simpleName} message=${it.message}")
-            runCatching { target.descriptor.close() }
+                "segment_sync_error type=${it.javaClass.simpleName}")
+            runCatching { RecorderStageMetrics.measure(RecorderStage.DESCRIPTOR_CLOSE) { target.descriptor.close() } }
             // Keep IS_PENDING=1. An incomplete/unsynced file must not enter the playable archive.
             throw it
         }
-        target.descriptor.close()
-        val updated = context.contentResolver.update(target.uri, ContentValues().apply {
-            put(MediaStore.MediaColumns.IS_PENDING, 0)
-            put(MediaStore.MediaColumns.DATE_MODIFIED, System.currentTimeMillis() / 1000)
-        }, null, null)
+        RecorderStageMetrics.measure(RecorderStage.DESCRIPTOR_CLOSE) { target.descriptor.close() }
+        val updated = RecorderStageMetrics.measure(RecorderStage.MEDIA_PUBLISH) {
+            context.contentResolver.update(target.uri, ContentValues().apply {
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
+                put(MediaStore.MediaColumns.DATE_MODIFIED, System.currentTimeMillis() / 1000)
+            }, null, null)
+        }
         check(updated > 0) { "Не удалось опубликовать завершённый MP4" }
-        RecorderDiagnostics.record(context, "segment_published uri=${target.uri} bytes=$size")
+        RecorderDiagnostics.record(context, "segment_published bytes=$size")
     }
 
     fun abortSegment(context: Context, target: RecordingTarget) {
-        runCatching { target.descriptor.close() }
-        context.contentResolver.delete(target.uri, null, null)
+        runCatching { RecorderStageMetrics.measure(RecorderStage.DESCRIPTOR_CLOSE) { target.descriptor.close() } }
+        RecorderStageMetrics.measure(RecorderStage.MEDIA_DELETE) { context.contentResolver.delete(target.uri, null, null) }
     }
 
     fun list(context: Context): List<RecordingFile> = listInternal(context) + listExternal(context)
@@ -120,7 +110,7 @@ object RecordingStore {
             context.contentResolver.query(
                 destination, projection,
                 "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? AND ${MediaStore.MediaColumns.IS_PENDING}=0",
-                arrayOf("$rootPath%"),
+                arrayOf("${rootPath(context)}%"),
                 "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
             )?.use { cursor ->
                 val idIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
@@ -222,7 +212,7 @@ object RecordingStore {
             }.apply()
             return true
         }
-        val path = if (protect) "$rootPath$PROTECTED/" else cameraPath(recording.inputId)
+        val path = if (protect) "${rootPath(context)}$PROTECTED/" else cameraPath(context, recording.inputId)
         return context.contentResolver.update(Uri.parse(recording.uri), ContentValues().apply {
             put(MediaStore.MediaColumns.RELATIVE_PATH, path)
         }, null, null) > 0
@@ -243,10 +233,12 @@ object RecordingStore {
             destination, arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME),
             "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? AND ${MediaStore.MediaColumns.IS_PENDING}=1 " +
                 "AND ${MediaStore.MediaColumns.OWNER_PACKAGE_NAME}=?",
-            arrayOf("$rootPath%", context.packageName), null
+            arrayOf("${rootPath(context)}%", context.packageName), null
         )?.use { cursor ->
             while (cursor.moveToNext()) {
-                if (!cursor.getString(1).orEmpty().matches(RECORDING_NAME)) continue
+                val name = cursor.getString(1).orEmpty()
+                // Also clean app-owned pending test files left by older versions.
+                if (!name.matches(RECORDING_NAME) && !name.startsWith("gcam-usb-test-")) continue
                 val uri = ContentUris.withAppendedId(destination, cursor.getLong(0))
                 try {
                     context.contentResolver.delete(uri, null, null)
@@ -262,7 +254,7 @@ object RecordingStore {
 
     /** Moves recordings made by v4.0 from private app storage into visible Movies. */
     @Synchronized fun migrateLegacy(context: Context) {
-        val legacyRoot = File(context.getExternalFilesDir(Environment.DIRECTORY_MOVIES), ROOT)
+        val legacyRoot = File(context.getExternalFilesDir(Environment.DIRECTORY_MOVIES), archiveName(context))
         if (!legacyRoot.exists()) return
         legacyRoot.walkTopDown().filter { it.isFile && it.extension == "mp4" }.forEach { source ->
             val inputId = Regex("cam(\\d)").find(source.name)?.groupValues?.getOrNull(1)?.toIntOrNull()
@@ -280,7 +272,7 @@ object RecordingStore {
         }
     }
 
-    private fun cameraPath(inputId: Int) = "$rootPath${"camera_$inputId"}/"
+    private fun cameraPath(context: Context, inputId: Int) = "${rootPath(context)}${"camera_$inputId"}/"
 
     /** Only a removable volume is accepted; an emulated internal directory is not a USB destination. */
     fun validateExternal(context: Context): String? {
@@ -435,7 +427,7 @@ object RecordingStore {
             !hasExternalTreePermission(context, tree)) return emptyList()
         return runCatching {
             val root = treeRoot(tree)
-            val gcam = childDocuments(context, tree, root).firstOrNull { it.second == ROOT }?.first
+            val gcam = childDocuments(context, tree, root).firstOrNull { it.second == archiveName(context) }?.first
                 ?: return@runCatching emptyList()
             val protectedPrefs = context.getSharedPreferences("protected_usb_recordings", Context.MODE_PRIVATE)
             buildList {
